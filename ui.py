@@ -1421,6 +1421,12 @@ class CustomizeOverlay(QWidget):
         # every reply through an on-device British voice instead of Gemini's
         # own audio, no internet required. The Gemini voice pick above is kept
         # (just greyed out) so it's ready the moment JARVIS is switched off.
+        #
+        # The JARVIS voice-selection UI (LOCAL VOICE label, toggle button,
+        # and manual voice picker) has been removed from this menu. All the
+        # widgets below are still built — just never added to `lay` — because
+        # _refresh_jarvis_btn(), _toggle_jarvis(), _pick_jarvis_voice() and
+        # _save() (which reads self._jarvis_on) all still reference them.
         try:
             from core import local_tts
             self._jarvis_voice_id  = local_tts.available_voice_id()
@@ -1430,15 +1436,11 @@ class CustomizeOverlay(QWidget):
             self._jarvis_all_voices = []
         self._jarvis_on = bool(local_voice) and self._jarvis_voice_id is not None
 
-        lay.addSpacing(4)
-        lay.addWidget(_lbl("LOCAL VOICE", 8, color=C.TEXT_DIM,
-                            align=Qt.AlignmentFlag.AlignLeft))
         self._jarvis_btn = QPushButton("🇬🇧  JARVIS — OFFLINE BRITISH VOICE")
         self._jarvis_btn.setCheckable(True)
         self._jarvis_btn.setFixedHeight(30)
         self._jarvis_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         self._jarvis_btn.clicked.connect(self._toggle_jarvis)
-        lay.addWidget(self._jarvis_btn)
 
         # Manual fallback: shown only when no installed voice got auto-flagged
         # British — e.g. a differently-named voice pack, or an engine whose
@@ -1447,7 +1449,6 @@ class CustomizeOverlay(QWidget):
         self._jarvis_pick_hint = _lbl("", 7, color=C.TEXT_DIM,
                                         align=Qt.AlignmentFlag.AlignLeft)
         self._jarvis_pick_hint.setWordWrap(True)
-        lay.addWidget(self._jarvis_pick_hint)
 
         self._jarvis_pick_widget = QWidget()
         pick_row = QHBoxLayout(self._jarvis_pick_widget)
@@ -1476,7 +1477,6 @@ class CustomizeOverlay(QWidget):
         pick_btn.clicked.connect(self._pick_jarvis_voice)
         pick_row.addWidget(self._jarvis_pick_combo, 1)
         pick_row.addWidget(pick_btn)
-        lay.addWidget(self._jarvis_pick_widget)
 
         self._refresh_jarvis_btn()
 
@@ -2891,7 +2891,6 @@ class MainWindow(QMainWindow):
             }}
         """)
         self._center_split.addWidget(self._hud_cam_stack)
-        self._center_split.addWidget(self._content_panel)
         self._center_split.addWidget(self._quiz_panel)
         self._center_split.setStretchFactor(0, 3)
         self._center_split.setStretchFactor(1, 1)
@@ -3421,6 +3420,9 @@ class MainWindow(QMainWindow):
         # Quick drawer — reposition if open
         if hasattr(self, '_quick_drawer') and self._quick_drawer.isVisible():
             self._position_quick_drawer()
+        # Content panel — reposition if open
+        if hasattr(self, '_content_panel') and self._content_panel.isVisible():
+            self._position_content_panel()
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
@@ -3603,21 +3605,25 @@ class MainWindow(QMainWindow):
         w.setStyleSheet(f"background: {C.DARK};")
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
+        lay.setSpacing(2)
 
         def _sec(txt):
             l = QLabel(f"▸ {txt}")
             l.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
             l.setStyleSheet(f"color: {C.TEXT_MED};")
+            l.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             return l
 
-        lay.addWidget(_sec("ACTIVITY LOG"))
+        # ACTIVITY LOG box removed from the UI. self._log is still created
+        # (but never added to a layout, so it stays invisible) because many
+        # call sites elsewhere use self._log.append_log(...) / self._log.* —
+        # keeping the instance alive means none of that code needs to change.
         self._log = LogWidget()
-        lay.addWidget(self._log, stretch=1)
 
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
-        lay.addWidget(sep)
+        # Push the whole FILE UPLOAD / COMMAND INPUT cluster down to the
+        # bottom of the panel, close to the bottom-right corner, instead of
+        # letting it spread out to fill the available vertical space.
+        lay.addStretch(1)
 
         lay.addWidget(_sec("FILE UPLOAD"))
         self._drop_zone = FileDropZone()
@@ -3628,11 +3634,8 @@ class MainWindow(QMainWindow):
         self._file_hint.setFont(QFont("Courier New", 7))
         self._file_hint.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
         self._file_hint.setWordWrap(True)
+        self._file_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         lay.addWidget(self._file_hint)
-
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
-        lay.addWidget(sep2)
 
         lay.addWidget(_sec("COMMAND INPUT"))
         lay.addLayout(self._build_input_row())
@@ -3789,19 +3792,21 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._brief_btn)
 
         # ── Wake word ──────────────────────────────────────────────────────────
+        # WAKE WORD button (and its paired SLEEP/WAKE NOW button) removed from
+        # the settings menu. Both are still instantiated — just never added to
+        # the layout — because _refresh_wake_btns(), _toggle_wake_word(), and
+        # other call sites reference self._wake_btn / self._wake_sleep_btn.
         self._wake_btn = QPushButton()
         self._wake_btn.setFixedHeight(26)
         self._wake_btn.setFont(QFont("Courier New", 7))
         self._wake_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._wake_btn.clicked.connect(self._toggle_wake_word)
-        lay.addWidget(self._wake_btn)
 
         self._wake_sleep_btn = QPushButton()
         self._wake_sleep_btn.setFixedHeight(26)
         self._wake_sleep_btn.setFont(QFont("Courier New", 7))
         self._wake_sleep_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._wake_sleep_btn.clicked.connect(self._tap_wake_manual)
-        lay.addWidget(self._wake_sleep_btn)
         # Neutral placeholder now; the real state (which may load the model to
         # check readiness) is resolved lazily the first time the drawer opens.
         self._wake_btn.setText("🎙  WAKE WORD")
@@ -3878,6 +3883,19 @@ class MainWindow(QMainWindow):
         y = (cw.height() - h) // 2
         self._quick_drawer.setGeometry(x, y, _W, h)
 
+    def _position_content_panel(self):
+        """Floating overlay, like the SETTINGS drawer: anchored near the
+        bottom of the HUD/center area rather than filling the window."""
+        if not hasattr(self, '_content_panel'):
+            return
+        cs = self._center_split
+        origin = cs.mapTo(self.centralWidget(), cs.rect().topLeft())
+        pw = min(max(cs.width() - 48, 280), 520)
+        ph = min(max(cs.height() - 60, 160), 280)
+        x = origin.x() + (cs.width() - pw) // 2
+        y = origin.y() + cs.height() - ph - 18
+        self._content_panel.setGeometry(x, y, pw, ph)
+
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)
         self._input = QLineEdit()
@@ -3911,58 +3929,81 @@ class MainWindow(QMainWindow):
 
     def _build_content_panel(self) -> QWidget:
         """
-        Collapsible panel below the HUD — shows search results, news, briefings.
+        Floating overlay panel — shows search results, news, briefings and
+        document reviews. Styled and behaves like the SETTINGS drawer: a
+        rounded floating box with a draggable header and a small ✕ button
+        in the top-right corner, positioned over the bottom of the HUD area.
         Hidden by default; appears when show_content() is called.
         """
-        w = QWidget()
+        w = QWidget(self.centralWidget())
         w.setObjectName("ContentPanel")
         w.setStyleSheet(f"""
             QWidget#ContentPanel {{
-                background: {C.PANEL};
-                border-top: 1px solid {C.BORDER_B};
+                background: {C.DARK};
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
             }}
         """)
         w.hide()
 
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(12, 7, 12, 8)
+        lay.setContentsMargins(12, 8, 10, 10)
         lay.setSpacing(5)
 
-        # ── header row ───────────────────────────────────────────────────────
-        hdr = QHBoxLayout(); hdr.setSpacing(6)
+        # ── header row (draggable, with its own close button) ───────────────
+        hdr_w = QWidget()
+        hdr_w.setStyleSheet(f"border-bottom: 1px solid {C.BORDER};")
+        hdr = QHBoxLayout(hdr_w)
+        hdr.setContentsMargins(0, 0, 0, 5)
+        hdr.setSpacing(6)
 
         dot = QLabel("◈")
         dot.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
-        dot.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        dot.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
         hdr.addWidget(dot)
 
         self._content_title_lbl = QLabel("BRIEFING")
         self._content_title_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         self._content_title_lbl.setStyleSheet(
-            f"color: {C.PRI}; background: transparent; letter-spacing: 1px;"
+            f"color: {C.PRI}; background: transparent; letter-spacing: 1px; border: none;"
         )
         hdr.addWidget(self._content_title_lbl)
         hdr.addStretch()
 
         self._content_ts_lbl = QLabel("")
         self._content_ts_lbl.setFont(QFont("Courier New", 7))
-        self._content_ts_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._content_ts_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
         hdr.addWidget(self._content_ts_lbl)
 
-        dismiss = QPushButton("DISMISS  ✕")
-        dismiss.setFont(QFont("Courier New", 7))
-        dismiss.setFixedHeight(18)
+        dismiss = QPushButton("✕")
+        dismiss.setFixedSize(16, 16)
+        dismiss.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
         dismiss.setStyleSheet(f"""
             QPushButton {{
                 background: transparent; color: {C.TEXT_DIM};
-                border: 1px solid {C.BORDER}; border-radius: 2px; padding: 0 5px;
+                border: none;
             }}
-            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+            QPushButton:hover {{ color: {C.MUTED_C}; }}
         """)
         dismiss.clicked.connect(w.hide)
         hdr.addWidget(dismiss)
-        lay.addLayout(hdr)
+        lay.addWidget(hdr_w)
+
+        # Let the header be dragged to reposition the panel freely, just
+        # like the SETTINGS drawer's title bar.
+        def _hdr_mouse_press(ev):
+            if ev.button() == Qt.MouseButton.LeftButton:
+                w._drag_pos = ev.globalPosition().toPoint() - w.pos()
+                ev.accept()
+
+        def _hdr_mouse_move(ev):
+            if ev.buttons() & Qt.MouseButton.LeftButton and hasattr(w, "_drag_pos"):
+                w.move(ev.globalPosition().toPoint() - w._drag_pos)
+                ev.accept()
+
+        hdr_w.mousePressEvent = _hdr_mouse_press
+        hdr_w.mouseMoveEvent = _hdr_mouse_move
 
         # ── separator ─────────────────────────────────────────────────────────
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -4008,11 +4049,9 @@ class MainWindow(QMainWindow):
         self._content_display.moveCursor(
             self._content_display.textCursor().MoveOperation.Start
         )
-        first_show = not self._content_panel.isVisible()
+        self._position_content_panel()
         self._content_panel.show()
-        if first_show:
-            total = self._center_split.height()
-            self._center_split.setSizes([max(total - 220, 120), 220, 0])
+        self._content_panel.raise_()
 
     # ── document review ──────────────────────────────────────────────────────
     # Rendered as rich text into the content panel that already exists, rather
@@ -4079,11 +4118,9 @@ class MainWindow(QMainWindow):
         self._content_display.setHtml("".join(parts))
         self._content_display.moveCursor(
             self._content_display.textCursor().MoveOperation.Start)
-        first_show = not self._content_panel.isVisible()
+        self._position_content_panel()
         self._content_panel.show()
-        if first_show:
-            total = self._center_split.height()
-            self._center_split.setSizes([max(total - 260, 120), 260, 0])
+        self._content_panel.raise_()
 
     # ── quiz panel ───────────────────────────────────────────────────────────
     # An interactive twin of the content panel. The caller only ever hands over
