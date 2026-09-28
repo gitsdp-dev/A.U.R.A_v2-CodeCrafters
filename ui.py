@@ -3630,14 +3630,14 @@ class MainWindow(QMainWindow):
         self._drop_zone.file_selected.connect(self._on_file_selected)
         lay.addWidget(self._drop_zone)
 
-        self._file_hint = QLabel("No file loaded — drop or click above to upload")
+        self._file_hint = QLabel("")
         self._file_hint.setFont(QFont("Courier New", 7))
         self._file_hint.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
         self._file_hint.setWordWrap(True)
         self._file_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         lay.addWidget(self._file_hint)
 
-        lay.addWidget(_sec("COMMAND INPUT"))
+        lay.addWidget(_sec(""))
         lay.addLayout(self._build_input_row())
 
         self._interrupt_btn = QPushButton("✋  INTERRUPT  [ESC]")
@@ -4786,11 +4786,8 @@ class MainWindow(QMainWindow):
         if self._customize_overlay:
             self._customize_overlay.hide()
         cw = self.centralWidget()
-        try:
-            from core import local_tts
-            _local_voice_on = local_tts.is_enabled()
-        except Exception:
-            _local_voice_on = False
+        
+        _local_voice_on = False
         ov = CustomizeOverlay(
             cfg.get("assistant_name", "AURA") or "AURA",
             cfg.get("user_name", ""),

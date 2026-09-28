@@ -80,14 +80,13 @@ from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
-from core                      import local_tts
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
-WAKE_SLEEP_TIMEOUT = 1000.0   # seconds (20 minutes)
+WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -321,25 +320,6 @@ def _clean_transcript(text: str) -> str:
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
 
-_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
-
-
-def _split_ready_sentences(buf: str) -> tuple[str, list[str]]:
-    """Split whole sentences off a running transcript buffer for local TTS.
-
-    `output_transcription` arrives in small, often mid-word fragments — fine
-    for `feed_text`'s viseme hints, but a local voice needs a complete
-    sentence to get pacing and intonation right. Only the trailing fragment
-    with no terminal punctuation yet is kept for the next call.
-    """
-    if not buf:
-        return buf, []
-    parts = _SENTENCE_END_RE.split(buf)
-    if len(parts) <= 1:
-        return buf, []
-    *ready, remainder = parts
-    return remainder, [p.strip() for p in ready if p.strip()]
-
 TOOL_DECLARATIONS = [
     # ── Inline tools ─────────────────────────────────────────────────────────
     # These stay here (rather than in an actions/*.py TOOL dict) because their
@@ -424,29 +404,6 @@ TOOL_DECLARATIONS = [
             "type": "OBJECT",
             "properties": {},
         }
-    },
-    {
-        "name": "toggle_local_voice",
-        "description": (
-            "Switches between AURA's normal cloud voice and a fully offline, "
-            "local British English voice that runs on this machine with no "
-            "internet connection. Call this when the user asks to switch to "
-            "the British voice, the local/offline voice, or back to the "
-            "normal/default/cloud voice (in ANY language)."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "enabled": {
-                    "type": "BOOLEAN",
-                    "description": (
-                        "true to speak with the local British voice, "
-                        "false to go back to the normal voice"
-                    ),
-                },
-            },
-            "required": ["enabled"],
-        },
     },
     {
         "name": "save_memory",
@@ -577,7 +534,6 @@ class AuraLive:
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
-        self._local_speech_queue  = None    # asyncio.Queue[str]; local British TTS, sentence-by-sentence
         self._loop                     = None
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
@@ -598,16 +554,6 @@ class AuraLive:
         self._ptt                  = None    # core.hotkey.PushToTalk
         self._out_level            = 0.0     # level of the audio being played right now
         self._echo                 = EchoGuard()
-        # Local British TTS: entirely optional and additive. When active,
-        # `_receive_audio` discards Gemini's own audio for the turn and speaks
-        # the same transcript through this instead — everything downstream
-        # (viseme extraction, EchoGuard, interrupt(), the output-device
-        # picker) only ever looks at PCM sitting in `audio_in_queue`, so none
-        # of it needs to know or care where those bytes came from.
-        _lv = local_tts.available_voice_id()
-        print(f"[AURA] 🇬🇧 Local voice ready: {_lv}" if _lv else
-              "[AURA] 🇬🇧 No offline British voice found on this machine — "
-              "toggle_local_voice will fall back to the normal voice.")
         # `stream.write()` returns when the buffer accepts the audio, not when the
         # speaker has finished with it, so sound is still in the room after the
         # speaking flag drops. Streaming the microphone during that gap is how an
@@ -989,13 +935,6 @@ class AuraLive:
                     break
             if drained:
                 print(f"[AURA] ✋ Interrupted — {drained} audio chunks discarded")
-        lq = self._local_speech_queue
-        if lq:
-            while True:
-                try:
-                    lq.get_nowait()
-                except Exception:
-                    break
         self.set_speaking(False)
         # The words we were about to mouth are never going to be spoken now.
         self._visemes.reset()
@@ -1297,25 +1236,6 @@ class AuraLive:
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
 
-            elif name == "toggle_local_voice":
-                want = bool(args.get("enabled", True))
-                if want:
-                    local_tts.enable()
-                    if local_tts.available_voice_id():
-                        result = "Switched to the local British voice."
-                    else:
-                        # Config says "on", but there is nothing to speak with —
-                        # `local_tts.active()` will keep returning False, so
-                        # playback quietly stays on Gemini's own audio. Tell the
-                        # user the truth rather than pretend it worked.
-                        result = (
-                            "No offline British voice is installed on this "
-                            "machine, so I'm staying on the normal voice."
-                        )
-                else:
-                    local_tts.disable()
-                    result = "Switched back to the normal voice."
-
             elif self._action_registry.has(name):
                 # file_processor: fall back to the currently-uploaded file when none is given
                 if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
@@ -1549,7 +1469,6 @@ class AuraLive:
     async def _receive_audio(self):
         print("[AURA] 👂 Recv started")
         out_buf, in_buf = [], []
-        local_buf = ""   # unsynthesized tail of this turn's transcript, local-TTS only
 
         try:
             while True:
@@ -1571,13 +1490,6 @@ class AuraLive:
                     if response.data:
                         if self._interrupted:
                             pass  # discard: interrupted
-                        elif local_tts.active():
-                            # The local British voice is speaking this turn
-                            # instead (queued below, from the transcript) —
-                            # Gemini still generates audio server-side, it is
-                            # just never enqueued here, so the two voices can
-                            # never overlap.
-                            pass
                         else:
                             if self._turn_done_event and self._turn_done_event.is_set():
                                 self._turn_done_event.clear()
@@ -1611,12 +1523,6 @@ class AuraLive:
                                 # not by which audio is playing.
                                 self._visemes.feed_text(txt)
 
-                                if local_tts.active():
-                                    local_buf += (" " if local_buf else "") + txt
-                                    local_buf, ready = _split_ready_sentences(local_buf)
-                                    for _sentence in ready:
-                                        self._local_speech_queue.put_nowait(_sentence)
-
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
@@ -1633,7 +1539,6 @@ class AuraLive:
                                 self._interrupted = False
                                 in_buf    = []
                                 out_buf   = []
-                                local_buf = ""
                                 self._visemes.reset()
                                 continue
 
@@ -1669,10 +1574,6 @@ class AuraLive:
                                     }))
                             out_buf = []
 
-                            if local_tts.active() and local_buf.strip():
-                                self._local_speech_queue.put_nowait(local_buf.strip())
-                            local_buf = ""
-
                             if self._vision_close_pending:
                                 # This turn_complete IS the vision answer — close camera + release busy flag
                                 self._vision_close_pending = False
@@ -1696,48 +1597,6 @@ class AuraLive:
             print(f"[AURA] ❌ Recv: {e}")
             traceback.print_exc()
             raise
-
-    async def _run_local_tts(self) -> None:
-        """Serial worker: turns queued sentences into the local British voice.
-
-        Runs for the life of the session (started in the TaskGroup next to
-        `_receive_audio`/`_play_audio`) and pulls one sentence at a time off
-        `self._local_speech_queue`. Sentences are synthesized strictly in the
-        order they were spoken — the underlying engine handles one utterance
-        at a time regardless, and this keeps playback order correct with no
-        extra bookkeeping.
-
-        The result is sliced into the same ~50 ms chunks `_receive_audio`
-        uses for Gemini's own audio and pushed into `audio_in_queue`, so
-        `_play_audio`, the viseme extractor, EchoGuard and `interrupt()` all
-        treat it exactly like any other audio — none of them change.
-        """
-        _SLICE = 2400   # 24000 Hz × 2 bytes/sample × 0.05 s — matches _receive_audio
-        while True:
-            text = await self._local_speech_queue.get()
-
-            # The turn may have been interrupted, or the voice switched off,
-            # while this sentence was sitting in the queue — check again right
-            # before spending time synthesizing it.
-            if self._interrupted or not local_tts.active():
-                continue
-
-            try:
-                pcm = await asyncio.to_thread(
-                    local_tts.synthesize_pcm16, text, RECEIVE_SAMPLE_RATE
-                )
-            except Exception as e:
-                print(f"[AURA] ⚠️  Local voice failed on a sentence: {e} — "
-                      "it will stay silent, the rest of the reply continues.")
-                continue
-
-            if not pcm or self._interrupted or not local_tts.active():
-                continue
-
-            if self._turn_done_event and self._turn_done_event.is_set():
-                self._turn_done_event.clear()
-            for _i in range(0, len(pcm), _SLICE):
-                self.audio_in_queue.put_nowait(pcm[_i : _i + _SLICE])
 
     async def _play_audio(self):
         print("[AURA] 🔊 Play started")
@@ -2254,7 +2113,6 @@ class AuraLive:
                     self.session          = session
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
-                    self._local_speech_queue = asyncio.Queue()
                     self._turn_done_event = asyncio.Event()
 
                     # Reset transient state that must not carry over from a previous session
@@ -2293,7 +2151,6 @@ class AuraLive:
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
-                    tg.create_task(self._run_local_tts())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
