@@ -53,7 +53,7 @@ def _read_full_config() -> dict:
 
 _DEFAULT_W, _DEFAULT_H = 980, 700
 _MIN_W,     _MIN_H     = 820, 580
-_LEFT_W  = 148
+_LEFT_W  = 206
 _RIGHT_W = 340
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
@@ -692,6 +692,162 @@ class HudCanvas(QWidget):
         p.setPen(QPen(col, 1))
         p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
         p.drawText(QRectF(0, cy, W, 26), Qt.AlignmentFlag.AlignCenter, self._assistant_name)
+
+class HudButton(QPushButton):
+    """Chamfered outline button in the HUD style. Draws its own frame and
+    content (text, or a vector microphone icon), so no emoji are needed.
+    Colours are read at paint time, so accent re-theming keeps working."""
+
+    def __init__(self, text: str = "", kind: str = "text", parent=None):
+        super().__init__(text, parent)
+        self._kind  = kind      # "text" | "mic"
+        self._alert = False     # True → red (used for the muted mic)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_alert(self, on: bool):
+        self._alert = bool(on)
+        self.update()
+
+    def enterEvent(self, e):
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = float(self.width()), float(self.height())
+        col = qcol(C.MUTED_C if self._alert else C.PRI)
+
+        m, c = 1.5, 6.0
+        path = QPainterPath()
+        path.moveTo(m + c, m)
+        path.lineTo(W - m - c, m)
+        path.lineTo(W - m, m + c)
+        path.lineTo(W - m, H - m - c)
+        path.lineTo(W - m - c, H - m)
+        path.lineTo(m + c, H - m)
+        path.lineTo(m, H - m - c)
+        path.lineTo(m, m + c)
+        path.closeSubpath()
+
+        if self.isDown():
+            p.setBrush(QBrush(qcol(C.PRI_GHO)))
+        elif self.underMouse():
+            p.setBrush(QBrush(qcol(C.PRI_GHO, 170)))
+        else:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(col, 2.0))
+        p.drawPath(path)
+
+        if self._kind == "mic":
+            pen = QPen(col, 1.7)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            cx, cy = W / 2.0, H / 2.0
+            p.drawRoundedRect(QRectF(cx - 3.5, cy - 9, 7, 12), 3.5, 3.5)
+            p.drawArc(QRectF(cx - 7, cy - 6, 14, 14), 180 * 16, 180 * 16)
+            p.drawLine(QPointF(cx, cy + 8), QPointF(cx, cy + 11))
+            p.drawLine(QPointF(cx - 4, cy + 11), QPointF(cx + 4, cy + 11))
+            if self._alert:   # muted → slash through the icon
+                p.drawLine(QPointF(cx - 9, cy - 9), QPointF(cx + 9, cy + 11))
+        else:
+            p.setPen(QPen(col, 1))
+            p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+            p.drawText(QRectF(0, 0, W, H), Qt.AlignmentFlag.AlignCenter, self.text())
+        p.end()
+
+
+class TitleBar(QWidget):
+    """Header title with angled HUD rules on either side of the name."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(40)
+        self.setMinimumWidth(250)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = float(self.width()), float(self.height())
+        y1 = H / 2.0 - 2.0
+        y2 = y1 + 13.0
+        pen = QPen(qcol(C.PRI), 1.4)
+        p.setPen(pen)
+        p.drawLine(QPointF(2, y1), QPointF(46, y1))
+        p.drawLine(QPointF(46, y1), QPointF(60, y2))
+        p.drawLine(QPointF(W - 60, y2), QPointF(W - 46, y1))
+        p.drawLine(QPointF(W - 46, y1), QPointF(W - 2, y1))
+        p.end()
+
+
+class StatsBox(QWidget):
+    """HUD-style system stats box: chamfered orange frame with
+    CPU / RAM / GPU / NET rows. Painted with live palette colours (C.PRI)
+    so accent re-theming keeps working."""
+
+    _ROWS = ("CPU", "RAM", "GPU", "NET")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._vals = {k: "--" for k in self._ROWS}
+        self.setFixedSize(190, 150)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+    def set_values(self, cpu: str, ram: str, gpu: str, net: str):
+        self._vals = {"CPU": cpu, "RAM": ram, "GPU": gpu, "NET": net}
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        col = qcol(C.PRI)
+
+        # chamfered frame
+        m, c = 4.0, 12.0
+        frame = QPainterPath()
+        frame.moveTo(m + c, m)
+        frame.lineTo(W - m - c, m)
+        frame.lineTo(W - m, m + c)
+        frame.lineTo(W - m, H - m - c)
+        frame.lineTo(W - m - c, H - m)
+        frame.lineTo(m + c, H - m)
+        frame.lineTo(m, H - m - c)
+        frame.lineTo(m, m + c)
+        frame.closeSubpath()
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(col, 2.2))
+        p.drawPath(frame)
+
+        # small corner notches (inner chamfer accents)
+        p.setPen(QPen(col, 1.6))
+        n = 5.0
+        for (cx, cy, dx, dy) in ((m + c, m, -1, 1), (W - m - c, m, 1, 1),
+                                 (W - m - c, H - m, 1, -1), (m + c, H - m, -1, -1)):
+            p.drawLine(QPointF(cx, cy + dy * n), QPointF(cx + dx * n, cy + dy * n))
+
+        # rows
+        font = QFont("Courier New", 10, QFont.Weight.Bold)
+        p.setFont(font)
+        p.setPen(QPen(col, 1))
+        top, bottom = 24.0, H - 24.0
+        row_h = (bottom - top) / len(self._ROWS)
+        for i, key in enumerate(self._ROWS):
+            y = top + i * row_h
+            r_lab = QRectF(22, y, 44, row_h)
+            r_sep = QRectF(68, y, 12, row_h)
+            r_val = QRectF(84, y, W - 84 - 10, row_h)
+            al = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            p.drawText(r_lab, al, key)
+            p.drawText(r_sep, al, ":")
+            p.drawText(r_val, al, self._vals.get(key, "--"))
+        p.end()
+
 
 class MetricBar(QWidget):
 
@@ -2901,7 +3057,6 @@ class MainWindow(QMainWindow):
         body.addWidget(self._right_panel, stretch=0)
 
         root.addLayout(body, stretch=1)
-        root.addWidget(self._build_footer())
 
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
@@ -3428,12 +3583,14 @@ class MainWindow(QMainWindow):
         snap = _metrics.snapshot()
 
         # CPU
-        cpu = snap["cpu"]
-        self._bar_cpu.set_value(cpu, f"{cpu:.0f}%")
+        cpu_str = f"{snap['cpu']:.0f}%"
 
-        # MEM
-        mem = snap["mem"]
-        self._bar_mem.set_value(mem, f"{mem:.0f}%")
+        # RAM
+        ram_str = f"{snap['mem']:.0f}%"
+
+        # GPU
+        gpu = snap["gpu"]
+        gpu_str = f"{gpu:.0f}%" if gpu >= 0 else "N/A"
 
         # NET
         net = snap["net"]
@@ -3441,38 +3598,8 @@ class MainWindow(QMainWindow):
             net_str = f"{net*1024:.0f}KB/s"
         else:
             net_str = f"{net:.1f}MB/s"
-        net_pct = min(100, net * 10)  # 10 MB/s = %100
-        self._bar_net.set_value(net_pct, net_str)
 
-        # GPU
-        gpu = snap["gpu"]
-        if gpu >= 0:
-            self._bar_gpu.set_value(gpu, f"{gpu:.0f}%")
-        else:
-            self._bar_gpu.set_value(0, "N/A")
-
-        # TMP
-        tmp = snap["tmp"]
-        if tmp >= 0:
-            tmp_pct = min(100, (tmp / 100) * 100)
-            self._bar_tmp.set_value(tmp_pct, f"{tmp:.0f}°C")
-        else:
-            self._bar_tmp.set_value(0, "N/A")
-
-        try:
-            boot_t  = psutil.boot_time()
-            elapsed = time.time() - boot_t
-            h = int(elapsed // 3600)
-            m = int((elapsed % 3600) // 60)
-            self._uptime_lbl.setText(f"UP  {h:02d}:{m:02d}")
-        except Exception:
-            self._uptime_lbl.setText("UP  --:--")
-
-        try:
-            proc_count = len(psutil.pids())
-            self._proc_lbl.setText(f"PROC  {proc_count}")
-        except Exception:
-            self._proc_lbl.setText("PROC  --")
+        self._stats_box.set_values(cpu_str, ram_str, gpu_str, net_str)
 
 
     def _build_header(self) -> QWidget:
@@ -3481,13 +3608,56 @@ class MainWindow(QMainWindow):
         w.setStyleSheet(f"background: {C.DARK};")
         lay = QHBoxLayout(w)
         lay.setContentsMargins(16, 0, 16, 0)
+        lay.setSpacing(8)
 
-        def _badge(txt, color=C.TEXT_MED):
-            l = QLabel(txt)
-            l.setFont(QFont("Courier New", 8))
-            l.setStyleSheet(f"color: {color}; background: transparent;")
-            return l
+        # ── title with angled HUD rules (left) ──────────────────────────────
+        _disp = self._assistant_name.upper()
+        title_bar = TitleBar()
+        tl = QHBoxLayout(title_bar)
+        tl.setContentsMargins(70, 0, 70, 0)
+        self._title_lbl = QLabel(_disp)
+        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _tf = QFont("Courier New", 15, QFont.Weight.Bold)
+        _tf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
+        self._title_lbl.setFont(_tf)
+        self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        tl.addWidget(self._title_lbl)
+        lay.addWidget(title_bar)
 
+        # Subtitle / clock / date are no longer shown in the header, but the
+        # labels are kept (hidden) because other code updates them.
+        _sub_text = ("Autonomous User Responsive Agent"
+                     if _disp in ("AURA", "A.U.R.A")
+                     else "Personal AI Assistant")
+        self._sub_lbl = QLabel(_sub_text, w)
+        self._sub_lbl.setFont(QFont("Courier New", 7))
+        self._sub_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
+        self._sub_lbl.hide()
+        self._clock_lbl = QLabel("00:00:00", w)
+        self._clock_lbl.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
+        self._clock_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        self._clock_lbl.hide()
+        self._date_lbl = QLabel("", w)
+        self._date_lbl.setFont(QFont("Courier New", 7))
+        self._date_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._date_lbl.hide()
+
+        lay.addStretch()
+
+        # ── microphone + stop (interrupt) buttons ───────────────────────────
+        self._mute_btn = HudButton("", "mic")
+        self._mute_btn.setFixedSize(58, 30)
+        self._mute_btn.clicked.connect(self._toggle_mute)
+        self._style_mute_btn()
+        lay.addWidget(self._mute_btn)
+
+        self._interrupt_btn = HudButton("stop", "text")
+        self._interrupt_btn.setFixedSize(76, 30)
+        self._interrupt_btn.setToolTip("Interrupt  [ESC]")
+        self._interrupt_btn.clicked.connect(self._do_interrupt)
+        lay.addWidget(self._interrupt_btn)
+
+        # ── settings button (unchanged, just moved to the far right) ────────
         self._drawer_btn = QPushButton("⚙")
         self._drawer_btn.setFixedSize(26, 26)
         self._drawer_btn.setFont(QFont("Courier New", 11))
@@ -3504,38 +3674,6 @@ class MainWindow(QMainWindow):
         self._drawer_btn.setCheckable(True)
         self._drawer_btn.clicked.connect(self._toggle_drawer)
         lay.addWidget(self._drawer_btn)
-        lay.addStretch()
-
-        mid = QVBoxLayout(); mid.setSpacing(1)
-        _disp = self._assistant_name.upper()
-        self._title_lbl = QLabel(_disp)
-        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_lbl.setFont(QFont("Courier New", 17, QFont.Weight.Bold))
-        self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        mid.addWidget(self._title_lbl)
-        _sub_text = ("Autonomous User Responsive Agent"
-                     if _disp in ("AURA", "A.U.R.A")
-                     else "Personal AI Assistant")
-        self._sub_lbl = QLabel(_sub_text)
-        self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._sub_lbl.setFont(QFont("Courier New", 7))
-        self._sub_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
-        mid.addWidget(self._sub_lbl)
-        lay.addLayout(mid)
-        lay.addStretch()
-
-        right_col = QVBoxLayout(); right_col.setSpacing(2)
-        self._clock_lbl = QLabel("00:00:00")
-        self._clock_lbl.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
-        self._clock_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        self._clock_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._clock_lbl)
-        self._date_lbl = QLabel("")
-        self._date_lbl.setFont(QFont("Courier New", 7))
-        self._date_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-        self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._date_lbl)
-        lay.addLayout(right_col)
         return w
 
     def _tick_clock(self):
@@ -3550,61 +3688,21 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(8, 10, 8, 10)
         lay.setSpacing(6)
 
-        hdr = QLabel("◈ SYS MONITOR")
-        hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; "
-                          f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
-        lay.addWidget(hdr)
-        lay.addSpacing(2)
+        # Push the stats box to the bottom-left corner.
+        lay.addStretch(1)
 
-        self._bar_cpu = MetricBar("CPU", C.PRI)
-        self._bar_mem = MetricBar("MEM", C.ACC2)
-        self._bar_net = MetricBar("NET", C.GREEN)
-        self._bar_gpu = MetricBar("GPU", C.ACC)
-        self._bar_tmp = MetricBar("TMP", "#ff6688")
-
-        for bar in [self._bar_cpu, self._bar_mem, self._bar_net,
-                    self._bar_gpu, self._bar_tmp]:
-            lay.addWidget(bar)
-
-        lay.addSpacing(4)
-
-        info_panel = QWidget()
-        info_panel.setStyleSheet(
-            f"background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 4px;"
-        )
-        ip_lay = QVBoxLayout(info_panel)
-        ip_lay.setContentsMargins(6, 5, 6, 5)
-        ip_lay.setSpacing(3)
-
-        self._uptime_lbl = QLabel("UP  --:--")
-        self._uptime_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._uptime_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; border: none;")
-        ip_lay.addWidget(self._uptime_lbl)
-
-        self._proc_lbl = QLabel("PROC  --")
-        self._proc_lbl.setFont(QFont("Courier New", 8))
-        self._proc_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
-        ip_lay.addWidget(self._proc_lbl)
-
-        os_name = {"Windows": "WIN", "Darwin": "macOS", "Linux": "LINUX"}.get(_OS, _OS.upper())
-        os_lbl = QLabel(f"OS  {os_name}")
-        os_lbl.setFont(QFont("Courier New", 8))
-        os_lbl.setStyleSheet(f"color: {C.ACC2}; background: transparent; border: none;")
-        ip_lay.addWidget(os_lbl)
-
-        lay.addWidget(info_panel)
-        lay.addSpacing(4)
-
-        lay.addStretch()
+        self._stats_box = StatsBox()
+        lay.addWidget(self._stats_box, 0,
+                      Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
 
         return w
+
     def _build_right_panel(self) -> QWidget:
         w = QWidget()
         w.setFixedWidth(_RIGHT_W)
         w.setStyleSheet(f"background: {C.DARK};")
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setContentsMargins(8, 8, 8, 6)
         lay.setSpacing(2)
 
         def _sec(txt):
@@ -3639,33 +3737,6 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_sec(""))
         lay.addLayout(self._build_input_row())
-
-        self._interrupt_btn = QPushButton("✋  INTERRUPT  [ESC]")
-        self._interrupt_btn.setFixedHeight(34)
-        self._interrupt_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._interrupt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._interrupt_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: #140008; color: {C.MUTED_C};
-                border: 1px solid {C.MUTED_C}; border-radius: 3px;
-            }}
-            QPushButton:hover {{
-                background: #200010; border: 1px solid #ff6688;
-            }}
-            QPushButton:pressed {{
-                background: #300018;
-            }}
-        """)
-        self._interrupt_btn.clicked.connect(self._do_interrupt)
-        lay.addWidget(self._interrupt_btn)
-
-        self._mute_btn = QPushButton("🎙  MICROPHONE ACTIVE")
-        self._mute_btn.setFixedHeight(30)
-        self._mute_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._mute_btn.clicked.connect(self._toggle_mute)
-        self._style_mute_btn()
-        lay.addWidget(self._mute_btn)
 
         return w
 
@@ -5024,23 +5095,10 @@ class MainWindow(QMainWindow):
             self._log.append_log("SYS: Microphone active.")
 
     def _style_mute_btn(self):
-        if self._muted:
-            self._mute_btn.setText("🔇  MICROPHONE MUTED")
-            self._mute_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: #140006; color: {C.MUTED_C};
-                    border: 1px solid {C.MUTED_C}; border-radius: 3px;
-                }}
-            """)
-        else:
-            self._mute_btn.setText("🎙  MICROPHONE ACTIVE")
-            self._mute_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: #00140a; color: {C.GREEN};
-                    border: 1px solid {C.GREEN}; border-radius: 3px;
-                }}
-                QPushButton:hover {{ background: #001f10; }}
-            """)
+        self._mute_btn.set_alert(self._muted)
+        self._mute_btn.setToolTip(
+            "Microphone muted — click to unmute" if self._muted
+            else "Microphone active — click to mute")
 
     def _send(self):
         txt = self._input.text().strip()
