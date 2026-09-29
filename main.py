@@ -84,6 +84,24 @@ from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
 
+def _capture_camera_shared(ui):
+    """Grab a webcam frame while the always-on room watch briefly lets go of the device."""
+    _pause  = getattr(ui, "pause_room_watch", None)
+    _resume = getattr(ui, "resume_room_watch", None)
+    try:
+        if callable(_pause):
+            _pause()
+    except Exception as _e:
+        print(f"[RoomWatch] pause failed: {_e}")
+    try:
+        return _capture_camera()
+    finally:
+        try:
+            if callable(_resume):
+                _resume()
+        except Exception as _e:
+            print(f"[RoomWatch] resume failed: {_e}")
+
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
@@ -1176,7 +1194,7 @@ class AuraLive:
                     angle     = args.get("angle", "screen").lower()
                     user_text = args.get("text", "What do you see?")
                     if angle == "camera":
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
+                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera_shared, self.ui)
                         self.ui.start_camera_stream()
                         self._vision_cam_active = True
                         print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")

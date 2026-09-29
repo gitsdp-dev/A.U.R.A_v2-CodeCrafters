@@ -1273,6 +1273,152 @@ class _CameraPreview(QWidget):
         self._timer.start(6_000)   # auto-dismiss after 6 s
 
 
+class _DragHeader(QWidget):
+    """Header strip that drags its parent widget around inside the parent's parent."""
+
+    def __init__(self, target: QWidget):
+        super().__init__(target)
+        self._target = target
+        self._off = None
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setStyleSheet("background: transparent;")
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            t = self._target
+            p = t.parentWidget()
+            gp = ev.globalPosition().toPoint()
+            base = p.mapFromGlobal(gp) if p is not None else gp
+            self._off = base - t.pos()
+            ev.accept()
+        else:
+            super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if (ev.buttons() & Qt.MouseButton.LeftButton) and self._off is not None:
+            t = self._target
+            p = t.parentWidget()
+            gp = ev.globalPosition().toPoint()
+            base = p.mapFromGlobal(gp) if p is not None else gp
+            t.move_clamped(base - self._off)
+            t.user_moved = True
+            ev.accept()
+        else:
+            super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        self._off = None
+        super().mouseReleaseEvent(ev)
+
+
+class _RoomWatchBox(QWidget):
+    """Always-on floating room-monitor box: live webcam preview, draggable
+    by its header, with a cross in the top-right corner."""
+
+    _W     = 244
+    _IMG_W = 228
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("RoomWatchBox")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            QWidget#RoomWatchBox {{
+                background: {C.DARK};
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._W)
+        self.user_moved = False      # True once the user has dragged it somewhere
+        self.on_close = None         # callable set by MainWindow
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 8)
+        lay.setSpacing(5)
+
+        hdr_w = _DragHeader(self)
+        hdr = QHBoxLayout(hdr_w)
+        hdr.setContentsMargins(0, 0, 0, 0)
+        hdr.setSpacing(6)
+
+        dot = QLabel("◈")
+        dot.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        dot.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        hdr.addWidget(dot)
+
+        title = QLabel("ROOM WATCH")
+        title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        title.setStyleSheet(
+            f"color: {C.PRI}; background: transparent; letter-spacing: 1px; border: none;"
+        )
+        hdr.addWidget(title)
+        hdr.addStretch()
+
+        live = QLabel("● LIVE")
+        live.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        live.setStyleSheet(f"color: {C.RED}; background: transparent; border: none;")
+        hdr.addWidget(live)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(16, 16)
+        close_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setToolTip("Close room watch  [F8 to reopen]")
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_DIM}; border: none;
+            }}
+            QPushButton:hover {{ color: {C.MUTED_C}; }}
+        """)
+        close_btn.clicked.connect(self._close_clicked)
+        hdr.addWidget(close_btn)
+        lay.addWidget(hdr_w)
+
+        self._img = QLabel("CONNECTING…")
+        self._img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img.setFont(QFont("Courier New", 7))
+        self._img.setFixedSize(self._IMG_W, 150)
+        self._img.setStyleSheet(
+            f"background: #000000; color: {C.TEXT_DIM};"
+            f" border: 1px solid {C.BORDER}; border-radius: 3px;"
+        )
+        lay.addWidget(self._img)
+        self.adjustSize()
+        self.hide()
+
+    def _close_clicked(self) -> None:
+        cb = self.on_close
+        if callable(cb):
+            cb()
+        else:
+            self.hide()
+
+    def move_clamped(self, pt) -> None:
+        p = self.parentWidget()
+        if p is None:
+            self.move(pt)
+            return
+        x = max(0, min(pt.x(), max(0, p.width()  - self.width())))
+        y = max(0, min(pt.y(), max(0, p.height() - self.height())))
+        self.move(x, y)
+
+    def set_frame(self, img_bytes: bytes) -> bool:
+        """Show one JPEG frame. Returns True if the box changed size."""
+        px = QPixmap()
+        if not px.loadFromData(img_bytes) or px.isNull():
+            return False
+        scaled = px.scaledToWidth(
+            self._IMG_W, Qt.TransformationMode.SmoothTransformation
+        )
+        changed = (self._img.width(), self._img.height()) != (scaled.width(), scaled.height())
+        if changed:
+            self._img.setFixedSize(scaled.width(), scaled.height())
+            self.adjustSize()
+        self._img.setPixmap(scaled)
+        return changed
+
+
 class SetupOverlay(QWidget):
     done = pyqtSignal(str, str)
 
@@ -2932,6 +3078,8 @@ class MainWindow(QMainWindow):
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
+    _room_frame_sig = pyqtSignal(bytes)      # always-on room-watch preview frame
+    _room_lost_sig  = pyqtSignal()           # room-watch camera missing / unplugged
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -3094,6 +3242,22 @@ class MainWindow(QMainWindow):
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
         self._cam_preview = _CameraPreview(self.centralWidget())
 
+        # Always-on room watch: floating live preview under the header buttons.
+        # Stays hidden unless a camera actually delivers frames.
+        self._room_enabled = True            # False after the user closes the box
+        self._room_live    = False           # True while the camera is delivering frames
+        self._cam_relay    = False           # True while the HUD live view reuses room-watch frames
+        self._room_lock    = threading.Lock()
+        self._room_quit    = threading.Event()
+        self._room_thread  = None
+        self._room_box = _RoomWatchBox(self.centralWidget())
+        self._room_box.on_close = self._room_close
+        self._room_frame_sig.connect(self._on_room_frame)
+        self._room_lost_sig.connect(self._on_room_lost)
+        sc_room = QShortcut(QKeySequence("F8"), self)
+        sc_room.activated.connect(self._toggle_room_watch)
+        self._room_start()
+
         # Clipboard panel (child of central widget, bottom-center)
         self._clipboard_panel = ClipboardPanel(self.centralWidget())
         self._clipboard_panel.action_requested.connect(self._on_clipboard_action)
@@ -3146,6 +3310,13 @@ class MainWindow(QMainWindow):
     def start_camera_stream(self) -> None:
         self._cam_stop.clear()
         self._cam_stream_sig.emit(True)
+        if self._room_enabled and self._room_live:
+            # The room watch already owns the camera — reuse its frames
+            # instead of opening the device a second time.
+            self._cam_relay = True
+            self._room_start()
+            return
+        self._cam_relay = False
         t = threading.Thread(target=self._cam_loop, daemon=True, name="cam-stream")
         t.start()
 
@@ -3185,6 +3356,190 @@ class MainWindow(QMainWindow):
 
     def stop_camera_stream(self) -> None:
         self._cam_stop.set()
+        if self._cam_relay:
+            self._cam_relay = False
+            self._cam_stream_sig.emit(False)
+
+    # --- Always-on room watch ----------------------------------------------
+    def _room_start(self) -> None:
+        """Start the room-watch thread (no-op if running or closed by the user)."""
+        with self._room_lock:
+            if not self._room_enabled:
+                return
+            t = self._room_thread
+            if t is not None and t.is_alive() and not self._room_quit.is_set():
+                return
+            old = t
+        if old is not None and old.is_alive():
+            old.join(1.5)            # let it release the camera first
+        with self._room_lock:
+            cur = self._room_thread
+            if cur is not None and cur is not old and cur.is_alive():
+                return
+            if not self._room_enabled:
+                return
+            ev = threading.Event()
+            self._room_quit = ev
+            th = threading.Thread(target=self._room_loop, args=(ev,),
+                                  daemon=True, name="room-watch")
+            self._room_thread = th
+            th.start()
+
+    def _room_halt(self, join: float = 0.0) -> None:
+        with self._room_lock:
+            ev, t = self._room_quit, self._room_thread
+            ev.set()
+        if join and t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(join)
+
+    def pause_room_watch(self) -> None:
+        """Thread-safe: briefly release the camera (another capture needs it)."""
+        self._room_halt(3.0)
+
+    def resume_room_watch(self) -> None:
+        """Thread-safe: take the camera back after pause_room_watch()."""
+        if self._room_enabled:
+            time.sleep(0.3)
+            self._room_start()
+
+    def _room_open(self, cv2):
+        """Open the setup camera (configured index first, then 0). None if absent."""
+        idxs = []
+        try:
+            idxs.append(int(_read_full_config().get("camera_index", 0)))
+        except Exception:
+            pass
+        if 0 not in idxs:
+            idxs.append(0)
+        try:
+            backend = cv2.CAP_DSHOW if _OS == "Windows" else cv2.CAP_ANY
+        except AttributeError:
+            backend = 0
+        for i in idxs:
+            cap = None
+            try:
+                cap = cv2.VideoCapture(i, backend)
+                if cap is not None and cap.isOpened():
+                    ok, fr = cap.read()
+                    if ok and fr is not None:
+                        return cap
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:
+                    pass
+        return None
+
+    def _room_loop(self, quit_ev: threading.Event) -> None:
+        try:
+            import cv2
+        except Exception as e:
+            print(f"[RoomWatch] OpenCV unavailable: {e}")
+            return
+        cap = None
+        fails = 0
+        try:
+            while not quit_ev.is_set():
+                if cap is None:
+                    cap = self._room_open(cv2)
+                    if cap is None:
+                        if self._room_live:
+                            self._room_live = False
+                            self._room_lost_sig.emit()
+                        quit_ev.wait(10.0)       # no camera — retry later (hot-plug)
+                        continue
+                    self._room_live = True
+                    fails = 0
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    fails += 1
+                    if fails >= 30:              # camera vanished
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                        self._room_live = False
+                        self._room_lost_sig.emit()
+                    quit_ev.wait(0.05)
+                    continue
+                fails = 0
+                try:
+                    h, w = frame.shape[:2]
+                    small = frame
+                    if w > 320 and h > 0:
+                        small = cv2.resize(frame, (320, max(1, int(h * 320 / w))))
+                    okj, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    if okj:
+                        self._room_frame_sig.emit(buf.tobytes())
+                    if self._cam_relay and not self._cam_stop.is_set():
+                        okf, fbuf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                        if okf:
+                            self._cam_frame_sig.emit(fbuf.tobytes())
+                except Exception as e:
+                    print(f"[RoomWatch] Frame error: {e}")
+                quit_ev.wait(0.066)              # ~15 fps
+        except Exception as e:
+            print(f"[RoomWatch] Loop error: {e}")
+        finally:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+
+    def _on_room_frame(self, data: bytes) -> None:
+        if not self._room_enabled:
+            return
+        changed = self._room_box.set_frame(data)
+        if not self._room_box.isVisible():
+            self._position_room_box()
+            self._room_box.show()
+            self._room_box.raise_()
+        elif changed:
+            self._position_room_box()
+
+    def _on_room_lost(self) -> None:
+        self._room_box.hide()
+
+    def _room_close(self) -> None:
+        """✕ pressed: hide the box and let go of the camera."""
+        self._room_enabled = False
+        self._room_live = False
+        self._room_halt(0.0)
+        self._room_box.hide()
+        if self._cam_relay:
+            self.stop_camera_stream()
+
+    def _toggle_room_watch(self) -> None:
+        if self._room_enabled:
+            self._room_close()
+        else:
+            self._room_enabled = True
+            self._room_start()
+
+    def _position_room_box(self) -> None:
+        b = getattr(self, "_room_box", None)
+        cw = self.centralWidget()
+        if b is None or cw is None:
+            return
+        if b.user_moved:
+            b.move_clamped(b.pos())
+        else:
+            # Top-right corner, just below the mic / stop / settings buttons
+            # (the header is 54 px tall).
+            b.move(max(0, cw.width() - b.width() - 16), 54 + 10)
+
+    def closeEvent(self, e):
+        try:
+            self._room_enabled = False
+            self._room_halt(1.0)
+        except Exception:
+            pass
+        super().closeEvent(e)
 
     # ------------------------------------------------------------------
     # Icon generation — arc-reactor style, rendered with Pillow
@@ -3569,6 +3924,9 @@ class MainWindow(QMainWindow):
             cw.height() - ph - 28,
             pw, ph,
         )
+        # Room-watch box — top-right, below the header buttons
+        if hasattr(self, '_room_box') and self._room_box.isVisible():
+            self._position_room_box()
         # Clipboard panel — bottom-center
         if hasattr(self, '_clipboard_panel') and self._clipboard_panel.isVisible():
             self._position_clipboard_panel()
@@ -5342,6 +5700,14 @@ class AuraUI:
     def stop_camera_stream(self) -> None:
         """Thread-safe: stop the live camera feed."""
         self._win.stop_camera_stream()
+
+    def pause_room_watch(self) -> None:
+        """Thread-safe: briefly release the camera for a one-off capture."""
+        self._win.pause_room_watch()
+
+    def resume_room_watch(self) -> None:
+        """Thread-safe: resume the always-on room watch."""
+        self._win.resume_room_watch()
 
     @property
     def assistant_name(self) -> str:
