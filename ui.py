@@ -58,6 +58,176 @@ _RIGHT_W = 340
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
+# ── Face unlock (module-level helpers) ───────────────────────────────────────
+# Uses OpenCV's YuNet (detector) + SFace (recognizer). Both are small ONNX
+# models that are downloaded once into config/face_unlock/. Only 128-number
+# face descriptors are stored (config/face_unlock.json) — never photos.
+FACE_DIR      = CONFIG_DIR / "face_unlock"
+FACE_CFG_FILE = CONFIG_DIR / "face_unlock.json"
+_FACE_MODELS = (
+    ("face_detection_yunet_2023mar.onnx", (
+        "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+        "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+    )),
+    ("face_recognition_sface_2021dec.onnx", (
+        "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+        "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+    )),
+)
+_FACE_MODEL_MIN_BYTES = 100_000
+_FACE_THRESH    = 0.38     # cosine similarity needed to count as "same person" (SFace default 0.363)
+_FACE_NEED      = 3        # consecutive matching checks required before unlocking
+_FACE_ENROLL_N  = 8        # face samples captured during enrolment
+# Modes in which the lock/enrol overlay covers the window.
+_FACE_COVER = ("pending", "prep", "lock", "enroll", "reenroll", "unlocking")
+
+
+def _face_cfg_load() -> dict:
+    cfg = {"enabled": True, "allow_skip": True, "enrolled": []}
+    try:
+        data = json.loads(FACE_CFG_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            for k in ("enabled", "allow_skip", "enrolled"):
+                if k in data:
+                    cfg[k] = data[k]
+    except Exception:
+        pass
+    return cfg
+
+
+def _face_cfg_save(cfg: dict) -> bool:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = FACE_CFG_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg), encoding="utf-8")
+        os.replace(tmp, FACE_CFG_FILE)
+        return True
+    except Exception as e:
+        print(f"[FaceUnlock] Could not save settings: {e}")
+        return False
+
+
+def _face_stored_from(cfg: dict):
+    """Enrolled descriptors as a unit-normalised (N, 128) array, or None."""
+    try:
+        import numpy as np
+        arr = np.asarray(cfg.get("enrolled") or [], dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            return None
+        n = np.linalg.norm(arr, axis=1, keepdims=True)
+        n[n == 0] = 1.0
+        return arr / n
+    except Exception:
+        return None
+
+
+def _face_download(urls, dest: Path, say=None, label: str = "MODEL") -> bool:
+    """Download one model file (tries each URL in turn). True on success."""
+    import urllib.request
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (AURA)"})
+            with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0)
+                got, last = 0, -1
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if total and say:
+                        pct = int(got * 100 / total) // 5 * 5
+                        if pct != last:
+                            last = pct
+                            say(f"DOWNLOADING {label}… {pct}%")
+            if tmp.stat().st_size < _FACE_MODEL_MIN_BYTES:
+                raise ValueError("downloaded file too small")
+            os.replace(tmp, dest)
+            return True
+        except Exception as e:
+            print(f"[FaceUnlock] Download failed ({url}): {e}")
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+    return False
+
+
+class _FaceEngine:
+    """Face detection + descriptor extraction (OpenCV YuNet + SFace)."""
+
+    def __init__(self):
+        self.ready = False
+        self._det = None
+        self._rec = None
+        self._lock = threading.Lock()
+
+    def load(self, say=None) -> bool:
+        try:
+            import cv2
+            if not (hasattr(cv2, "FaceDetectorYN") and hasattr(cv2, "FaceRecognizerSF")):
+                print("[FaceUnlock] This OpenCV build has no FaceDetectorYN / FaceRecognizerSF "
+                      "(needs opencv-python 4.5.4 or newer).")
+                return False
+            paths = []
+            for name, urls in _FACE_MODELS:
+                p = FACE_DIR / name
+                ok = p.exists() and p.stat().st_size >= _FACE_MODEL_MIN_BYTES
+                if not ok:
+                    label = "FACE MODEL" if "sface" in name else "FACE DETECTOR"
+                    if say:
+                        say(f"DOWNLOADING {label}… (first run only)")
+                    if not _face_download(urls, p, say, label):
+                        print(f"[FaceUnlock] Could not download {name}. Download it manually "
+                              f"from the OpenCV Zoo and place it in: {FACE_DIR}")
+                        return False
+                paths.append(p)
+            try:
+                det = cv2.FaceDetectorYN.create(str(paths[0]), "", (320, 320), 0.8, 0.3, 5000)
+                rec = cv2.FaceRecognizerSF.create(str(paths[1]), "")
+            except Exception as e:
+                print(f"[FaceUnlock] Model load failed ({e}) — deleting so it re-downloads next run.")
+                for p in paths:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+                return False
+            self._det, self._rec = det, rec
+            self.ready = True
+            return True
+        except Exception as e:
+            print(f"[FaceUnlock] Engine error: {e}")
+            return False
+
+    def analyse(self, frame):
+        """→ (face_count, unit descriptor of the largest face | None, its width in px)."""
+        import cv2
+        import numpy as np
+        h, w = frame.shape[:2]
+        if w > 640:
+            frame = cv2.resize(frame, (640, max(1, int(h * 640 / w))))
+            h, w = frame.shape[:2]
+        with self._lock:
+            self._det.setInputSize((w, h))
+            _ret, faces = self._det.detect(frame)
+            if faces is None or len(faces) == 0:
+                return 0, None, 0
+            good = [f for f in faces if float(f[14]) >= 0.8 and float(f[2]) >= 40.0]
+            if not good:
+                return 0, None, 0
+            best = max(good, key=lambda f: float(f[2]) * float(f[3]))
+            aligned = self._rec.alignCrop(frame, best)
+            feat = self._rec.feature(aligned)
+        feat = np.asarray(feat, dtype=np.float32).reshape(-1)
+        nrm = float(np.linalg.norm(feat))
+        if nrm <= 0.0:
+            return 0, None, 0
+        return len(good), feat / nrm, int(best[2])
+
 
 class C:
     BG        = "#000000"
@@ -1417,6 +1587,129 @@ class _RoomWatchBox(QWidget):
             self.adjustSize()
         self._img.setPixmap(scaled)
         return changed
+
+
+class FaceLockOverlay(QWidget):
+    """Full-window lock / enrolment screen for face unlock."""
+
+    action_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("FaceLockOverlay")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setStyleSheet(f"QWidget#FaceLockOverlay {{ background: {C.BG}; }}")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 24, 24, 24)
+        outer.setSpacing(12)
+        outer.addStretch(1)
+        _c = Qt.AlignmentFlag.AlignHCenter
+
+        title = QLabel("◈  FACE UNLOCK")
+        title.setFont(QFont("Courier New", 16, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        outer.addWidget(title, 0, _c)
+
+        self._status = QLabel("")
+        self._status.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status.setWordWrap(True)
+        self._status.setFixedWidth(440)
+        outer.addWidget(self._status, 0, _c)
+
+        self._preview = QLabel("CAMERA…")
+        self._preview.setFont(QFont("Courier New", 8))
+        self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview.setFixedSize(320, 240)
+        self._preview.setStyleSheet(
+            f"background: #000000; color: {C.TEXT_DIM};"
+            f" border: 1px solid {C.BORDER_B}; border-radius: 6px;"
+        )
+        outer.addWidget(self._preview, 0, _c)
+
+        self._bar = QProgressBar()
+        self._bar.setFixedSize(320, 8)
+        self._bar.setTextVisible(False)
+        self._bar.setStyleSheet(f"""
+            QProgressBar {{ background: {C.PANEL}; border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QProgressBar::chunk {{ background: {C.PRI}; border-radius: 2px; }}
+        """)
+        self._bar.hide()
+        outer.addWidget(self._bar, 0, _c)
+
+        self._btn = QPushButton("")
+        self._btn.setFixedHeight(28)
+        self._btn.setMinimumWidth(260)
+        self._btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 0 12px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}
+        """)
+        self._btn.clicked.connect(lambda _checked=False: self.action_clicked.emit())
+        self._btn.hide()
+        outer.addWidget(self._btn, 0, _c)
+
+        outer.addStretch(1)
+
+        self._btn_timer = QTimer(self)
+        self._btn_timer.setSingleShot(True)
+        self._btn_timer.timeout.connect(self._btn.show)
+        self.hide()
+
+    def set_status(self, text: str, color: str | None = None) -> None:
+        self._status.setText(text)
+        self._status.setStyleSheet(
+            f"color: {color or C.TEXT_MED}; background: transparent;"
+        )
+
+    def set_progress(self, n: int, total: int) -> None:
+        self._bar.setMaximum(max(1, int(total)))
+        self._bar.setValue(max(0, int(n)))
+
+    def set_frame(self, img_bytes: bytes) -> None:
+        if not self.isVisible():
+            return
+        px = QPixmap()
+        if not px.loadFromData(img_bytes) or px.isNull():
+            return
+        px = QPixmap.fromImage(px.toImage().mirrored(True, False))   # selfie view
+        self._preview.setPixmap(px.scaled(
+            320, 240,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+
+    def set_mode(self, mode: str, allow_skip: bool = True) -> None:
+        self._btn_timer.stop()
+        self._btn.hide()
+        self._bar.hide()
+        self._bar.setValue(0)
+        if mode == "prep":
+            self.set_status("PREPARING FACE RECOGNITION…", C.TEXT_MED)
+            self._btn.setText("CONTINUE WITHOUT FACE UNLOCK")
+            self._btn_timer.start(15000)
+        elif mode == "lock":
+            self.set_status("LOCKED — LOOK AT THE CAMERA", C.PRI)
+            self._btn.setText("ENTER WITHOUT FACE (THIS TIME ONLY)")
+            if allow_skip:
+                self._btn_timer.start(20000)
+        elif mode == "enroll":
+            self.set_status("FIRST-TIME SETUP — LOOK STRAIGHT AT THE CAMERA", C.PRI)
+            self._btn.setText("SKIP — DON'T USE FACE UNLOCK")
+            self._bar.show()
+            self._btn.show()
+        elif mode == "reenroll":
+            self.set_status("RE-ENROLLING — LOOK STRAIGHT AT THE CAMERA", C.PRI)
+            self._btn.setText("CANCEL")
+            self._bar.show()
+            self._btn.show()
 
 
 class SetupOverlay(QWidget):
@@ -3080,6 +3373,9 @@ class MainWindow(QMainWindow):
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
     _room_frame_sig = pyqtSignal(bytes)      # always-on room-watch preview frame
     _room_lost_sig  = pyqtSignal()           # room-watch camera missing / unplugged
+    _face_cam_sig   = pyqtSignal(bool)       # first camera check: suitable camera present?
+    _face_ready_sig = pyqtSignal(bool)       # face engine loaded (True) / unavailable (False)
+    _face_evt_sig   = pyqtSignal(str, int, str)  # (kind, n, message) from the face worker
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -3256,6 +3552,28 @@ class MainWindow(QMainWindow):
         self._room_lost_sig.connect(self._on_room_lost)
         sc_room = QShortcut(QKeySequence("F8"), self)
         sc_room.activated.connect(self._toggle_room_watch)
+
+        # Face unlock state. The gate holds the assistant back until the lock
+        # (if one is active on this setup) has let the user in.
+        self._face_gate         = threading.Event()
+        self._face_mode         = "pending"   # pending|prep|lock|enroll|reenroll|unlocking|unlocked|off
+        self._face_target       = "auto"
+        self._face_cam_reported = False
+        self._face_engine       = _FaceEngine()
+        self._face_cfg          = _face_cfg_load()
+        self._face_stored       = None
+        self._face_samples      = []
+        self._face_new          = []
+        self._face_streak       = 0
+        self._face_last         = 0.0
+        self._face_last_sample  = 0.0
+        self._face_prev_enabled = {}
+        try:
+            self._face_init()
+        except Exception as e:
+            print(f"[FaceUnlock] Init error: {e}")
+            self._face_mode = "off"
+            self._face_gate.set()
         self._room_start()
 
         # Clipboard panel (child of central widget, bottom-center)
@@ -3438,6 +3756,9 @@ class MainWindow(QMainWindow):
             import cv2
         except Exception as e:
             print(f"[RoomWatch] OpenCV unavailable: {e}")
+            if not self._face_cam_reported:
+                self._face_cam_reported = True
+                self._face_cam_sig.emit(False)
             return
         cap = None
         fails = 0
@@ -3446,6 +3767,9 @@ class MainWindow(QMainWindow):
                 if cap is None:
                     cap = self._room_open(cv2)
                     if cap is None:
+                        if not self._face_cam_reported:
+                            self._face_cam_reported = True
+                            self._face_cam_sig.emit(False)      # no camera → no face unlock
                         if self._room_live:
                             self._room_live = False
                             self._room_lost_sig.emit()
@@ -3467,6 +3791,13 @@ class MainWindow(QMainWindow):
                     quit_ev.wait(0.05)
                     continue
                 fails = 0
+                if not self._face_cam_reported:
+                    self._face_cam_reported = True
+                    try:
+                        _fh, _fw = frame.shape[:2]
+                        self._face_cam_sig.emit(bool(_fw >= 320 and _fh >= 240))
+                    except Exception:
+                        self._face_cam_sig.emit(False)
                 try:
                     h, w = frame.shape[:2]
                     small = frame
@@ -3479,6 +3810,7 @@ class MainWindow(QMainWindow):
                         okf, fbuf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
                         if okf:
                             self._cam_frame_sig.emit(fbuf.tobytes())
+                    self._face_on_frame(frame)
                 except Exception as e:
                     print(f"[RoomWatch] Frame error: {e}")
                 quit_ev.wait(0.066)              # ~15 fps
@@ -3492,6 +3824,10 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_room_frame(self, data: bytes) -> None:
+        if self._face_mode in _FACE_COVER:
+            # The lock screen is up: feed its preview, keep the floating box away.
+            self._face_overlay.set_frame(data)
+            return
         if not self._room_enabled:
             return
         changed = self._room_box.set_frame(data)
@@ -3504,6 +3840,8 @@ class MainWindow(QMainWindow):
 
     def _on_room_lost(self) -> None:
         self._room_box.hide()
+        if self._face_mode in ("prep", "lock", "enroll", "reenroll"):
+            self._face_fail_open("camera lost")
 
     def _room_close(self) -> None:
         """✕ pressed: hide the box and let go of the camera."""
@@ -3515,11 +3853,289 @@ class MainWindow(QMainWindow):
             self.stop_camera_stream()
 
     def _toggle_room_watch(self) -> None:
+        if self._face_mode in _FACE_COVER:
+            return                      # the lock screen needs the camera
         if self._room_enabled:
             self._room_close()
         else:
             self._room_enabled = True
             self._room_start()
+
+    # --- Face unlock ---------------------------------------------------------
+    def _face_init(self) -> None:
+        self._face_overlay = FaceLockOverlay(self.centralWidget())
+        self._face_overlay.action_clicked.connect(self._face_action)
+        self._face_cam_sig.connect(self._on_face_cam)
+        self._face_ready_sig.connect(self._on_face_ready)
+        self._face_evt_sig.connect(self._on_face_evt)
+        self._face_stored = _face_stored_from(self._face_cfg)
+        self._update_face_btn()
+        if not self._face_cfg.get("enabled", True):
+            self._face_mode = "off"
+            self._face_gate.set()
+            return
+        # Safety net: if the camera never answers, don't hold the assistant back.
+        QTimer.singleShot(12000, self._face_timeout)
+
+    def _face_timeout(self) -> None:
+        if self._face_mode == "pending":
+            self._face_mode = "off"
+            self._face_gate.set()
+
+    def _face_lock_widgets(self) -> list:
+        return [w for w in (getattr(self, "_right_panel", None),
+                            getattr(self, "_mute_btn", None),
+                            getattr(self, "_interrupt_btn", None),
+                            getattr(self, "_drawer_btn", None)) if w is not None]
+
+    def _face_cover(self, on: bool) -> None:
+        ov = self._face_overlay
+        if on:
+            try:
+                self._close_drawer()
+            except Exception:
+                pass
+            if not self._face_prev_enabled:
+                for w in self._face_lock_widgets():
+                    self._face_prev_enabled[w] = w.isEnabled()
+                    w.setEnabled(False)
+            self._room_box.hide()
+            ov.setGeometry(self.centralWidget().rect())
+            ov.show()
+            ov.raise_()
+            ov.setFocus()
+        else:
+            ov.hide()
+            for w, was in self._face_prev_enabled.items():
+                w.setEnabled(was)
+            self._face_prev_enabled = {}
+
+    def _on_face_cam(self, ok: bool) -> None:
+        """First camera check result (main thread)."""
+        if ok:
+            self._face_btn.show()
+            self._face_re_btn.show()
+        if self._face_mode != "pending":
+            return
+        if not ok or not self._face_cfg.get("enabled", True):
+            self._face_mode = "off"
+            self._face_gate.set()
+            return
+        self._face_begin("auto")
+
+    def _face_begin(self, target: str) -> None:
+        self._face_target = target
+        self._face_mode = "prep"
+        self._face_overlay.set_mode("prep", True)
+        self._face_cover(True)
+        if self._face_engine.ready:
+            self._on_face_ready(True)
+        else:
+            threading.Thread(target=self._face_prep_worker, daemon=True,
+                             name="face-init").start()
+
+    def _face_prep_worker(self) -> None:
+        ok = False
+        try:
+            ok = self._face_engine.load(lambda m: self._face_evt_sig.emit("info", 0, m))
+        except Exception as e:
+            print(f"[FaceUnlock] Prep error: {e}")
+        self._face_ready_sig.emit(bool(ok))
+
+    def _on_face_ready(self, ok: bool) -> None:
+        if self._face_mode != "prep":
+            return                      # user skipped while it was loading
+        if not ok:
+            self._face_fail_open("face recognition is unavailable on this setup")
+            return
+        if self._face_target == "reenroll":
+            self._face_enter("reenroll")
+        elif self._face_stored is not None and len(self._face_stored) > 0:
+            self._face_enter("lock")
+        else:
+            self._face_enter("enroll")
+
+    def _face_enter(self, mode: str) -> None:
+        self._face_samples = []
+        self._face_new = []
+        self._face_streak = 0
+        self._face_last = 0.0
+        self._face_last_sample = 0.0
+        self._face_overlay.set_mode(mode, bool(self._face_cfg.get("allow_skip", True)))
+        self._face_mode = mode          # set last: the worker starts on this
+
+    def _face_fail_open(self, reason: str) -> None:
+        self._face_mode = "off"
+        self._face_cover(False)
+        self._face_gate.set()
+        self._log.append_log(f"SYS: Face unlock skipped — {reason}.")
+
+    def _face_unlock_ui(self, text: str) -> None:
+        self._face_mode = "unlocking"
+        self._face_overlay.set_status(text, C.GREEN)
+        QTimer.singleShot(700, self._face_finish_unlock)
+
+    def _face_finish_unlock(self) -> None:
+        self._face_mode = "unlocked"
+        self._face_cover(False)
+        self._face_gate.set()
+
+    def _face_action(self) -> None:
+        """The overlay's button (meaning depends on the current mode)."""
+        mode = self._face_mode
+        if mode == "prep":
+            self._face_fail_open("skipped while preparing")
+        elif mode == "lock":
+            self._log.append_log("SYS: Face unlock bypassed for this launch.")
+            self._face_finish_unlock()
+        elif mode == "enroll":
+            self._face_cfg["enabled"] = False
+            _face_cfg_save(self._face_cfg)
+            self._update_face_btn()
+            self._log.append_log("SYS: Face unlock turned off (re-enable it from the settings menu).")
+            self._face_finish_unlock()
+        elif mode == "reenroll":
+            self._face_finish_unlock()
+
+    def _on_face_evt(self, kind: str, n: int, msg: str) -> None:
+        try:
+            if kind in ("info", "warn"):
+                if self._face_mode in _FACE_COVER and self._face_mode != "unlocking":
+                    self._face_overlay.set_status(msg, C.RED if kind == "warn" else C.TEXT_MED)
+            elif kind == "progress":
+                if self._face_mode in ("enroll", "reenroll"):
+                    self._face_overlay.set_progress(n, _FACE_ENROLL_N)
+                    if msg:
+                        self._face_overlay.set_status(msg, C.PRI)
+            elif kind == "unlock":
+                self._log.append_log("SYS: Face recognised — unlocked.")
+                self._face_unlock_ui("ACCESS GRANTED")
+            elif kind == "enrolled":
+                samples = list(self._face_new or [])
+                if not samples:
+                    self._face_fail_open("no face data was captured")
+                    return
+                self._face_cfg["enrolled"] = samples
+                self._face_cfg["enabled"] = True
+                if not _face_cfg_save(self._face_cfg):
+                    self._log.append_log("ERR: Could not save face data — you will be asked to enrol again next launch.")
+                self._face_stored = _face_stored_from(self._face_cfg)
+                self._update_face_btn()
+                self._log.append_log("SYS: Face registered. Face unlock is on.")
+                self._face_unlock_ui("FACE REGISTERED")
+        except Exception as e:
+            print(f"[FaceUnlock] Event error: {e}")
+
+    def _face_on_frame(self, frame) -> None:
+        """Runs on the room-watch thread with each full-size camera frame."""
+        try:
+            mode = self._face_mode
+            if mode not in ("lock", "enroll", "reenroll") or not self._face_engine.ready:
+                return
+            now = time.monotonic()
+            if now - self._face_last < 0.25:
+                return
+            self._face_last = now
+            import numpy as np
+            n, feat, fw = self._face_engine.analyse(frame)
+            emit = self._face_evt_sig.emit
+            if n == 0 or feat is None:
+                self._face_streak = 0
+                emit("info", 0, "NO FACE DETECTED — LOOK AT THE CAMERA")
+                return
+            if mode == "lock":
+                stored = self._face_stored
+                if stored is None or len(stored) == 0:
+                    return
+                score = float(np.max(stored @ feat))
+                if score >= _FACE_THRESH:
+                    self._face_streak += 1
+                    if self._face_streak >= _FACE_NEED:
+                        self._face_mode = "unlocking"
+                        emit("unlock", 0, "")
+                    else:
+                        emit("info", 0, "VERIFYING…")
+                else:
+                    self._face_streak = 0
+                    emit("warn", 0, "FACE NOT RECOGNISED")
+                return
+            # ── enrolment ──
+            if n > 1:
+                emit("warn", 0, "ONLY ONE PERSON IN FRAME, PLEASE")
+                return
+            if fw < 90:
+                emit("warn", 0, "MOVE A LITTLE CLOSER TO THE CAMERA")
+                return
+            if now - self._face_last_sample < 0.6:
+                return
+            self._face_last_sample = now
+            self._face_samples.append(feat)
+            k = len(self._face_samples)
+            emit("progress", k, f"CAPTURING… {k}/{_FACE_ENROLL_N}")
+            if k >= _FACE_ENROLL_N:
+                arr = np.stack(self._face_samples)
+                sims = arr @ arr.T
+                mean_sim = float((sims.sum() - k) / (k * (k - 1)))
+                if mean_sim < 0.45:
+                    self._face_samples = []
+                    emit("progress", 0, "")
+                    emit("warn", 0, "COULD NOT GET A STABLE READING — HOLD STILL AND TRY AGAIN")
+                else:
+                    self._face_new = [[round(float(x), 6) for x in s] for s in self._face_samples]
+                    self._face_mode = "unlocking"
+                    emit("enrolled", k, "")
+        except Exception as e:
+            print(f"[FaceUnlock] Frame error: {e}")
+
+    def _update_face_btn(self) -> None:
+        if not hasattr(self, "_face_btn"):
+            return
+        if self._face_cfg.get("enabled", True):
+            self._face_btn.setText("◉  FACE UNLOCK: ON")
+            self._face_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #001a08; color: {C.GREEN};
+                    border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ background: #002010; }}
+            """)
+        else:
+            self._face_btn.setText("◉  FACE UNLOCK: OFF")
+            self._face_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; color: {C.TEXT_DIM};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
+            """)
+
+    def _toggle_face_unlock(self) -> None:
+        if self._face_mode not in ("unlocked", "off"):
+            return
+        if self._face_cfg.get("enabled", True):
+            self._face_cfg["enabled"] = False
+            _face_cfg_save(self._face_cfg)
+            self._log.append_log("SYS: Face unlock OFF.")
+        else:
+            self._face_cfg["enabled"] = True
+            _face_cfg_save(self._face_cfg)
+            if self._face_stored is None or len(self._face_stored) == 0:
+                self._update_face_btn()
+                self._reenroll_face()
+                return
+            self._log.append_log("SYS: Face unlock ON — it will lock on the next launch.")
+        self._update_face_btn()
+
+    def _reenroll_face(self) -> None:
+        if self._face_mode not in ("unlocked", "off"):
+            return
+        if not (self._room_enabled and self._room_live):
+            self._log.append_log("SYS: Face enrolment needs the camera — no live camera "
+                                 "(press F8 to turn the room watch back on).")
+            return
+        self._face_begin("reenroll")
 
     def _position_room_box(self) -> None:
         b = getattr(self, "_room_box", None)
@@ -3924,6 +4540,9 @@ class MainWindow(QMainWindow):
             cw.height() - ph - 28,
             pw, ph,
         )
+        # Face-unlock screen covers the whole window
+        if hasattr(self, '_face_overlay') and self._face_overlay.isVisible():
+            self._face_overlay.setGeometry(cw.rect())
         # Room-watch box — top-right, below the header buttons
         if hasattr(self, '_room_box') and self._room_box.isVisible():
             self._position_room_box()
@@ -4219,6 +4838,24 @@ class MainWindow(QMainWindow):
         self._brief_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._brief_btn.clicked.connect(self._toggle_brief)
         lay.addWidget(self._brief_btn)
+
+        # Face unlock buttons — hidden until a suitable camera is detected.
+        self._face_btn = QPushButton()
+        self._face_btn.setFixedHeight(26)
+        self._face_btn.setFont(QFont("Courier New", 7))
+        self._face_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._face_btn.clicked.connect(self._toggle_face_unlock)
+        self._face_btn.hide()
+        lay.addWidget(self._face_btn)
+
+        self._face_re_btn = QPushButton("⟳  RE-ENROLL MY FACE")
+        self._face_re_btn.setFixedHeight(26)
+        self._face_re_btn.setFont(QFont("Courier New", 7))
+        self._face_re_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._face_re_btn.setStyleSheet(_BTN_STYLE_DIM)
+        self._face_re_btn.clicked.connect(self._reenroll_face)
+        self._face_re_btn.hide()
+        lay.addWidget(self._face_re_btn)
 
         # ── Wake word ──────────────────────────────────────────────────────────
         # WAKE WORD button (and its paired SLEEP/WAKE NOW button) removed from
@@ -5652,6 +6289,10 @@ class AuraUI:
     def wait_for_api_key(self):
         while not self._win._ready:
             time.sleep(0.1)
+        # Face unlock (only active on setups with a suitable camera) holds the
+        # assistant back until the user has been recognised.
+        while not self._win._face_gate.wait(0.1):
+            pass
 
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
