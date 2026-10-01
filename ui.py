@@ -3228,6 +3228,258 @@ class ClipboardPanel(QWidget):
         self._dismiss_timer.start(8000)
 
 
+# ── Weather widget (Open-Meteo) ──────────────────────────────────────────────
+# Location comes from the machine's public IP (no API key, no GPS, no extra
+# dependency — stdlib urllib only). Several providers are tried in turn so one
+# being down or rate-limited never leaves the widget blank. The forecast itself
+# comes from the Open-Meteo API, requested explicitly in °C and km/h.
+_WEATHER_GEO_URLS = (
+    "https://ipwho.is/",
+    "https://ipapi.co/json/",
+    "http://ip-api.com/json/",
+)
+_WEATHER_URL = (
+    "https://api.open-meteo.com/v1/forecast"
+    "?latitude={lat:.4f}&longitude={lon:.4f}"
+    "&current=temperature_2m,wind_speed_10m"
+    "&temperature_unit=celsius&wind_speed_unit=kmh&timezone=auto"
+)
+
+
+def _weather_http_json(url: str, timeout: float = 8.0) -> dict:
+    import urllib.request
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (AURA weather widget)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    if not isinstance(data, dict):
+        raise ValueError("unexpected response")
+    return data
+
+
+def _weather_locate() -> dict | None:
+    """Best-effort location of this machine → {lat, lon, city, country} or None."""
+    for url in _WEATHER_GEO_URLS:
+        try:
+            d = _weather_http_json(url, timeout=6.0)
+            if d.get("success") is False or d.get("error") or d.get("status") == "fail":
+                continue
+            lat = d.get("latitude", d.get("lat"))
+            lon = d.get("longitude", d.get("lon"))
+            lat, lon = float(lat), float(lon)
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                continue
+            city = str(d.get("city") or d.get("region") or "").strip()
+            country = str(d.get("country_name") or d.get("country") or "").strip()
+            return {"lat": lat, "lon": lon, "city": city, "country": country}
+        except Exception as e:
+            print(f"[Weather] Location lookup failed ({url}): {e}")
+    return None
+
+
+def _weather_fetch(lat: float, lon: float) -> tuple[float, float]:
+    """Open-Meteo current conditions → (temperature °C, wind speed km/h)."""
+    d = _weather_http_json(_WEATHER_URL.format(lat=lat, lon=lon), timeout=10.0)
+    cur = d.get("current") or {}
+    return float(cur["temperature_2m"]), float(cur["wind_speed_10m"])
+
+
+class WeatherWidget(_HudOverlay):
+    """Small floating weather pop-up: temperature (°C) and wind speed (km/h)
+    for wherever the user is. Draggable by its header, closable with the ✕
+    (F9 brings it back). Spawns in the top-left corner of the AURA window.
+
+    All network work runs on a worker thread; results come back to the Qt
+    thread through a signal, so the UI never blocks."""
+
+    _W          = 244
+    _MARGIN     = 12                # gap from the left edge
+    _TOP        = 54 + 10           # just below the 54 px header bar
+    _REFRESH_MS = 10 * 60 * 1000    # auto-refresh while visible
+
+    _result_sig = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("WeatherWidget")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            QWidget#WeatherWidget {{
+                background: {C.DARK};
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._W)
+        self.user_moved = False         # True once the user has dragged it
+        self.on_close   = None          # optional callable
+        self._loc       = None          # cached {lat, lon, city, country}
+        self._busy      = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 10)
+        lay.setSpacing(5)
+
+        # ── header: drag handle + refresh + close ───────────────────────────
+        hdr_w = _DragHeader(self)
+        hdr = QHBoxLayout(hdr_w)
+        hdr.setContentsMargins(0, 0, 0, 0)
+        hdr.setSpacing(6)
+
+        dot = QLabel("◈")
+        dot.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        dot.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        hdr.addWidget(dot)
+
+        title = QLabel("WEATHER")
+        title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+
+        def _hdr_btn(text: str, tip: str, hover: str) -> QPushButton:
+            b = QPushButton(text)
+            b.setFixedSize(16, 16)
+            b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(tip)
+            b.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {C.TEXT_DIM}; border: none; }}
+                QPushButton:hover {{ color: {hover}; }}
+            """)
+            return b
+
+        refresh_btn = _hdr_btn("↻", "Refresh (re-detect location)", C.PRI)
+        refresh_btn.clicked.connect(lambda _=False: self._refresh(redetect=True))
+        hdr.addWidget(refresh_btn)
+
+        close_btn = _hdr_btn("✕", "Close weather  [F9 to reopen]", C.MUTED_C)
+        close_btn.clicked.connect(self._close_clicked)
+        hdr.addWidget(close_btn)
+        lay.addWidget(hdr_w)
+
+        # ── body ────────────────────────────────────────────────────────────
+        self._loc_lbl = QLabel("LOCATING…")
+        self._loc_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._loc_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        lay.addWidget(self._loc_lbl)
+
+        self._temp_lbl = QLabel("-- °C")
+        self._temp_lbl.setFont(QFont("Courier New", 24, QFont.Weight.Bold))
+        self._temp_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        lay.addWidget(self._temp_lbl)
+
+        self._wind_lbl = QLabel("WIND  -- km/h")
+        self._wind_lbl.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._wind_lbl.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        lay.addWidget(self._wind_lbl)
+
+        self._status_lbl = QLabel("")
+        self._status_lbl.setFont(QFont("Courier New", 7))
+        self._status_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        lay.addWidget(self._status_lbl)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(lambda: self._refresh(redetect=False))
+        self._result_sig.connect(self._on_result)
+
+        self.adjustSize()
+        self.place_default()
+        self.hide()
+
+    # ── placement ────────────────────────────────────────────────────────────
+    def place_default(self) -> None:
+        self.user_moved = False
+        self.move(self._MARGIN, self._TOP)
+
+    def move_clamped(self, pt) -> None:
+        """Called by _DragHeader while dragging: keep the box inside the window."""
+        p = self.parentWidget()
+        if p is None:
+            self.move(pt)
+            return
+        x = max(0, min(pt.x(), max(0, p.width()  - self.width())))
+        y = max(0, min(pt.y(), max(0, p.height() - self.height())))
+        self.move(x, y)
+
+    def reposition(self) -> None:
+        """After a window resize: stay put if dragged (but clamped), else top-left."""
+        if self.user_moved:
+            self.move_clamped(self.pos())
+        else:
+            self.move(self._MARGIN, self._TOP)
+
+    def open_widget(self) -> None:
+        self.adjustSize()
+        self.reposition()
+        self.show()
+        self.raise_()
+
+    # ── visibility ───────────────────────────────────────────────────────────
+    def _close_clicked(self) -> None:
+        cb = self.on_close
+        if callable(cb):
+            cb()
+        self.hide()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._refresh(redetect=False)
+        self._timer.start(self._REFRESH_MS)
+
+    def hideEvent(self, e):
+        self._timer.stop()
+        super().hideEvent(e)
+
+    # ── data ─────────────────────────────────────────────────────────────────
+    def _refresh(self, redetect: bool = False) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self._status_lbl.setText("UPDATING…")
+        self._status_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        cached = None if redetect else self._loc
+        threading.Thread(target=self._worker, args=(cached,),
+                         daemon=True, name="weather").start()
+
+    def _worker(self, cached) -> None:
+        try:
+            loc = cached or _weather_locate()
+            if not loc:
+                raise RuntimeError("could not detect your location")
+            temp, wind = _weather_fetch(loc["lat"], loc["lon"])
+            res = {"ok": True, "loc": loc, "temp": temp, "wind": wind}
+        except Exception as e:
+            print(f"[Weather] Update failed: {e}")
+            res = {"ok": False, "err": str(e)}
+        try:
+            self._result_sig.emit(res)
+        except RuntimeError:
+            pass                        # widget already destroyed (app closing)
+
+    def _on_result(self, res) -> None:
+        self._busy = False
+        try:
+            if res.get("ok"):
+                loc = res["loc"]
+                self._loc = loc
+                place = ", ".join(x for x in (loc.get("city"), loc.get("country")) if x)
+                place = place or f"{loc['lat']:.2f}, {loc['lon']:.2f}"
+                if len(place) > 30:
+                    place = place[:29] + "…"
+                self._loc_lbl.setText(f"⌖ {place.upper()}")
+                self._temp_lbl.setText(f"{res['temp']:.1f} °C")
+                self._wind_lbl.setText(f"WIND  {res['wind']:.1f} km/h")
+                self._status_lbl.setText(f"UPDATED {time.strftime('%H:%M')}  ·  OPEN-METEO")
+                self._status_lbl.setStyleSheet(
+                    f"color: {C.TEXT_DIM}; background: transparent;")
+            else:
+                self._status_lbl.setText("OFFLINE — COULD NOT FETCH WEATHER")
+                self._status_lbl.setStyleSheet(f"color: {C.RED}; background: transparent;")
+        except Exception as e:
+            print(f"[Weather] Display error: {e}")
+
+
 class RemoteKeyOverlay(QWidget):
     """Floating overlay — QR code for instant phone pairing + manual key fallback."""
 
@@ -3697,6 +3949,12 @@ class MainWindow(QMainWindow):
         self._clipboard_panel = ClipboardPanel(self.centralWidget())
         self._clipboard_panel.action_requested.connect(self._on_clipboard_action)
         QApplication.clipboard().dataChanged.connect(self._on_clipboard_changed)
+
+        # Weather pop-up: draggable + closable, spawns top-left. F9 toggles it.
+        self._weather_widget = WeatherWidget(self.centralWidget())
+        self._weather_widget.open_widget()
+        sc_weather = QShortcut(QKeySequence("F9"), self)
+        sc_weather.activated.connect(self._toggle_weather_widget)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -4254,6 +4512,16 @@ class MainWindow(QMainWindow):
                                  "(press F8 to turn the room watch back on).")
             return
         self._face_begin("reenroll")
+
+    def _toggle_weather_widget(self) -> None:
+        """F9 — show / hide the weather pop-up."""
+        w = getattr(self, "_weather_widget", None)
+        if w is None or self._face_mode in _FACE_COVER:
+            return                      # nothing to toggle / lock screen is up
+        if w.isVisible():
+            w.hide()
+        else:
+            w.open_widget()
 
     def _position_room_box(self) -> None:
         b = getattr(self, "_room_box", None)
@@ -4918,6 +5186,9 @@ class MainWindow(QMainWindow):
         # Clipboard panel — bottom-center
         if hasattr(self, '_clipboard_panel') and self._clipboard_panel.isVisible():
             self._position_clipboard_panel()
+        # Weather widget — top-left by default, clamped inside if dragged
+        if hasattr(self, '_weather_widget') and self._weather_widget.isVisible():
+            self._weather_widget.reposition()
         # Quick drawer — reposition if open
         if hasattr(self, '_quick_drawer') and self._quick_drawer.isVisible():
             self._position_quick_drawer()
