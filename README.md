@@ -27,7 +27,7 @@ Version 2 introduces a more modular architecture together with an **offline Brit
 | **Wake-Up System** | Activate A.U.R.A using configurable wake commands. |
 | **"Hey AURA"** | Natural voice activation command. |
 | **"AURA, Wake Up"** | Dedicated wake-up command inspired by traditional cinematic AI assistants. |
-| **"DADDY's Home"** | Custom wake-up command for activating A.U.R.A. |
+| **"Wake Up, Daddy's Home"** | Custom wake-up command for activating A.U.R.A. . This will absolutely be loved by Tony Stark a.k.a Iron Man Fans |
 | **Desktop Automation** | Execute supported desktop, keyboard, mouse, browser, and system actions. |
 | **System Control** | Control supported system functions such as audio and other desktop operations. |
 | **Persistent Memory** | Store and retrieve useful information across sessions. |
@@ -40,6 +40,8 @@ Version 2 introduces a more modular architecture together with an **offline Brit
 | **Browser Interaction** | Perform supported browser-based tasks and automation. |
 | **Assistant Customization** | Configure assistant behavior, voice, devices, and other preferences. |
 | **Modular Architecture** | Separate core logic, actions, memory, plugins, configuration, UI, and voice components. |
+| **Face Unlock Feature** | If You Have camera, for more security, to authorize for you only in your computer, face recognision feature can help you with. |
+| **Room Checking** | It always monitors your room using your camera with a preview you can see through a draggable preview box |
 
 ---
 
@@ -47,7 +49,6 @@ Version 2 introduces a more modular architecture together with an **offline Brit
 
 A.U.R.A v2 significantly expands the original architecture with:
 
-- **Offline British-style JARVIS voice**
 - **Dedicated wake-up system**
 - **"Hey AURA" activation**
 - **"AURA, Wake Up" activation**
@@ -55,6 +56,8 @@ A.U.R.A v2 significantly expands the original architecture with:
 - **Individual microphone selection**
 - **Individual speaker/output selection**
 - **Modular plugin architecture**
+- **Face Unlock Feature**
+- **Room Checking Feature**
 - Improved separation between core assistant components
 - Expanded desktop automation and customization capabilities
 
