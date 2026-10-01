@@ -18,8 +18,13 @@ if platform.system() == "Windows":
 else:
     _WIN_HIDE: dict = {}
 
+# Qt's video backend prints the ffmpeg stream banner (codec, bitrate, the whole
+# signed stream URL) to the console for every stream it opens. Silenced here,
+# before Qt initialises its logging. An explicit user setting is left alone.
+os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
+
 from PyQt6.QtCore import (
-    QEasingCurve, QMimeData, QObject, QPointF, QRectF, QSize, Qt,
+    QEasingCurve, QMimeData, QObject, QPointF, QRectF, QSize, QSizeF, Qt,
     QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
@@ -27,9 +32,23 @@ from PyQt6.QtGui import (
     QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
+# Video playback for the HUD. Part of PyQt6, so it costs no new dependency —
+# but the multimedia plugins are a separate piece of the Qt install and can be
+# absent on a stripped-down system, so a failure here disables one feature
+# rather than stopping the app from starting.
+try:
+    from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
+    HAVE_VIDEO = True
+except Exception as _e:            # noqa: BLE001 - reported, never fatal
+    QAudioOutput = QMediaPlayer = QGraphicsVideoItem = None
+    HAVE_VIDEO = False
+    print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
+
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
 
@@ -623,9 +642,67 @@ class HudCanvas(QWidget):
             for _ in range(64)
         ]
 
+        # Live audio reactivity: _live_amp is written from the audio threads
+        # (0.0–1.0), _amp_disp is the smoothed value the paint code reads.
+        self._live_amp = 0.0
+        self._amp_disp = 0.0
+        # (frames, start_time, hop) posted by the playback thread — see
+        # push_visemes(). None means "no schedule; use the plain level".
+        self._visemes = None
+
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
+
+    def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
+        """Compatibility hook: the central ball has no eyes, so there is
+        nothing to turn. Accepted so callers written for the head never fail."""
+        return None
+
+    def push_visemes(self, frames, hop: float, at: float) -> None:
+        """Thread-safe: hand over a schedule of (level, openness, width) frames.
+
+        The ball has no mouth, so only the loudness of each frame is used —
+        _step() plays the schedule out against the wall clock, in step with
+        the audio going to the speakers, and the ball pulses with it.
+        """
+        try:
+            if not frames:
+                return
+            hop = max(1e-3, float(hop))
+            at = float(at)
+            new = list(frames)
+            cur = self._visemes
+            if cur is not None:
+                old, t0, ohop = cur
+                if abs(ohop - hop) < 1e-6:
+                    i = int(round((at - t0) / hop))
+                    if 0 <= i <= len(old) + 1:
+                        merged = old[:i] + new
+                        played = int((time.time() - t0) / hop) - 2
+                        if played > 60:
+                            merged = merged[played:]
+                            t0 += played * hop
+                        self._visemes = (merged, t0, hop)
+                        return
+            self._visemes = (new, at, hop)
+        except Exception:
+            pass
+
+    def set_audio_level(self, level: float) -> None:
+        """Thread-safe entry point for the audio threads. Stores the louder of
+        the incoming level and the current value so brief gaps between chunks
+        don't make the ball stutter; _step() decays it back down."""
+        try:
+            lv = float(level)
+        except (TypeError, ValueError):
+            return
+        if lv < 0.0:
+            lv = 0.0
+        elif lv > 1.0:
+            lv = 1.0
+        if lv > self._live_amp:
+            self._live_amp = lv
 
     def _load_face(self, path: str):
         try:
@@ -647,6 +724,26 @@ class HudCanvas(QWidget):
     def _step(self):
         self._tick += 1
         now = time.time()
+
+        # ── Live audio reactivity ────────────────────────────────────────────
+        # A viseme schedule, if one is playing, gives the level for this exact
+        # instant; otherwise fall back to the peak the audio threads pushed in.
+        sched = self._visemes
+        if sched is not None:
+            frames, t0, hop = sched
+            i = int((now - t0) / hop)
+            if 0 <= i < len(frames):
+                try:
+                    lv = float(frames[i][0])
+                    if lv > self._live_amp:
+                        self._live_amp = min(1.0, lv)
+                except Exception:
+                    pass
+            elif i >= len(frames):
+                self._visemes = None        # schedule spent
+        self._live_amp *= 0.86
+        self._amp_disp += (self._live_amp - self._amp_disp) * 0.45
+
         if now - self._last_t > (0.12 if self.speaking else 0.5):
             if self.speaking:
                 self._tgt_scale = random.uniform(1.06, 1.14)
@@ -671,6 +768,7 @@ class HudCanvas(QWidget):
             orb_spd = 0.10
         else:
             orb_spd = 0.32
+        orb_spd += self._amp_disp * 2.4     # audio makes the ball spin a touch faster
         self._orb_spin = (self._orb_spin + orb_spd) % 360
 
         speeds = [1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9]
@@ -717,7 +815,9 @@ class HudCanvas(QWidget):
           • LISTENING / THINKING / PROCESSING → slow, steady spin — stable
           • MUTED      → almost frozen, tinted red as an alert state
         """
-        orb_r = fw * 0.30 * self._scale
+        amp   = self._amp_disp
+        halo  = min(255.0, self._halo + amp * 90.0)
+        orb_r = fw * 0.30 * (self._scale + amp * 0.08)
         muted = self.muted
         ball_col = C.MUTED_C if muted else C.PRI
 
@@ -726,7 +826,7 @@ class HudCanvas(QWidget):
         for i in range(9, 0, -1):
             r2  = orb_r * i / 9
             frc = i / 9
-            a   = max(0, min(255, int(self._halo * 1.05 * frc)))
+            a   = max(0, min(255, int(halo * 1.05 * frc)))
             rr, gg, bb = core_rgb
             p.setBrush(QBrush(QColor(
                 min(255, int(rr * frc + 30)),
@@ -743,7 +843,7 @@ class HudCanvas(QWidget):
         for i, tr in enumerate(self._orb_trails):
             rot = (self._orb_spin * tr["speed_mult"] + tr["phase"]) % 360
             r_i = orb_r * tr["scale"]
-            a   = max(15, min(220, int(self._halo * (0.95 - (i % 5) * 0.09))))
+            a   = max(15, min(220, int(halo * (0.95 - (i % 5) * 0.09))))
             p.save()
             p.translate(cx, cy)
             p.rotate(rot)
@@ -764,7 +864,7 @@ class HudCanvas(QWidget):
                 continue   # backface cull — keep the sphere illusion
             depth  = 0.35 + 0.65 * ((z + 1) / 2)
             tw     = 0.55 + 0.45 * math.sin(self._tick * 0.06 * d["spd"] + d["tw"] * 6.28)
-            a      = max(0, min(255, int(self._halo * 1.4 * depth * tw)))
+            a      = max(0, min(255, int(halo * 1.4 * depth * tw)))
             size   = 1.1 + 1.3 * depth
             dot_col = C.MUTED_C if muted else (C.WHITE if depth > 0.82 else C.ACC2)
             p.setPen(Qt.PenStyle.NoPen)
@@ -3364,6 +3464,10 @@ class MainWindow(QMainWindow):
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
+    _video_open_sig  = pyqtSignal(str, str, bool, str)  # video, title, muted, audio
+    _wake_btns_sig   = pyqtSignal()          # wake state resolved off-thread
+    _video_close_sig = pyqtSignal()
+    _video_mute_sig  = pyqtSignal(bool)
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
@@ -3475,10 +3579,18 @@ class MainWindow(QMainWindow):
         )
         _cam_v.addWidget(self._cam_live_lbl, stretch=1)
 
-        # Stack: 0 = animated HUD, 1 = live camera
+        # Video surface — stacked beside the camera page: something takes the
+        # centre of the HUD for a while and then gives it back.
+        self._video_split = False        # is the sound a separate stream?
+        self._video_auto_muted = False   # did the app close the mic, or the user?
+        self._video_on = False           # plain flag: safe to read from plugin threads
+        self._video_cont = self._build_video_surface()
+
+        # Stack: 0 = animated HUD, 1 = live camera, 2 = video
         self._hud_cam_stack = QStackedWidget()
         self._hud_cam_stack.addWidget(self.hud)
         self._hud_cam_stack.addWidget(_cam_cont)
+        self._hud_cam_stack.addWidget(self._video_cont)
 
         self._center_split = QSplitter(Qt.Orientation.Vertical)
         self._center_split.setStyleSheet(f"""
@@ -3504,6 +3616,7 @@ class MainWindow(QMainWindow):
 
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
+        self._warm_wake_state()
         self._update_autostart_btn(self._check_autostart())
         from memory.config_manager import get_brief_enabled as _gbe
         self._update_brief_btn(_gbe())
@@ -3530,6 +3643,10 @@ class MainWindow(QMainWindow):
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
         self._wake_dl_sig.connect(self._on_wake_install_done)
+        self._wake_btns_sig.connect(self._refresh_wake_btns)
+        self._video_open_sig.connect(self._on_video_open)
+        self._video_close_sig.connect(self._on_video_close)
+        self._video_mute_sig.connect(self._on_video_mute)
         self._quiz_sig.connect(self._show_quiz)
         self._quiz_hide_sig.connect(self._hide_quiz)
         self._review_sig.connect(self._show_review)
@@ -3610,8 +3727,9 @@ class MainWindow(QMainWindow):
         if start:
             self._hud_cam_stack.setCurrentIndex(1)
         else:
-            self._hud_cam_stack.setCurrentIndex(0)
             self._cam_live_lbl.clear()
+            if not self._video_on:      # a playing video keeps the centre
+                self._hud_cam_stack.setCurrentIndex(0)
 
     def _on_cam_frame(self, data: bytes) -> None:
         px = QPixmap()
@@ -4157,6 +4275,256 @@ class MainWindow(QMainWindow):
             pass
         super().closeEvent(e)
 
+    # --- Video in the HUD area ---------------------------------------------
+    #
+    # Everything below runs on the Qt thread. Plugins and the assistant reach it
+    # through the signals above, the same way every other panel is driven, so a
+    # background thread never touches a widget.
+    def _build_video_surface(self) -> QWidget:
+        cont = QWidget()
+        cont.setStyleSheet(f"background: {C.BG};")
+        v = QVBoxLayout(cont)
+        v.setContentsMargins(8, 6, 8, 8)
+        v.setSpacing(4)
+
+        hdr = QHBoxLayout()
+        self._video_title = QLabel("▶  VIDEO")
+        self._video_title.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._video_title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        hdr.addWidget(self._video_title)
+        hdr.addStretch()
+
+        def _vid_btn(text: str) -> QPushButton:
+            b = QPushButton(text)
+            b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(f"""
+                QPushButton {{
+                    color: {C.TEXT_DIM}; background: transparent;
+                    border: none; padding: 2px 6px;
+                }}
+                QPushButton:hover {{ color: {C.PRI}; }}
+            """)
+            return b
+
+        # Muted is the default and the button says so: a soundtrack talking
+        # over the assistant is the one way this feature could make it worse.
+        self._video_mute_btn = _vid_btn("🔇  SOUND OFF")
+        self._video_mute_btn.clicked.connect(self._toggle_video_mute)
+        hdr.addWidget(self._video_mute_btn)
+        close = _vid_btn("✕  CLOSE")
+        close.clicked.connect(self.stop_video)
+        hdr.addWidget(close)
+        v.addLayout(hdr)
+
+        self._video_scene = self._video_item = self._video_widget = None
+        self._video_player = self._video_audio = None
+        self._video_sound = self._video_sound_out = self._video_sync = None
+        ok = False
+        if HAVE_VIDEO:
+            try:
+                # A GRAPHICS ITEM, NOT A QVideoWidget: QVideoWidget gets a
+                # native window that the compositor paints above every ordinary
+                # widget (so drawers would open underneath the video). A video
+                # item drawn into a QGraphicsView goes through Qt's own painter,
+                # and anything laid over it stays over it.
+                self._video_scene = QGraphicsScene(self)
+                self._video_item = QGraphicsVideoItem()
+                self._video_scene.addItem(self._video_item)
+                self._video_widget = QGraphicsView(self._video_scene)
+                self._video_widget.setStyleSheet("background: #000; border: none;")
+                self._video_widget.setFrameShape(QGraphicsView.Shape.NoFrame)
+                self._video_widget.setHorizontalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                self._video_widget.setVerticalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                self._video_widget.setSizePolicy(
+                    QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+                v.addWidget(self._video_widget, stretch=1)
+
+                self._video_audio = QAudioOutput()
+                self._video_audio.setMuted(True)
+                self._video_player = QMediaPlayer()
+                self._video_player.setVideoOutput(self._video_item)
+                self._video_item.nativeSizeChanged.connect(self._fit_video)
+                self._video_player.setAudioOutput(self._video_audio)
+                self._video_player.errorOccurred.connect(self._on_video_error)
+
+                # A SECOND player for sound that arrives as a separate stream
+                # (picture and sound are two URLs on some sites). Started
+                # together and nudged back into line by the timer below.
+                self._video_sound = QMediaPlayer()
+                self._video_sound_out = QAudioOutput()
+                self._video_sound_out.setMuted(True)
+                self._video_sound.setAudioOutput(self._video_sound_out)
+
+                self._video_sync = QTimer(self)
+                self._video_sync.setInterval(1000)
+                self._video_sync.timeout.connect(self._sync_video_sound)
+                ok = True
+            except Exception as e:
+                print(f"[Video] setup failed ({e}) — the HUD will not show video.")
+                self._video_scene = self._video_item = self._video_widget = None
+                self._video_player = self._video_audio = None
+                self._video_sound = self._video_sound_out = self._video_sync = None
+        if not ok:
+            miss = QLabel("Video playback is not available in this Qt install.")
+            miss.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            miss.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+            v.addWidget(miss, stretch=1)
+        return cont
+
+    def _on_video_open(self, source: str, title: str, muted: bool,
+                       audio_source: str = "") -> None:
+        if not HAVE_VIDEO or not self._video_player:
+            self._log.append_log("SYS: Video playback is not available in this Qt "
+                                 "install.")
+            return
+        # A video and the live camera cannot share the centre of the HUD.
+        self._cam_stop.set()
+        self._cam_relay = False
+
+        self._video_title.setText(f"▶  {(title or 'VIDEO')[:44].upper()}")
+        self._video_split = bool(audio_source)
+        self._set_video_muted(bool(muted))
+
+        try:
+            is_file = Path(source).exists()
+        except Exception:
+            is_file = False
+        url = QUrl.fromLocalFile(source) if is_file else QUrl(source)
+        self._video_player.setSource(url)
+        if self._video_split:
+            self._video_sound.setSource(QUrl(audio_source))
+        self._hud_cam_stack.setCurrentIndex(2)
+        self._video_on = True
+        # Re-run now that the video counts as playing: _set_video_muted ran
+        # before this line and saw no video, so its mic check was a no-op.
+        self._sync_mic_for_video()
+        self._video_player.play()
+        if self._video_split:
+            self._video_sound.play()
+            self._video_sync.start()
+
+    def _fit_video(self, *_a) -> None:
+        """Size the picture to the panel, keeping its shape."""
+        if not (self._video_item and self._video_widget):
+            return
+        try:
+            native = self._video_item.nativeSize()
+            if native.isEmpty():
+                return
+            view = self._video_widget.viewport().size()
+            scale = min(view.width() / native.width(),
+                        view.height() / native.height())
+            w, h = native.width() * scale, native.height() * scale
+            self._video_item.setSize(QSizeF(w, h))
+            self._video_scene.setSceneRect(0, 0, w, h)
+            self._video_widget.centerOn(self._video_item)
+        except Exception:
+            pass
+
+    def _on_video_close(self) -> None:
+        if self._video_sync:
+            self._video_sync.stop()
+        for p in (self._video_player, self._video_sound):
+            if p:
+                p.stop()
+                p.setSource(QUrl())
+        self._video_split = False
+        was_on = self._video_on
+        self._video_on = False
+        if was_on or self._hud_cam_stack.currentIndex() == 2:
+            self._hud_cam_stack.setCurrentIndex(0)
+        self._sync_mic_for_video()      # gives the microphone back
+
+    def _set_video_muted(self, muted: bool) -> None:
+        """Silence whichever output is carrying the sound for this video."""
+        muted = bool(muted)
+        if self._video_audio:
+            self._video_audio.setMuted(muted)
+        if self._video_sound_out:
+            self._video_sound_out.setMuted(muted)
+        self._sync_video_mute_btn()
+        self._sync_mic_for_video()
+
+    def _on_video_mute(self, muted: bool) -> None:
+        self._set_video_muted(muted)
+
+    def _sync_mic_for_video(self) -> None:
+        """Close the microphone while the video is making sound.
+
+        The assistant subtracts its OWN output from the microphone, but a video
+        plays through a different output entirely, so it would answer the film.
+        The microphone therefore closes for exactly as long as the sound is on
+        and opens again by itself when it goes off or the video is closed.
+        Only if the app closed it: a microphone the user muted stays muted, and
+        pressing the mute key during a video hands the decision back to them.
+        """
+        sound_on = bool(self._video_on and self._video_sound_out
+                        and not self._video_sound_out.isMuted())
+        if sound_on and not self._muted:
+            self._video_auto_muted = True
+            self._set_muted(True, "The video's sound is on — silence it, close "
+                                  "it, or press F4 to talk. Typing still works.")
+        elif not sound_on and self._video_auto_muted:
+            self._video_auto_muted = False
+            self._set_muted(False, "The video is quiet again.")
+
+    def _sync_video_sound(self) -> None:
+        """Keep the separate soundtrack in step with the picture (only nudged
+        when the drift is audible, since correcting less is itself audible)."""
+        if not (self._video_split and self._video_sound and self._video_player):
+            return
+        try:
+            if self._video_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                return
+            drift = self._video_sound.position() - self._video_player.position()
+            if abs(drift) > 300:
+                self._video_sound.setPosition(self._video_player.position())
+        except Exception:
+            pass
+
+    def _sync_video_mute_btn(self) -> None:
+        out = self._video_sound_out if self._video_split else self._video_audio
+        muted = bool(out and out.isMuted())
+        self._video_mute_btn.setText("🔇  SOUND OFF" if muted else "🔊  SOUND ON")
+
+    def _toggle_video_mute(self) -> None:
+        out = self._video_sound_out if self._video_split else self._video_audio
+        if out:
+            self._set_video_muted(not out.isMuted())
+
+    def _on_video_error(self, *_a) -> None:
+        err = ""
+        try:
+            err = self._video_player.errorString()
+        except Exception:
+            pass
+        self._log.append_log(f"SYS: The video could not be played{(' — ' + err) if err else ''}.")
+        self._on_video_close()
+
+    def stop_video(self) -> None:
+        self._video_close_sig.emit()
+
+    def video_is_playing(self) -> bool:
+        return bool(self._video_on)
+
+    def _warm_wake_state(self) -> None:
+        """Resolve the wake-word state off the UI thread, once. Checking it used
+        to happen when the settings drawer opened, and the first check blocks on
+        an `import openwakeword` (which drags in onnxruntime) — opening the
+        drawer stalled for about two seconds. Afterwards the same check is
+        near-instant, so it only needed to happen somewhere other than in front
+        of the user."""
+        def work():
+            try:
+                self._wake_state()
+            except Exception:
+                pass
+            self._wake_btns_sig.emit()
+        threading.Thread(target=work, daemon=True, name="wake-state-warm").start()
+
     # ------------------------------------------------------------------
     # Icon generation — arc-reactor style, rendered with Pillow
     # ------------------------------------------------------------------
@@ -4540,6 +4908,7 @@ class MainWindow(QMainWindow):
             cw.height() - ph - 28,
             pw, ph,
         )
+        self._fit_video()
         # Face-unlock screen covers the whole window
         if hasattr(self, '_face_overlay') and self._face_overlay.isVisible():
             self._face_overlay.setGeometry(cw.rect())
@@ -6079,15 +6448,24 @@ class MainWindow(QMainWindow):
             self.on_interrupt()
 
     def _toggle_mute(self):
-        self._muted = not self._muted
-        self.hud.muted = self._muted
+        # A deliberate press settles the question: whatever the video did, or is
+        # about to do, the user has now said what they want.
+        self._video_auto_muted = False
+        self._set_muted(not self._muted)
+
+    def _set_muted(self, muted: bool, note: str = ""):
+        muted = bool(muted)
+        if muted == self._muted:
+            return
+        self._muted = muted
+        self.hud.muted = muted
         self._style_mute_btn()
-        if self._muted:
+        if muted:
             self._apply_state("MUTED")
-            self._log.append_log("SYS: Microphone muted.")
+            self._log.append_log("SYS: Microphone muted." + (f" {note}" if note else ""))
         else:
             self._apply_state("LISTENING")
-            self._log.append_log("SYS: Microphone active.")
+            self._log.append_log("SYS: Microphone active." + (f" {note}" if note else ""))
 
     def _style_mute_btn(self):
         self._mute_btn.set_alert(self._muted)
@@ -6333,6 +6711,52 @@ class AuraUI:
     def show_camera_frame(self, img_bytes: bytes):
         """Thread-safe: show a webcam frame in the small overlay (screen captures)."""
         self._win._camera_sig.emit(img_bytes)
+
+    def show_video(self, source: str, title: str = "", muted: bool = True,
+                   audio_source: str = "") -> None:
+        """Thread-safe: play a video where the central ball normally is.
+
+        `source` is a local file path or a direct URL. `audio_source` is an
+        optional separate soundtrack URL for sites that serve picture and sound
+        as two streams. It starts muted, and while its sound is on the
+        microphone is closed so the assistant does not answer the film.
+        """
+        self._win._video_open_sig.emit(str(source or ""), str(title or ""),
+                                       bool(muted), str(audio_source or ""))
+
+    def stop_video(self) -> None:
+        """Thread-safe: close the video and give the HUD back to the ball."""
+        self._win._video_close_sig.emit()
+
+    def set_video_muted(self, muted: bool) -> None:
+        """Thread-safe: turn the video's sound on or off."""
+        self._win._video_mute_sig.emit(bool(muted))
+
+    def video_is_playing(self) -> bool:
+        return bool(self._win.video_is_playing())
+
+    def set_audio_level(self, level: float) -> None:
+        """Thread-safe: feed the live output loudness (0.0–1.0) to the HUD so
+        the central ball pulses with the assistant's voice."""
+        try:
+            self._win.hud.set_audio_level(level)
+        except Exception:
+            pass
+
+    def push_visemes(self, frames, hop: float, at: float) -> None:
+        """Thread-safe: schedule per-frame loudness, timed to when the audio
+        will actually sound. See HudCanvas.push_visemes()."""
+        try:
+            self._win.hud.push_visemes(frames, hop, at)
+        except Exception:
+            pass
+
+    def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
+        """Accepted for compatibility; the central ball has no eyes."""
+        try:
+            self._win.hud.glance(dx, dy, hold)
+        except Exception:
+            pass
 
     def start_camera_stream(self) -> None:
         """Thread-safe: start live camera feed in the full HUD area."""

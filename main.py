@@ -73,6 +73,13 @@ from memory.config_manager     import (
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
 )
+# Model ladder + quota fallback (core/gemini.py). Guarded so the assistant still
+# starts on the fixed LIVE_MODEL below if that module is not in this project.
+try:
+    from core                  import gemini as _gemini
+except Exception as _gemini_err:
+    _gemini = None
+    print(f"[AURA] core.gemini unavailable — using fixed live model: {_gemini_err}")
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
@@ -114,6 +121,13 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
+# The conversation's model. A NAME, not a decision: the ladder lives in
+# core/gemini.py and this is only whichever rung is currently in use, kept here
+# as a module attribute because plugins read it (chat_takeover asks main for it
+# so that upgrading the assistant upgrades the plugin too).
+#
+# It is reassigned on every connect, so a model that runs out of quota is
+# stepped over and the assistant keeps talking instead of failing to start.
 LIVE_MODEL          = "models/gemini-3.1-flash-live-preview"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000 
@@ -2113,6 +2127,19 @@ class AuraLive:
             try:
                 print("[AURA] Connecting...")
                 self.ui.set_state("THINKING")
+
+                # Pick the rung to open the conversation on. A model resting
+                # off a quota limit is skipped; the name is published back to
+                # LIVE_MODEL so plugins follow whatever is actually in use.
+                global LIVE_MODEL
+                if _gemini is not None:
+                    try:
+                        LIVE_MODEL = _gemini.live_model()
+                    except Exception as _e:
+                        print(f"[AURA] live_model() failed, keeping {LIVE_MODEL}: {_e}")
+                live_model = LIVE_MODEL
+                print(f"[AURA] Live model: {live_model}")
+
                 _resumed_with = self._resume_handle is not None
                 config = self._build_config()
 
@@ -2125,7 +2152,7 @@ class AuraLive:
                 )
 
                 async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
+                    client.aio.live.connect(model=live_model, config=config) as session,
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session          = session
@@ -2225,6 +2252,29 @@ class AuraLive:
                 err_str = str(e)
                 print(f"[AURA] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
+
+                # Out of quota, or this model is not available to this key —
+                # step down the ladder and reconnect straight away. This is the
+                # difference between "AURA is quieter today" and "AURA does
+                # not start today": one model means one daily limit, and the
+                # limit always arrives mid-conversation.
+                _stepped = False
+                if _gemini is not None:
+                    try:
+                        _stepped = _gemini.note_live_failure(live_model, err_str)
+                    except Exception as _ge:
+                        print(f"[AURA] note_live_failure() failed: {_ge}")
+                if _stepped:
+                    nxt = _gemini.live_model()
+                    self.ui.write_log(
+                        f"SYS: Switching to {nxt.split('/')[-1]} — the previous "
+                        f"model is out of quota."
+                        if nxt != live_model else
+                        "SYS: Every live model is rate-limited — retrying.")
+                    self._conn_backoff = 0 if nxt != live_model else 15
+                    if nxt == live_model:
+                        await asyncio.sleep(self._conn_backoff)
+                    continue
 
                 # Turn-taking / media / thinking knobs rejected by the server
                 # (preview API drift) — drop them first, because they are the
