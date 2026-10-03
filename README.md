@@ -14,7 +14,7 @@ Built by **CodeCrafters**.
 
 A.U.R.A is designed to work alongside the user rather than functioning as a conventional chatbot. It can understand natural-language commands, interact with the desktop, perform supported system actions, remember information, research topics, process files, and respond through voice.
 
-Version 2 introduces a more modular architecture together with an **offline British-style JARVIS voice**, configurable audio devices, customizable wake-up commands, and a dedicated plugin system.
+Version 2 introduces a more modular architecture together with configurable audio devices, customizable wake-up commands, and a dedicated plugin system.
 
 ---
 
@@ -23,7 +23,6 @@ Version 2 introduces a more modular architecture together with an **offline Brit
 | Feature | Description |
 |---|---|
 | **AI Voice Interaction** | Natural voice-based communication with the assistant. |
-| **Offline British JARVIS Voice** | Local text-to-speech system providing a British-style assistant voice without requiring an online TTS service. |
 | **Wake-Up System** | Activate A.U.R.A using configurable wake commands. |
 | **"Hey AURA"** | Natural voice activation command. |
 | **"AURA, Wake Up"** | Dedicated wake-up command inspired by traditional cinematic AI assistants. |
@@ -78,7 +77,6 @@ A.U.R.A v2
 ├── dashboard/        # Dashboard components
 ├── memory/           # Persistent memory system
 ├── plugins/          # Plugin architecture
-├── voices/           # Voice-related resources
 │
 ├── main.py           # Application entry point
 ├── ui.py             # User interface
@@ -103,8 +101,6 @@ AI Processing
 Action / Response
     ↓
 Text Response
-    ↓
-Local TTS
     ↓
 Selected Speaker
 ```
