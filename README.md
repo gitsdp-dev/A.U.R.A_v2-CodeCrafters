@@ -187,7 +187,7 @@ Performance improvements
 
 For major changes, opening an issue before implementation is recommended.
 
-### A Small Change Towards a Little Bit Innovation By CodeCrafters ❤️
+### A Small Change Towards a Little Bit of Innovation By CodeCrafters ❤️
 
 A.U.R.A is developed by CodeCrafters, an independent development team focused on AI assistants, productivity software, developer tools, and experimental desktop applications.
 
