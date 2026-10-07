@@ -487,43 +487,11 @@ python scripts\download_models.py
 
 # Running A.U.R.A
 
-## Standard UI / Text Mode
+Just start the program by typing:
 
 ```bash
 python main.py
 ```
-
-or:
-
-```bash
-py main.py
-```
-
-## Offline Voice Mode
-
-```bash
-python main.py --voice
-```
-
-A provider can be selected for a specific run:
-
-```bash
-python main.py --voice --provider ollama
-```
-
-```bash
-python main.py --voice --provider lmstudio
-```
-
-or:
-
-```bash
-python main.py --voice --provider auto
-```
-
-The `auto` provider attempts to use the configured local provider first and can fall back to the other supported local server.
-
----
 
 # Configuration
 
