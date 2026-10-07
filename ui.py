@@ -24,11 +24,11 @@ else:
 os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
 
 from PyQt6.QtCore import (
-    QEasingCurve, QMimeData, QObject, QPointF, QRectF, QSize, QSizeF, Qt, QThread,
+    QEasingCurve, QEvent, QMimeData, QObject, QPoint, QPointF, QRectF, QSize, QSizeF, Qt, QThread,
     QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
+    QBrush, QColor, QConicalGradient, QCursor, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
@@ -4638,6 +4638,348 @@ class RemoteKeyOverlay(QWidget):
         self.closed.emit()
 
 
+class _MiniBar(QWidget):
+    """Mic + interrupt buttons that drop down under the floating orb.
+
+    They are the very same HudButton widgets the header uses (same size, same
+    chamfered outline, same vector mic icon, same red 'alert' state), wired to
+    the very same MainWindow handlers. The window itself is a separate frameless
+    always-on-top tool window so the orb can stay exactly 128 x 128.
+    """
+
+    _W, _H = 158, 42
+
+    def __init__(self, win):
+        super().__init__(None, (Qt.WindowType.FramelessWindowHint
+                                | Qt.WindowType.WindowStaysOnTopHint
+                                | Qt.WindowType.Tool
+                                | Qt.WindowType.WindowDoesNotAcceptFocus))
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self.setFixedSize(self._W, self._H)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(8)
+
+        # Identical to the header: mic 58x30 (icon) + "stop" 76x30 (text).
+        self.mic_btn = HudButton("", "mic")
+        self.mic_btn.setFixedSize(58, 30)
+        self.mic_btn.clicked.connect(win._toggle_mute)
+        lay.addWidget(self.mic_btn)
+
+        self.stop_btn = HudButton("stop", "text")
+        self.stop_btn.setFixedSize(76, 30)
+        self.stop_btn.setToolTip("Interrupt  [ESC]")
+        self.stop_btn.clicked.connect(win._do_interrupt)
+        lay.addWidget(self.stop_btn)
+
+        self._synced_muted = None
+        self.sync_muted(bool(getattr(win, "_muted", False)))
+
+    def sync_muted(self, muted: bool) -> None:
+        """Mirror the main window's mic state (F4, remote, video auto-mute…)."""
+        if muted == self._synced_muted:
+            return
+        self._synced_muted = muted
+        self.mic_btn.set_alert(muted)
+        self.mic_btn.setToolTip(
+            "Microphone muted — click to unmute" if muted
+            else "Microphone active — click to mute")
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = float(self.width()), float(self.height())
+        m, c = 1.5, 8.0
+        path = QPainterPath()
+        path.moveTo(m + c, m)
+        path.lineTo(W - m - c, m)
+        path.lineTo(W - m, m + c)
+        path.lineTo(W - m, H - m - c)
+        path.lineTo(W - m - c, H - m)
+        path.lineTo(m + c, H - m)
+        path.lineTo(m, H - m - c)
+        path.lineTo(m, m + c)
+        path.closeSubpath()
+        p.setBrush(QBrush(qcol(C.BG, 238)))
+        p.setPen(QPen(qcol(C.BORDER_A), 1.2))
+        p.drawPath(path)
+        p.end()
+
+
+class MiniOrbWidget(QWidget):
+    """Always-on-top, draggable 128 x 128 AURA orb.
+
+    Shown only while the main window is minimised (MainWindow.changeEvent) and
+    hidden again as soon as it is restored.
+
+    The picture is the HUD's central ball: HudCanvas._draw_orb is called
+    directly, and the scale / halo / spin logic below is a line-for-line mirror
+    of HudCanvas._step, driven by the live HUD state (speaking, muted and the
+    smoothed audio level), so the orb behaves exactly like the one in the HUD:
+        SPEAKING  -> fast spin, bright halo, pulses with the voice
+        LISTENING -> slow, steady spin
+        MUTED     -> almost frozen and tinted red
+
+    Hover the orb  -> mic + stop buttons appear just below it.
+    Leave the orb  -> the buttons stay for HIDE_DELAY_MS (4 s), then vanish.
+    Drag anywhere on the orb to move it. Double-click it to restore AURA.
+    """
+
+    SIZE          = 128
+    HIDE_DELAY_MS = 4000      # buttons linger this long after the mouse leaves
+    _EDGE         = 24        # default gap from the screen corner
+    _BAR_GAP      = 2         # gap between the orb and the button bar
+
+    def __init__(self, win):
+        super().__init__(None, (Qt.WindowType.FramelessWindowHint
+                                | Qt.WindowType.WindowStaysOnTopHint
+                                | Qt.WindowType.Tool
+                                | Qt.WindowType.WindowDoesNotAcceptFocus))
+        self._win = win
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag to move  ·  double-click to restore")
+
+        # ── animation state, mirrors HudCanvas ──────────────────────────────
+        hud = win.hud
+        self.muted       = False
+        self.speaking    = False
+        self._tick       = 0
+        self._scale      = 1.0
+        self._tgt_scale  = 1.0
+        self._halo       = 55.0
+        self._tgt_halo   = 55.0
+        self._last_t     = time.time()
+        self._amp_disp   = 0.0
+        self._orb_spin   = 0.0
+        self._rings      = [0.0, 120.0, 240.0]
+        # Same trails / dots as the HUD ball, so it is recognisably the same orb.
+        self._orb_trails = [dict(t) for t in hud._orb_trails]
+        self._orb_dots   = [dict(d) for d in hud._orb_dots]
+
+        # ── hover / drag state ──────────────────────────────────────────────
+        self._bar          = _MiniBar(win)
+        self._hover        = False
+        self._hide_at      = None        # monotonic deadline for hiding the bar
+        self._drag_off     = None
+        self._saved_pos    = None        # remembered between minimise / restore
+
+        self._tmr = QTimer(self)
+        self._tmr.setInterval(16)
+        self._tmr.timeout.connect(self._step)
+
+    # ── show / hide (driven by MainWindow.changeEvent) ──────────────────────
+    def show_mini(self) -> None:
+        if self.isVisible():
+            return
+        self.move(self._start_pos())
+        self._hide_at = None
+        self._bar.hide()
+        self.show()
+        self.raise_()
+
+    def hide_mini(self) -> None:
+        self._drag_off = None
+        self._hide_at = None
+        self._bar.hide()
+        self.hide()
+
+    def showEvent(self, e):
+        self._tmr.start()
+        super().showEvent(e)
+
+    def hideEvent(self, e):
+        self._tmr.stop()
+        super().hideEvent(e)
+
+    # ── placement ───────────────────────────────────────────────────────────
+    def _screen_rect(self, pt):
+        scr = QApplication.screenAt(pt) or QApplication.primaryScreen()
+        return scr.availableGeometry()
+
+    def _clamp(self, pt, ref=None):
+        ag = self._screen_rect(ref if ref is not None else pt)
+        x = max(ag.left(), min(pt.x(), ag.right()  + 1 - self.SIZE))
+        y = max(ag.top(),  min(pt.y(), ag.bottom() + 1 - self.SIZE))
+        return type(pt)(x, y)
+
+    def _start_pos(self):
+        """Where the orb appears: last spot, else the bottom-right corner."""
+        if self._saved_pos is not None:
+            return self._clamp(self._saved_pos)
+        ag = QApplication.primaryScreen().availableGeometry()
+        return QPoint(
+            ag.right()  + 1 - self.SIZE - self._EDGE,
+            ag.bottom() + 1 - self.SIZE - self._EDGE - _MiniBar._H - self._BAR_GAP,
+        )
+
+    def _place_bar(self) -> None:
+        """Centre the buttons just below the orb (flip above only if the
+        screen has no room underneath)."""
+        g, b = self.geometry(), self._bar
+        ag = self._screen_rect(g.center())
+        x = g.x() + (g.width() - b.width()) // 2
+        y = g.y() + g.height() + self._BAR_GAP
+        if y + b.height() > ag.bottom() + 1:
+            y = g.y() - b.height() - self._BAR_GAP
+        x = max(ag.left(), min(x, ag.right() + 1 - b.width()))
+        b.move(x, y)
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        if self._bar.isVisible():
+            self._place_bar()
+
+    # ── per-frame update (mirrors HudCanvas._step) ──────────────────────────
+    def _step(self):
+        hud = self._win.hud
+        self._tick += 1
+        now = time.time()
+        self.speaking  = bool(getattr(hud, "speaking", False))
+        self.muted     = bool(getattr(hud, "muted", False))
+        self._amp_disp = float(getattr(hud, "_amp_disp", 0.0))
+
+        if now - self._last_t > (0.12 if self.speaking else 0.5):
+            if self.speaking:
+                self._tgt_scale = random.uniform(1.06, 1.14)
+                self._tgt_halo  = random.uniform(145, 190)
+            elif self.muted:
+                self._tgt_scale = random.uniform(0.998, 1.002)
+                self._tgt_halo  = random.uniform(15, 28)
+            else:
+                self._tgt_scale = random.uniform(1.001, 1.008)
+                self._tgt_halo  = random.uniform(48, 68)
+            self._last_t = now
+
+        sp = 0.38 if self.speaking else 0.15
+        self._scale += (self._tgt_scale - self._scale) * sp
+        self._halo  += (self._tgt_halo  - self._halo)  * sp
+
+        if self.speaking:
+            orb_spd = 3.4
+        elif self.muted:
+            orb_spd = 0.10
+        else:
+            orb_spd = 0.32
+        orb_spd += self._amp_disp * 2.4
+        self._orb_spin = (self._orb_spin + orb_spd) % 360
+
+        speeds = [1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9]
+        for i, spd in enumerate(speeds):
+            self._rings[i] = (self._rings[i] + spd) % 360
+
+        self._bar.sync_muted(bool(getattr(self._win, "_muted", False)))
+        self._poll_hover()
+        self.update()
+
+    # ── hover logic ─────────────────────────────────────────────────────────
+    def _over_orb(self, pos) -> bool:
+        g = self.geometry()
+        dx = pos.x() - (g.x() + self.SIZE / 2.0)
+        dy = pos.y() - (g.y() + self.SIZE / 2.0)
+        return dx * dx + dy * dy <= (self.SIZE / 2.0) ** 2
+
+    def _poll_hover(self) -> None:
+        pos = QCursor.pos()
+        over_orb = self._drag_off is not None or self._over_orb(pos)
+        over_bar = self._bar.isVisible() and self._bar.geometry().contains(pos)
+        self._hover = over_orb
+
+        if over_orb or over_bar:
+            self._hide_at = None
+            if not self._bar.isVisible():
+                self._place_bar()
+                self._bar.show()
+                self._bar.raise_()
+        elif self._bar.isVisible():
+            t = time.monotonic()
+            if self._hide_at is None:
+                self._hide_at = t + self.HIDE_DELAY_MS / 1000.0
+            elif t >= self._hide_at:
+                self._bar.hide()
+                self._hide_at = None
+
+    # ── drag / double-click ─────────────────────────────────────────────────
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            gp = e.globalPosition().toPoint()
+            self._drag_off = gp - self.frameGeometry().topLeft()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            e.accept()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_off is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+            gp = e.globalPosition().toPoint()
+            self.move(self._clamp(gp - self._drag_off, ref=gp))
+            e.accept()
+        else:
+            super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._drag_off is not None:
+            self._drag_off = None
+            self._saved_pos = self.pos()
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            w = self._win
+            w.setWindowState((w.windowState() & ~Qt.WindowState.WindowMinimized)
+                             | Qt.WindowState.WindowActive)
+            w.show()
+            w.raise_()
+            w.activateWindow()
+            e.accept()
+        else:
+            super().mouseDoubleClickEvent(e)
+
+    # ── painting ────────────────────────────────────────────────────────────
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        S = float(self.SIZE)
+        cx = cy = S / 2.0
+        col = C.MUTED_C if self.muted else C.PRI
+
+        # round dark disc (the HUD's black background, cut to a circle)
+        disc = QRectF(2, 2, S - 4, S - 4)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(qcol(C.BG)))
+        p.drawEllipse(disc)
+
+        # the HUD's central ball, clipped to the disc
+        clip = QPainterPath()
+        clip.addEllipse(disc)
+        p.setClipPath(clip)
+        HudCanvas._draw_orb(self, p, cx, cy, S * 1.05)
+        p.setClipping(False)
+
+        # outer spinning arc ring — same colour / alpha logic as the HUD's
+        ring_r = S * 0.455
+        a_val  = max(0, min(255, int(self._halo)))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(qcol(col, a_val), 2.2))
+        rect = QRectF(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2)
+        angle = self._rings[0]
+        while angle < self._rings[0] + 360:
+            p.drawArc(rect, int(angle * 16), int(115 * 16))
+            angle += 115 + 78
+
+        # thin rim; a touch brighter while hovered
+        p.setPen(QPen(qcol(col, 170 if self._hover else 90), 1.4))
+        p.drawEllipse(disc)
+        p.end()
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -4898,6 +5240,9 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+
+        # Floating always-on-top orb: appears only while this window is minimised.
+        self._mini_orb = MiniOrbWidget(self)
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -5466,7 +5811,22 @@ class MainWindow(QMainWindow):
             # (the header is 54 px tall).
             b.move(max(0, cw.width() - b.width() - 16), 54 + 10)
 
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.WindowStateChange:
+            mini = getattr(self, "_mini_orb", None)
+            if mini is not None:
+                # Windows' own minimise button -> orb appears; restore -> it goes.
+                if self.isMinimized():
+                    mini.show_mini()
+                else:
+                    mini.hide_mini()
+
     def closeEvent(self, e):
+        try:
+            self._mini_orb.hide_mini()
+        except Exception:
+            pass
         try:
             self._room_enabled = False
             self._room_halt(1.0)
