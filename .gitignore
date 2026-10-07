@@ -1,16 +1,19 @@
-# ── AURA V2 — what never belongs in the repository ──────────────────────────
+# ── A.U.R.A v2 (Local Ai Integration) — what never belongs in the repository ──────────────────────────
 # Everything listed here is created by the app on first run. A fresh clone with
 # none of it present boots straight to the setup screen, which is the intended
 # first experience — so nothing here needs to be committed, and some of it must
 # never be.
 
 # ── Secrets. Committing any of these publishes them. ──────────────────────────
-config/api_keys.json          # your Gemini API key, plus per-plugin credentials
-config/certs/                 # the dashboard's TLS private key and certificate
-config/whatsapp_web/          # a LINKED WhatsApp session — committing it hands
-                              # somebody your WhatsApp account, not just a key
-**/token*.json                # Google OAuth tokens (Gmail / Calendar plugins)
-**/client_secret*.json        # Google OAuth client secrets
+# API keys, biometric data, certificates/private keys, and linked sessions.
+config/api_keys.json
+config/face_unlock.json
+config/face_unlock/
+config/certs/
+config/whatsapp_web/
+# Google OAuth tokens and client secrets.
+**/token*.json
+**/client_secret*.json
 *credentials*.json
 .env
 .env.*
@@ -18,6 +21,10 @@ config/whatsapp_web/          # a LINKED WhatsApp session — committing it hand
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
 memory/*.db
+
+# ── Downloaded assets and local backups ───────────────────────────────────────
+models/
+bugs_backup.txt
 
 # ── Python build noise ────────────────────────────────────────────────────────
 __pycache__/

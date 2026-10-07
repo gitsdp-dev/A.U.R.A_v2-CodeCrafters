@@ -107,3 +107,15 @@ pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
 # macOS / Linux OS actions (volume, brightness, reminders) shell out to native
 # tools (pactl / brightnessctl / osascript / systemd), so no extra Python
 # packages are needed there — nothing Windows-specific is ever pulled in.
+
+vosk>=0.3.45,<1
+av
+kokoro
+kokoro-onnx
+smolagents
+litellm
+openai
+ollama
+PyYAML
+edge-tts
+miniaudio

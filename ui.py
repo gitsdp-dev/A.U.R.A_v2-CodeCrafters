@@ -24,7 +24,7 @@ else:
 os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
 
 from PyQt6.QtCore import (
-    QEasingCurve, QMimeData, QObject, QPointF, QRectF, QSize, QSizeF, Qt,
+    QEasingCurve, QMimeData, QObject, QPointF, QRectF, QSize, QSizeF, Qt, QThread,
     QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
@@ -46,11 +46,12 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
 
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
+from core.vosk_models import DEFAULT_VOSK_MODEL, VOSK_MODEL_OPTIONS
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -76,6 +77,48 @@ _LEFT_W  = 206
 _RIGHT_W = 340
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
+
+KOKORO_VOICE_GROUPS = {
+    "American English — Female": (
+        "af_heart", "af_bella", "af_nicole", "af_alloy", "af_aoede",
+        "af_jessica", "af_kore", "af_nova", "af_river", "af_sarah", "af_sky",
+    ),
+    "American English — Male": (
+        "am_adam", "am_michael", "am_fenrir", "am_puck", "am_echo",
+        "am_eric", "am_liam", "am_onyx", "am_santa",
+    ),
+    "British English — Female": ("bf_alice", "bf_emma", "bf_lily", "bf_isabella"),
+    "British English — Male": ("bm_daniel", "bm_fable", "bm_george", "bm_lewis"),
+    "Japanese — Female": (
+        "jf_alpha", "jf_gongitsune", "jf_tebukuro", "jf_nezumi",
+    ),
+    "Japanese — Male": ("jm_kumo",),
+    "Mandarin Chinese — Female": (
+        "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
+    ),
+    "Mandarin Chinese — Male": (
+        "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
+    ),
+    "Spanish": ("ef_dora", "em_alex", "em_santa"),
+    "French": ("ff_siwis",),
+    "Hindi": ("hf_alpha", "hf_beta", "hm_omega", "hm_psi"),
+    "Italian": ("if_sara", "im_nicola"),
+    "Brazilian Portuguese": ("pf_dora", "pm_alex", "pm_santa"),
+}
+
+LOCAL_MODEL_SUGGESTIONS = {
+    "ollama": (
+        "qwen2.5:1.5b", "llama3.2:1b", "qwen2.5:3b", "llama3.2:3b",
+        "qwen3:4b", "gemma3:4b",
+        "phi4-mini:3.8b", "mistral:7b", "qwen2.5:7b", "llama3.1:8b",
+    ),
+    "lmstudio": (
+        "Qwen2.5-1.5B-Instruct", "Llama-3.2-1B-Instruct",
+        "Qwen2.5-3B-Instruct", "Llama-3.2-3B-Instruct",
+        "Qwen3-4B", "Gemma-3-4B", "Phi-4-mini",
+        "Mistral-7B-Instruct", "Qwen2.5-7B-Instruct",
+    ),
+}
 
 # ── Face unlock (module-level helpers) ───────────────────────────────────────
 # Uses OpenCV's YuNet (detector) + SFace (recognizer). Both are small ONNX
@@ -1813,10 +1856,20 @@ class FaceLockOverlay(QWidget):
 
 
 class SetupOverlay(QWidget):
-    done = pyqtSignal(str, str)
+    done = pyqtSignal(dict)
+    finished = pyqtSignal()
+    _probe_done = pyqtSignal(object)
+    _voice_test_done = pyqtSignal(str)
+    _voice_catalog_done = pyqtSignal(str, object, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, config=None):
         super().__init__(parent)
+        config = config if isinstance(config, dict) else {}
+        from memory.config_manager import is_setup_configured
+        self._already_configured = is_setup_configured(config)
+        saved_local = config.get("local_llm", {})
+        if not isinstance(saved_local, dict):
+            saved_local = {}
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             SetupOverlay {{
@@ -1826,14 +1879,67 @@ class SetupOverlay(QWidget):
             }}
         """)
 
-        detected = {"darwin": "mac", "windows": "windows"}.get(
-            _OS.lower(), "linux"
-        )
+        detected = {"darwin": "mac", "windows": "windows"}.get(_OS.lower(), "linux")
+        saved_os = config.get("os_system")
+        if saved_os in {"windows", "mac", "linux"}:
+            detected = saved_os
         self._sel_os = detected
+        self._model_worker = None
+        self._probe_generation = 0
+        saved_voices = saved_local.get("voice_by_model", {})
+        self._voice_by_model = dict(saved_voices) if isinstance(saved_voices, dict) else {}
+        saved_engine_voices = saved_local.get("tts_voice_by_engine", {})
+        self._tts_voice_by_engine = (
+            dict(saved_engine_voices) if isinstance(saved_engine_voices, dict)
+            else {}
+        )
+        saved_tts_engine = str(saved_local.get("tts_engine", "kokoro"))
+        self._last_tts_engine = (
+            saved_tts_engine
+            if saved_tts_engine in {"kokoro", "edgetts", "elevenlabs"}
+            else "kokoro"
+        )
+        saved_tts_voice = str(saved_local.get("tts_voice", "af_heart"))
+        if saved_tts_voice:
+            self._tts_voice_by_engine.setdefault(
+                self._last_tts_engine, saved_tts_voice
+            )
+        saved_provider = saved_local.get("provider", "ollama")
+        if saved_provider not in {"ollama", "lmstudio"}:
+            saved_provider = "ollama"
+        self._last_provider = saved_provider
+        self._models_by_provider = {saved_provider: str(saved_local.get("model", ""))}
+        self._base_urls = {
+            "ollama": "http://127.0.0.1:11434",
+            "lmstudio": "http://127.0.0.1:1234/v1",
+        }
+        if saved_provider in self._base_urls and saved_local.get("base_url"):
+            self._base_urls[saved_provider] = saved_local["base_url"]
+        self._probe_done.connect(self._apply_probe_result)
+        self._voice_test_done.connect(self._on_voice_test_done)
+        self._voice_catalog_done.connect(self._on_voice_catalog_done)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 22, 30, 22)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(0)
+
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 6)
+        top_bar.addStretch(1)
+        self._close_btn = QPushButton("×")
+        self._close_btn.setAccessibleName("Close setup")
+        self._close_btn.setToolTip("Close without saving")
+        self._close_btn.setFixedSize(28, 28)
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                font: bold 18px "Courier New"; }}
+            QPushButton:hover {{ color: {C.RED}; border-color: {C.RED}; }}
+        """)
+        self._close_btn.clicked.connect(self.finished.emit)
+        top_bar.addWidget(self._close_btn)
+        layout.addLayout(top_bar)
 
         def _lbl(txt, font_size=9, bold=False, color=C.PRI,
                  align=Qt.AlignmentFlag.AlignCenter):
@@ -1844,42 +1950,305 @@ class SetupOverlay(QWidget):
             w.setStyleSheet(f"color: {color}; background: transparent;")
             return w
 
-        layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
-        layout.addWidget(_lbl("Configure J.A.R.V.I.S. before first boot.", 9, color=C.PRI_DIM))
-        layout.addSpacing(6)
+        self._stack = QStackedWidget()
+        layout.addWidget(self._stack)
+        form = QWidget()
+        form_layout = QVBoxLayout(form)
+        form_layout.setContentsMargins(12, 8, 12, 8)
+        form_layout.setSpacing(6)
+        form_layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
+        form_layout.addWidget(_lbl("Configure A.U.R.A. before first boot.", 9, color=C.PRI_DIM))
 
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep)
-        layout.addSpacing(4)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        scroll.setWidget(form)
+        self._stack.addWidget(scroll)
 
-        layout.addWidget(_lbl("GEMINI API KEY", 8, color=C.TEXT_DIM,
-                               align=Qt.AlignmentFlag.AlignLeft))
+        def _separator(target):
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setStyleSheet(f"color: {C.BORDER};")
+            target.addWidget(line)
+
+        def _combo():
+            box = QComboBox()
+            box.setFont(QFont("Courier New", 9))
+            box.setFixedHeight(29)
+            box.setStyleSheet(f"""
+                QComboBox {{ background: {C.PANEL2}; color: {C.TEXT};
+                    border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 7px; }}
+                QComboBox QAbstractItemView {{ background: {C.PANEL};
+                    color: {C.TEXT}; selection-background-color: {C.PRI_GHO}; }}
+            """)
+            return box
+
+        def _pills(box, choices):
+            holder = QWidget()
+            row = QHBoxLayout(holder)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(5)
+            buttons = []
+
+            def refresh():
+                for button, value in buttons:
+                    selected = box.currentData() == value
+                    button.setChecked(selected)
+                    button.setStyleSheet(f"""
+                        QPushButton {{ background: {C.PRI if selected else C.PANEL2};
+                            color: {C.BG if selected else C.TEXT_DIM};
+                            border: 1px solid {C.PRI if selected else C.BORDER};
+                            border-radius: 3px; padding: 4px 6px; font-weight: bold; }}
+                        QPushButton:hover {{ border-color: {C.PRI}; color: {C.TEXT}; }}
+                    """)
+
+            for label, value in choices:
+                button = QPushButton(label)
+                button.setCheckable(True)
+                button.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+                button.setFixedHeight(29)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.clicked.connect(
+                    lambda _checked=False, selected=value:
+                        box.setCurrentIndex(box.findData(selected))
+                )
+                buttons.append((button, value))
+                row.addWidget(button, 1)
+            holder._buttons_by_value = dict(
+                (value, button) for button, value in buttons
+            )
+            box.setParent(holder)
+            box.hide()
+            box.currentIndexChanged.connect(refresh)
+            refresh()
+            return holder
+
+        form_layout.addSpacing(4)
+        _separator(form_layout)
+        form_layout.addWidget(_lbl("GEMINI API KEY", 8, color=C.TEXT_DIM,
+                                   align=Qt.AlignmentFlag.AlignLeft))
         self._key_input = QLineEdit()
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setPlaceholderText("AIza…")
+        self._key_input.setText(str(config.get("gemini_api_key", "")))
+        self._key_input.setPlaceholderText("AIza… (required for Gemini modes)")
         self._key_input.setFont(QFont("Courier New", 10))
-        self._key_input.setFixedHeight(32)
+        self._key_input.setFixedHeight(30)
         self._key_input.setStyleSheet(f"""
-            QLineEdit {{
-                background: {C.PANEL2}; color: {C.TEXT};
-                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
-            }}
+            QLineEdit {{ background: {C.PANEL2}; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}
             QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
         """)
-        layout.addWidget(self._key_input)
-        layout.addSpacing(12)
+        form_layout.addWidget(self._key_input)
 
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep2)
-        layout.addSpacing(4)
+        form_layout.addWidget(_lbl("INITIALISATION MODE", 8, True, color=C.ACC2,
+                                   align=Qt.AlignmentFlag.AlignLeft))
+        form_layout.addWidget(_lbl("BRAIN MODE", 8, color=C.TEXT_DIM,
+                                   align=Qt.AlignmentFlag.AlignLeft))
+        self._mode = _combo()
+        self._mode.addItem("GEMINI", "gemini")
+        self._mode.addItem("LOCAL ONLY", "local")
+        self._mode.addItem("GEMINI + LOCAL FALLBACK", "fallback")
+        mode_index = self._mode.findData(saved_local.get("mode", "gemini"))
+        self._mode.setCurrentIndex(max(0, mode_index))
+        self._mode_pills = _pills(self._mode, [
+            ("GEMINI KEY ONLY", "gemini"),
+            ("LOCAL AI ONLY", "local"),
+            ("GEMINI + LOCAL FALLBACK", "fallback"),
+        ])
+        form_layout.addWidget(self._mode_pills)
+        _separator(form_layout)
+        form_layout.addWidget(_lbl(
+            "SPEECH-TO-TEXT MODEL", 8, color=C.TEXT_DIM,
+            align=Qt.AlignmentFlag.AlignLeft
+        ))
+        self._vosk_model_label = _lbl(
+            "VOSK MODEL  (downloaded once; speech recognition only)",
+            7, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft
+        )
+        self._vosk_model = _combo()
+        for label, model in VOSK_MODEL_OPTIONS:
+            self._vosk_model.addItem(label, model)
+        vosk_model_index = self._vosk_model.findData(
+            saved_local.get("vosk_model", DEFAULT_VOSK_MODEL)
+        )
+        self._vosk_model.setCurrentIndex(max(0, vosk_model_index))
+        self._vosk_model.setToolTip(
+            "Vosk is local speech recognition, not speech synthesis. It is used "
+            "in Local AI mode and when fallback switches from Gemini; Gemini "
+            "Live uses its own speech recognition while connected. The model "
+            "downloads on the first local listening session."
+        )
+        form_layout.addWidget(self._vosk_model_label)
+        form_layout.addWidget(self._vosk_model)
 
-        layout.addWidget(_lbl("OPERATING SYSTEM", 8, color=C.TEXT_DIM,
-                               align=Qt.AlignmentFlag.AlignLeft))
+        form_layout.addWidget(_lbl("LOCAL LLM PROVIDER", 8, color=C.TEXT_DIM,
+                                   align=Qt.AlignmentFlag.AlignLeft))
+        provider_row = QHBoxLayout()
+        provider_row.setSpacing(6)
+        self._provider = _combo()
+        self._provider.addItem("OLLAMA", "ollama")
+        self._provider.addItem("LM STUDIO / OPENAI", "lmstudio")
+        self._provider.setCurrentIndex(max(
+            0, self._provider.findData(saved_provider)
+        ))
+        self._provider_pills = _pills(self._provider, [
+            ("OLLAMA", "ollama"), ("LM STUDIO / OPENAI", "lmstudio")
+        ])
+        provider_row.addWidget(self._provider_pills, 1)
+        self._refresh = QPushButton("↻ REFRESH")
+        self._refresh.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._refresh.setFixedHeight(29)
+        self._refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._refresh.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 8px; }}
+            QPushButton:hover {{ border-color: {C.PRI}; }}
+        """)
+        provider_row.addWidget(self._refresh)
+        form_layout.addLayout(provider_row)
+        self._base_url = QLineEdit()
+        self._base_url.setFont(QFont("Courier New", 9))
+        self._base_url.setFixedHeight(28)
+        self._base_url.setPlaceholderText("http://127.0.0.1:11434")
+        self._base_url.setStyleSheet(self._key_input.styleSheet())
+        self._base_url.setText(str(
+            saved_local.get("base_url", self._base_urls[saved_provider])
+        ))
+        form_layout.addWidget(_lbl("SERVER URL", 7, color=C.TEXT_DIM,
+                                   align=Qt.AlignmentFlag.AlignLeft))
+        form_layout.addWidget(self._base_url)
+        self._provider_status = _lbl("● SERVER STATUS: NOT CHECKED", 8, color=C.RED,
+                                     align=Qt.AlignmentFlag.AlignLeft)
+        form_layout.addWidget(self._provider_status)
+        self._model = _combo()
+        self._model.setEditable(True)
+        self._model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        default_model = LOCAL_MODEL_SUGGESTIONS[saved_provider][0]
+        self._model.setEditText(str(saved_local.get("model", default_model)))
+        self._model.setToolTip(
+            "Choose a model reported as loaded by the server or type its exact model ID."
+        )
+        form_layout.addWidget(_lbl("MODEL  (select a listed model or type a name)", 8,
+                                   color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        form_layout.addWidget(self._model)
+        form_layout.addWidget(_lbl(
+            "Suggestions are examples; select one or type your loaded model ID.",
+            7, color=C.PRI_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        self._provider_hint = _lbl(
+            "Start Ollama, then run: ollama pull qwen2.5:3b",
+            7, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft)
+        form_layout.addWidget(self._provider_hint)
+
+        _separator(form_layout)
+        form_layout.addWidget(_lbl("TEXT-TO-SPEECH ENGINE", 8, color=C.TEXT_DIM,
+                                   align=Qt.AlignmentFlag.AlignLeft))
+        self._tts = _combo()
+        self._tts.addItem("Kokoro (offline neural)", "kokoro")
+        self._tts.addItem("Edge TTS (online)", "edgetts")
+        self._tts.addItem("ElevenLabs (online)", "elevenlabs")
+        tts_index = self._tts.findData(saved_local.get("tts_engine", "kokoro"))
+        self._tts.setCurrentIndex(max(0, tts_index))
+        self._tts_pills = _pills(self._tts, [
+            ("KOKORO", "kokoro"), ("EDGETTS", "edgetts"),
+            ("ELEVENLABS", "elevenlabs"),
+        ])
+        form_layout.addWidget(self._tts_pills)
+        self._tts_voice = _combo()
+        self._tts_voice.setEditable(True)
+        self._tts_voice.addItem("af_heart")
+        self._tts_voice.addItem("en-US-GuyNeural")
+        saved_tts_voice = str(saved_local.get("tts_voice", "af_heart"))
+        if self._tts_voice.findText(saved_tts_voice) < 0:
+            self._tts_voice.addItem(saved_tts_voice)
+        self._tts_voice.setCurrentText(saved_tts_voice)
+        form_layout.addWidget(_lbl("VOICE ID", 8, color=C.TEXT_DIM,
+                                   align=Qt.AlignmentFlag.AlignLeft))
+        voice_row = QHBoxLayout()
+        voice_row.setSpacing(6)
+        voice_row.addWidget(self._tts_voice, 1)
+        self._refresh_tts_voices_btn = QPushButton("↻ VOICES")
+        self._refresh_tts_voices_btn.setFont(
+            QFont("Courier New", 8, QFont.Weight.Bold)
+        )
+        self._refresh_tts_voices_btn.setFixedHeight(29)
+        self._refresh_tts_voices_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self._refresh_tts_voices_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 8px; }}
+            QPushButton:hover {{ border-color: {C.PRI}; }}
+        """)
+        self._refresh_tts_voices_btn.clicked.connect(self._refresh_tts_voices)
+        voice_row.addWidget(self._refresh_tts_voices_btn)
+        self._test_voice_btn = QPushButton("▶ TEST")
+        self._test_voice_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._test_voice_btn.setFixedHeight(29)
+        self._test_voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._test_voice_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 8px; }}
+            QPushButton:hover {{ border-color: {C.PRI}; }}
+        """)
+        self._test_voice_btn.clicked.connect(self._test_voice)
+        voice_row.addWidget(self._test_voice_btn)
+        form_layout.addLayout(voice_row)
+        self._voice_test_status = _lbl("", 7, color=C.TEXT_DIM,
+                                      align=Qt.AlignmentFlag.AlignLeft)
+        form_layout.addWidget(self._voice_test_status)
+        self._voice_catalog_status = _lbl("", 7, color=C.TEXT_DIM,
+                                          align=Qt.AlignmentFlag.AlignLeft)
+        form_layout.addWidget(self._voice_catalog_status)
+        self._elevenlabs_key_label = _lbl(
+            "ELEVENLABS API KEY",
+            8, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft
+        )
+        form_layout.addWidget(self._elevenlabs_key_label)
+        self._elevenlabs_key_input = QLineEdit()
+        self._elevenlabs_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._elevenlabs_key_input.setText(
+            str(config.get("elevenlabs_api_key", ""))
+        )
+        self._elevenlabs_key_input.setPlaceholderText(
+            "Required for ElevenLabs voices"
+        )
+        self._elevenlabs_key_input.setFont(QFont("Courier New", 9))
+        self._elevenlabs_key_input.setFixedHeight(29)
+        self._elevenlabs_key_input.setStyleSheet(self._key_input.styleSheet())
+        form_layout.addWidget(self._elevenlabs_key_input)
+        form_layout.addWidget(_lbl(
+                                   "Edge TTS and ElevenLabs need internet. "
+                                   "Kokoro works offline; Local AI mode can use any selected voice.",
+                                   7, color=C.PRI_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        self._local_voice_override = QCheckBox(
+            "Use selected TTS voice for Gemini responses"
+        )
+        self._local_voice_override.setChecked(
+            bool(saved_local.get("local_voice_override", False))
+        )
+        self._local_voice_override.setStyleSheet(
+            f"QCheckBox {{ color: {C.ACC2}; background: transparent; }}"
+            f"QCheckBox::indicator {{ width: 15px; height: 15px; }}"
+            f"QCheckBox::indicator:unchecked {{ border: 1px solid {C.BORDER_B}; }}"
+            f"QCheckBox::indicator:checked {{ background: {C.PRI}; border: 1px solid {C.PRI}; }}"
+        )
+        self._local_voice_override.setToolTip(
+            "In Gemini + Local Fallback mode, use the selected TTS provider for "
+            "Gemini's spoken replies. Kokoro works offline; Edge TTS needs internet; "
+            "ElevenLabs needs internet and an API key."
+        )
+        self._local_voice_override.toggled.connect(self._tts_changed)
+        form_layout.addWidget(self._local_voice_override)
+
+        _separator(form_layout)
+        form_layout.addWidget(_lbl("OPERATING SYSTEM", 8, color=C.TEXT_DIM,
+                                   align=Qt.AlignmentFlag.AlignLeft))
         det_name = {"windows": "Windows", "mac": "macOS", "linux": "Linux"}[detected]
-        layout.addWidget(_lbl(f"Auto-detected: {det_name}", 8, color=C.ACC2,
-                               align=Qt.AlignmentFlag.AlignLeft))
-
-        os_row = QHBoxLayout(); os_row.setSpacing(6)
+        form_layout.addWidget(_lbl(f"Auto-detected: {det_name}", 8, color=C.ACC2,
+                                   align=Qt.AlignmentFlag.AlignLeft))
+        os_row = QHBoxLayout()
+        os_row.setSpacing(6)
         self._os_btns: dict[str, QPushButton] = {}
         for key, label in [("windows","⊞  Windows"),("mac","  macOS"),("linux","🐧  Linux")]:
             btn = QPushButton(label)
@@ -1889,15 +2258,17 @@ class SetupOverlay(QWidget):
             btn.clicked.connect(lambda _, k=key: self._sel(k))
             os_row.addWidget(btn)
             self._os_btns[key] = btn
-        layout.addLayout(os_row)
+        form_layout.addLayout(os_row)
         self._sel(detected)
-        layout.addSpacing(12)
 
-        init_btn = QPushButton("▸  INITIALISE SYSTEMS")
-        init_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
-        init_btn.setFixedHeight(36)
-        init_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        init_btn.setStyleSheet(f"""
+        self._init_btn = QPushButton(
+            "▸  SAVE CHANGES" if self._already_configured
+            else "▸  INITIALISE SYSTEMS"
+        )
+        self._init_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        self._init_btn.setFixedHeight(34)
+        self._init_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._init_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent; color: {C.PRI};
                 border: 1px solid {C.PRI_DIM}; border-radius: 3px;
@@ -1906,8 +2277,60 @@ class SetupOverlay(QWidget):
                 background: {C.PRI_GHO}; border: 1px solid {C.PRI};
             }}
         """)
-        init_btn.clicked.connect(self._submit)
-        layout.addWidget(init_btn)
+        form_layout.addWidget(self._init_btn)
+        self._init_btn.clicked.connect(self._submit)
+        self._mode.currentIndexChanged.connect(self._mode_changed)
+        self._provider.currentIndexChanged.connect(self._provider_changed)
+        self._refresh.clicked.connect(self._refresh_models)
+        self._tts.currentIndexChanged.connect(self._tts_changed)
+        self._model.currentTextChanged.connect(self._model_changed)
+        self._tts_voice.currentTextChanged.connect(self._save_current_model_voice)
+        self._mode_changed()
+        self._provider_changed()
+        self._tts_changed()
+
+        self._status_page = QWidget()
+        status_layout = QVBoxLayout(self._status_page)
+        status_layout.setContentsMargins(22, 30, 22, 24)
+        status_layout.setSpacing(12)
+        status_layout.addWidget(_lbl("◈  SYSTEMS INITIALISING", 13, True))
+        self._status_rows = {}
+        for key, title in (
+            ("stt", "SPEECH RECOGNITION  (STT)"),
+            ("llm", "LANGUAGE MODEL  (LLM)"),
+            ("tts", "VOICE SYNTHESIS  (TTS)"),
+        ):
+            frame = QFrame()
+            frame.setStyleSheet(f"QFrame {{ background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 3px; }}")
+            row = QVBoxLayout(frame)
+            row.setContentsMargins(10, 8, 10, 8)
+            heading = QHBoxLayout()
+            heading.addWidget(_lbl(title, 8, True, color=C.ACC2,
+                                   align=Qt.AlignmentFlag.AlignLeft))
+            status = _lbl("CHECKING...", 8, color=C.PRI,
+                          align=Qt.AlignmentFlag.AlignRight)
+            heading.addWidget(status)
+            row.addLayout(heading)
+            progress = QProgressBar()
+            progress.setRange(0, 0)
+            progress.setFixedHeight(5)
+            progress.setTextVisible(False)
+            progress.setStyleSheet(f"QProgressBar {{ background: {C.BG}; border: 0; }} QProgressBar::chunk {{ background: {C.PRI}; }}")
+            row.addWidget(progress)
+            status_layout.addWidget(frame)
+            self._status_rows[key] = (status, progress)
+        self._status_message = _lbl("Checking local components...", 8, color=C.TEXT_DIM)
+        status_layout.addWidget(self._status_message)
+        status_layout.addStretch(1)
+        self._continue_btn = QPushButton("▸  CONTINUE TO A.U.R.A.")
+        self._continue_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        self._continue_btn.setFixedHeight(36)
+        self._continue_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._continue_btn.setStyleSheet(self._init_btn.styleSheet())
+        self._continue_btn.setEnabled(False)
+        self._continue_btn.clicked.connect(self.finished.emit)
+        status_layout.addWidget(self._continue_btn)
+        self._stack.addWidget(self._status_page)
 
     def _sel(self, key: str):
         self._sel_os = key
@@ -1930,15 +2353,509 @@ class SetupOverlay(QWidget):
                     QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
                 """)
 
+    def _mode_changed(self, *_):
+        local = self._mode.currentData() != "gemini"
+        fallback = self._mode.currentData() == "fallback"
+        self._provider_pills.setEnabled(local)
+        self._local_voice_override.setVisible(fallback)
+        for widget in (self._refresh, self._base_url, self._model):
+            widget.setEnabled(local)
+        self._key_input.setPlaceholderText(
+            "AIza… (optional in Local Only)" if self._mode.currentData() == "local"
+            else "AIza… (required for Gemini modes)"
+        )
+        self._tts_changed()
+        if local:
+            self._refresh_models()
+
+    def _provider_changed(self, *_):
+        provider = self._provider.currentData()
+        previous = self._last_provider
+        if hasattr(self, "_base_url"):
+            self._base_urls[previous] = self._base_url.text().strip() or self._base_urls[previous]
+            previous_model = self._model.currentText().strip()
+            if previous_model:
+                self._models_by_provider[previous] = previous_model
+        self._last_provider = provider
+        self._base_url.setText(self._base_urls[provider])
+        self._provider_hint.setText(
+            "Start Ollama, then run: ollama pull qwen2.5:1.5b" if provider == "ollama"
+            else "Start the LM Studio local server (Developer → Start Server)."
+        )
+        self._provider_status.setText("● CHECKING SERVER...")
+        self._provider_status.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        self._model.clear()
+        self._model.setEditText(self._models_by_provider.get(
+            provider, LOCAL_MODEL_SUGGESTIONS[provider][0]
+        ))
+        self._populate_model_choices()
+        if self._mode.currentData() != "gemini":
+            self._refresh_models()
+
+    def _populate_model_choices(self, discovered=()):
+        provider = self._provider.currentData()
+        current = self._selected_model()
+        self._model.blockSignals(True)
+        self._model.clear()
+        for model in discovered:
+            self._model.addItem(model, model)
+        for model in LOCAL_MODEL_SUGGESTIONS[provider]:
+            if model not in discovered:
+                self._model.addItem(f"{model}  ·  suggested; load in server", model)
+        self._model.setEditText(current)
+        self._model.blockSignals(False)
+
+    def _model_changed(self, model):
+        model = self._selected_model()
+        provider = self._provider.currentData()
+        if model and provider:
+            self._models_by_provider[provider] = model
+        if not model:
+            return
+        voice = self._voice_by_model.get(model)
+        if voice and self._tts_voice.findData(voice) < 0:
+            voice = None
+        voice = (
+            voice
+            or self._tts_voice_by_engine.get(self._tts.currentData())
+            or self._default_tts_voice()
+        )
+        if self._selected_voice() != voice:
+            self._tts_voice.setCurrentText(voice)
+
+    def _save_current_model_voice(self, voice):
+        model = self._selected_model()
+        voice = self._selected_voice()
+        if model and voice:
+            self._voice_by_model[model] = voice
+        engine = self._tts.currentData()
+        if engine and voice:
+            self._tts_voice_by_engine[engine] = voice
+
+    def _selected_model(self):
+        if self._model.isEditable():
+            text = self._model.currentText().strip()
+            index = self._model.currentIndex()
+            if index >= 0 and text == self._model.itemText(index):
+                selected = self._model.itemData(index)
+                if isinstance(selected, str) and selected:
+                    return selected.strip()
+            return text
+        selected = self._model.currentData()
+        if isinstance(selected, str) and selected:
+            return selected.strip()
+        return self._model.currentText().strip()
+
+    def _selected_voice(self):
+        selected = self._tts_voice.currentData()
+        if isinstance(selected, str) and selected:
+            return selected.strip()
+        text = self._tts_voice.currentText().strip()
+        return text.split("  ·  ", 1)[0].strip()
+
+    def _select_voice(self, voice_id):
+        index = self._tts_voice.findData(voice_id)
+        if index >= 0:
+            self._tts_voice.setCurrentIndex(index)
+        else:
+            self._tts_voice.setEditText(voice_id)
+
+    def _default_tts_voice(self):
+        return {
+            "kokoro": "af_heart",
+            "edgetts": "en-US-GuyNeural",
+            "elevenlabs": "pNInz6obpgDQGcFmaJgB",
+        }.get(self._tts.currentData(), "")
+
+    def _refresh_models(self):
+        self._probe_generation += 1
+        generation = self._probe_generation
+        if self._mode.currentData() == "gemini":
+            self._provider_status.setText("● OPTIONAL — SELECT A LOCAL MODE TO CONNECT")
+            self._provider_status.setStyleSheet(
+                f"color: {C.TEXT_DIM}; background: transparent;"
+            )
+            return
+        if self._model_worker is not None and self._model_worker.isRunning():
+            return
+        provider, url = self._provider.currentData(), self._base_url.text().strip()
+        if not url:
+            return
+        self._base_urls[provider] = url
+        self._refresh.setEnabled(False)
+
+        class Worker(QThread):
+            result = pyqtSignal(int, bool, object, str)
+
+            def run(worker_self):
+                try:
+                    from core.llm_client import is_reachable, list_models
+                    reachable = is_reachable(provider, url)
+                    models = list_models(provider, url) if reachable else []
+                    worker_self.result.emit(generation, reachable, models, "")
+                except Exception as exc:
+                    worker_self.result.emit(generation, False, [], str(exc))
+
+        self._model_worker = Worker(self)
+        self._model_worker.result.connect(self._models_ready)
+        self._model_worker.finished.connect(
+            lambda request_id=generation: self._model_probe_finished(request_id)
+        )
+        self._model_worker.start()
+
+    def _model_probe_finished(self, request_id):
+        if (request_id != self._probe_generation
+                and self._mode.currentData() != "gemini"):
+            QTimer.singleShot(0, self._refresh_models)
+
+    def _models_ready(self, request_id, reachable, models, error):
+        if request_id != self._probe_generation:
+            return
+        self._refresh.setEnabled(True)
+        self._provider_status.setText(
+            "● SERVER CONNECTED" if reachable else "● SERVER NOT RUNNING"
+        )
+        self._provider_status.setStyleSheet(
+            f"color: {C.GREEN if reachable else C.RED}; background: transparent;"
+        )
+        current = self._selected_model()
+        self._populate_model_choices(models)
+        if current:
+            index = self._model.findData(current)
+            if index >= 0:
+                self._model.setCurrentIndex(index)
+            else:
+                self._model.setEditText(current)
+        if not reachable and error:
+            self._provider_hint.setText(f"Could not query server: {error[:100]}")
+
+    def _tts_changed(self, *_):
+        engine = self._tts.currentData()
+        previous_engine = self._last_tts_engine
+        engine_changed = engine != previous_engine
+        if engine_changed:
+            previous_voice = self._selected_voice()
+            if previous_voice:
+                self._tts_voice_by_engine[previous_engine] = previous_voice
+            self._last_tts_engine = engine
+        model = self._selected_model()
+        current_voice = (
+            self._tts_voice_by_engine.get(engine)
+            if engine_changed else
+            self._voice_by_model.get(model)
+            or self._tts_voice_by_engine.get(engine)
+        ) or self._default_tts_voice()
+        self._tts_voice.clear()
+        if engine == "kokoro":
+            for group, voices in KOKORO_VOICE_GROUPS.items():
+                for voice_id in voices:
+                    self._tts_voice.addItem(
+                        f"{voice_id}  ·  {group}", voice_id
+                    )
+        elif engine == "edgetts":
+            self._tts_voice.addItem("en-US-GuyNeural", "en-US-GuyNeural")
+        else:
+            self._tts_voice.addItem("pNInz6obpgDQGcFmaJgB", "pNInz6obpgDQGcFmaJgB")
+        if current_voice:
+            self._select_voice(current_voice)
+        if self._selected_voice() != current_voice and current_voice:
+            self._voice_test_status.setText(
+                "Saved voice unavailable; using the first voice in this engine."
+            )
+            self._select_voice(
+                self._tts_voice.itemData(0) or self._tts_voice.itemText(0)
+            )
+        self._elevenlabs_key_label.setVisible(engine == "elevenlabs")
+        self._elevenlabs_key_input.setVisible(engine == "elevenlabs")
+        self._refresh_tts_voices_btn.setVisible(
+            engine in {"edgetts", "elevenlabs"}
+        )
+        local_brain = self._mode.currentData() != "gemini"
+        if local_brain and engine == "edgetts":
+            self._provider_hint.setText(
+                "Edge TTS works with Local AI, but needs an internet connection."
+            )
+        elif local_brain and engine == "elevenlabs":
+            self._provider_hint.setText(
+                "ElevenLabs works with Local AI; it needs internet and an API key."
+            )
+
+    def _refresh_tts_voices(self):
+        engine = self._tts.currentData()
+        api_key = self._elevenlabs_key_input.text().strip()
+        self._refresh_tts_voices_btn.setEnabled(False)
+        self._voice_catalog_status.setText("Loading provider voices...")
+
+        def load_voices():
+            try:
+                if engine == "edgetts":
+                    import asyncio
+                    import edge_tts
+
+                    catalog = asyncio.run(edge_tts.list_voices())
+                    voices = [
+                        (
+                            f"{item['ShortName']} · {item.get('Locale', '')} · "
+                            f"{item.get('Gender', '')}",
+                            item["ShortName"],
+                        )
+                        for item in catalog
+                        if item.get("ShortName")
+                    ]
+                elif engine == "elevenlabs":
+                    if not api_key:
+                        raise RuntimeError(
+                            "Enter an ElevenLabs API key before loading voices."
+                        )
+                    import requests
+
+                    response = requests.get(
+                        "https://api.elevenlabs.io/v1/voices",
+                        headers={"xi-api-key": api_key},
+                        timeout=20,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    voices = [
+                        (item["name"], item["voice_id"])
+                        for item in payload.get("voices", [])
+                        if item.get("name") and item.get("voice_id")
+                    ]
+                    if not voices:
+                        raise RuntimeError(
+                            "ElevenLabs returned no voices for this account."
+                        )
+                else:
+                    raise RuntimeError("The selected TTS engine has no online voice list.")
+                self._voice_catalog_done.emit(engine, voices, "")
+            except Exception as exc:
+                self._voice_catalog_done.emit(engine, [], str(exc))
+
+        threading.Thread(
+            target=load_voices, daemon=True, name="tts-voice-catalog"
+        ).start()
+
+    def _on_voice_catalog_done(self, engine, voices, error):
+        self._refresh_tts_voices_btn.setEnabled(True)
+        if engine != self._tts.currentData():
+            return
+        if error:
+            self._voice_catalog_status.setText(
+                f"Voice list unavailable: {error[:140]}"
+            )
+            self._voice_catalog_status.setStyleSheet(
+                f"color: {C.RED}; background: transparent;"
+            )
+            return
+
+        selected = self._selected_voice()
+        self._tts_voice.blockSignals(True)
+        self._tts_voice.clear()
+        for label, voice_id in voices:
+            self._tts_voice.addItem(label, voice_id)
+        self._select_voice(selected)
+        self._tts_voice.blockSignals(False)
+        if self._selected_voice() != selected and self._tts_voice.count():
+            self._select_voice(self._tts_voice.itemData(0))
+        self._voice_catalog_status.setText(
+            f"Loaded {len(voices)} voices from {engine}."
+        )
+        self._voice_catalog_status.setStyleSheet(
+            f"color: {C.GREEN}; background: transparent;"
+        )
+
+    def _test_voice(self):
+        self._test_voice_btn.setEnabled(False)
+        self._voice_test_status.setText("Synthesising sample...")
+        engine_name = self._tts.currentData()
+        voice = self._selected_voice()
+        elevenlabs_api_key = self._elevenlabs_key_input.text().strip()
+
+        def run():
+            try:
+                from core.tts import (
+                    EdgeTTSEngine, ElevenLabsTTSEngine, KokoroTTSEngine,
+                )
+                if engine_name == "kokoro":
+                    engine = KokoroTTSEngine(voice=voice or "af_heart")
+                elif engine_name == "edgetts":
+                    engine = EdgeTTSEngine(voice=voice or "en-US-GuyNeural")
+                else:
+                    if not elevenlabs_api_key:
+                        raise RuntimeError("Add an ElevenLabs API key in config before testing this voice.")
+                    engine = ElevenLabsTTSEngine(
+                        elevenlabs_api_key, voice or "pNInz6obpgDQGcFmaJgB"
+                    )
+                engine.speak("A.U.R.A. voice test. Audio systems are online.")
+                try:
+                    self._voice_test_done.emit("Voice test complete.")
+                except RuntimeError:
+                    print("[UI] Voice test finished but the overlay was already closed; skipping notification.")
+            except Exception as exc:
+                try:
+                    self._voice_test_done.emit(f"Voice test failed: {exc}")
+                except RuntimeError:
+                    print(f"[UI] Voice test failed ({exc}) but the overlay was already closed; skipping notification.")
+
+        threading.Thread(target=run, daemon=True, name="voice-test").start()
+
+    def _on_voice_test_done(self, message):
+        self._test_voice_btn.setEnabled(True)
+        self._voice_test_status.setText(str(message))
+        self._voice_test_status.setStyleSheet(
+            f"color: {C.GREEN if message == 'Voice test complete.' else C.RED};"
+            " background: transparent;"
+        )
+
+    def begin_initialising(self, settings: dict):
+        self._stack.setCurrentIndex(1)
+        self._continue_btn.setEnabled(False)
+        self._status_message.setText("Checking selected STT, LLM and TTS components...")
+        self._status_worker = threading.Thread(
+            target=self._probe_components, args=(settings,), daemon=True
+        )
+        self._status_worker.start()
+
+    def _probe_components(self, settings):
+        import importlib.util
+        mode = settings["mode"]
+        stt_ok = mode == "gemini" or importlib.util.find_spec("vosk") is not None
+        local_tts_required = mode != "gemini"
+        tts_modules = {
+            "kokoro": ("kokoro",),
+            "edgetts": ("edge_tts", "miniaudio"),
+            "elevenlabs": ("requests", "miniaudio"),
+        }[settings["tts_engine"]]
+        missing_tts_modules = [
+            package for package in tts_modules
+            if importlib.util.find_spec(package) is None
+        ]
+        missing_tts_key = (
+            settings["tts_engine"] == "elevenlabs"
+            and not bool(settings.get("elevenlabs_api_key"))
+        )
+        tts_ok = (
+            not local_tts_required
+            or (not missing_tts_modules and not missing_tts_key)
+        )
+        missing_tts_package = ", ".join(missing_tts_modules)
+        if mode == "gemini":
+            llm_ok = bool(settings.get("gemini_api_key"))
+            llm_message = "API key configured" if llm_ok else "API key missing"
+        else:
+            try:
+                from core.llm_client import is_reachable, list_models
+                provider, url = settings["provider"], settings["base_url"]
+                llm_ok = is_reachable(provider, url)
+                names = list_models(provider, url) if llm_ok else []
+                model = settings["model"]
+                if llm_ok and model and names:
+                    llm_ok = model in names
+                llm_message = (
+                    "Connected" if llm_ok else
+                    "Model not listed" if is_reachable(provider, url) else
+                    "Server not running"
+                )
+            except Exception as exc:
+                llm_ok, llm_message = False, str(exc)[:80]
+        results = {
+            "stt": (stt_ok, "READY" if stt_ok else f"Missing {stt_package}"),
+            "llm": (llm_ok, llm_message),
+            "tts": (
+                tts_ok,
+                (
+                    "OPTIONAL — GEMINI LIVE VOICE"
+                    if not local_tts_required else "READY"
+                ) if tts_ok else
+                "ElevenLabs API key missing" if missing_tts_key else
+                f"Missing {missing_tts_package}",
+            ),
+        }
+        self._probe_done.emit(results)
+
+    def _apply_probe_result(self, results):
+        ready_count = 0
+        for key, (ok, detail) in results.items():
+            label, progress = self._status_rows[key]
+            label.setText(("● " if ok else "● ") + detail.upper())
+            label.setStyleSheet(
+                f"color: {C.GREEN if ok else C.RED}; background: transparent;"
+            )
+            progress.setRange(0, 1)
+            progress.setValue(1 if ok else 0)
+            progress.setStyleSheet(
+                f"QProgressBar {{ background: {C.BG}; border: 0; }}"
+                f"QProgressBar::chunk {{ background: {C.GREEN if ok else C.RED}; }}"
+            )
+            ready_count += int(ok)
+        self._status_message.setText(
+            "All selected components are ready." if ready_count == 3
+            else "Review the missing component status; setup is saved and can be changed later."
+        )
+        self._continue_btn.setEnabled(True)
+
     def _submit(self):
         key = self._key_input.text().strip()
-        if not key:
+        mode = self._mode.currentData()
+        tts_engine = self._tts.currentData()
+        if mode != "gemini" and not self._selected_model():
+            self._provider_hint.setText("Choose a local model or enter its model ID.")
+            self._provider_hint.setStyleSheet(f"color: {C.RED}; background: transparent;")
+            return
+        if mode in {"gemini", "fallback"} and not key:
             self._key_input.setStyleSheet(
                 self._key_input.styleSheet() +
                 f" QLineEdit {{ border: 1px solid {C.RED}; }}"
             )
+            self._provider_hint.setText(
+                "Gemini API key is required for Gemini-only and fallback modes."
+            )
+            self._provider_hint.setStyleSheet(f"color: {C.RED}; background: transparent;")
             return
-        self.done.emit(key, self._sel_os)
+        elevenlabs_api_key = self._elevenlabs_key_input.text().strip()
+        if tts_engine == "elevenlabs" and not elevenlabs_api_key:
+            self._provider_hint.setText(
+                "Enter an ElevenLabs API key to use or test ElevenLabs voices."
+            )
+            self._provider_hint.setStyleSheet(
+                f"color: {C.RED}; background: transparent;"
+            )
+            return
+        from urllib.parse import urlparse
+        parsed = urlparse(self._base_url.text().strip())
+        if mode != "gemini" and (
+            parsed.scheme not in {"http", "https"} or not parsed.hostname
+        ):
+            self._provider_hint.setText("Enter a valid http:// or https:// provider URL.")
+            self._provider_hint.setStyleSheet(f"color: {C.RED}; background: transparent;")
+            return
+        if mode != "gemini" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            answer = QMessageBox.warning(
+                self,
+                "Non-local AI endpoint",
+                "This host is not localhost. Prompts and conversation context may be sent to it. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.done.emit({
+            "gemini_api_key": key,
+            "elevenlabs_api_key": elevenlabs_api_key,
+            "os_system": self._sel_os,
+            "mode": mode,
+            "provider": self._provider.currentData(),
+            "base_url": self._base_url.text().strip(),
+            "model": self._selected_model(),
+            "stt_engine": "vosk",
+            "vosk_model": self._vosk_model.currentData(),
+            "tts_engine": tts_engine,
+            "tts_voice": self._selected_voice(),
+            "local_voice_override": self._local_voice_override.isChecked(),
+            "voice_id": self._selected_voice(),
+            "voice_by_model": dict(self._voice_by_model),
+            "tts_voice_by_engine": dict(self._tts_voice_by_engine),
+        })
 
 
 class HueWheel(QWidget):
@@ -2036,6 +2953,7 @@ class CustomizeOverlay(QWidget):
     """Floating overlay — change assistant name, user name, UI colour and voice."""
 
     saved = pyqtSignal(str, str, str, str, bool)   # assistant_name, user_name, ui_color, voice, local_voice
+    configure_local_ai = pyqtSignal()
     _OW, _OH = 400, 660
 
     def __init__(self, assistant_name="AURA", user_name="",
@@ -2086,6 +3004,18 @@ class CustomizeOverlay(QWidget):
         self._user_input.setFixedHeight(32)
         self._user_input.setStyleSheet(_fs)
         lay.addWidget(self._user_input)
+
+        local_ai_btn = QPushButton("LOCAL AI / STT / TTS SETTINGS")
+        local_ai_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        local_ai_btn.setFixedHeight(28)
+        local_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        local_ai_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ border-color: {C.PRI}; }}
+        """)
+        local_ai_btn.clicked.connect(self.configure_local_ai.emit)
+        lay.addWidget(local_ai_btn)
 
         # ── Assistant voice — Gemini prebuilt voices ─────────────────────────
         # Names are language-neutral proper nouns, so the row reads the same in
@@ -3762,6 +4692,7 @@ class MainWindow(QMainWindow):
         self.on_interrupt      = None   # callable: () -> None — stop AURA mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
+        self.on_brain_change   = None   # callable: () -> None — apply brain/provider settings
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by AuraLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by AuraLive
@@ -6511,8 +7442,14 @@ class MainWindow(QMainWindow):
         )
         ov.on_preview = self._preview_ui_color
         ov.saved.connect(self._apply_name_update)
+        ov.configure_local_ai.connect(self._open_local_ai_settings)
         ov.show()
         self._customize_overlay = ov
+
+    def _open_local_ai_settings(self):
+        if self._customize_overlay:
+            self._customize_overlay.hide()
+        self._show_setup()
 
     def _preview_ui_color(self, hex_color: str):
         """Canlı önizleme — tüm arayüzü yeni renge boyar (config'e YAZMAZ)."""
@@ -6760,36 +7697,75 @@ class MainWindow(QMainWindow):
         if not API_FILE.exists(): return False
         try:
             d = json.loads(API_FILE.read_text(encoding="utf-8"))
-            return bool(d.get("gemini_api_key")) and bool(d.get("os_system"))
+            from memory.config_manager import is_setup_configured
+            return is_setup_configured(d)
         except Exception:
             return False
 
     def _show_setup(self):
-        ov = SetupOverlay(self.centralWidget())
+        ov = SetupOverlay(self.centralWidget(), _read_full_config())
         cw = self.centralWidget()
-        ow, oh = 460, 390
+        ow, oh = min(620, cw.width() - 24), min(540, cw.height() - 24)
         ov.setGeometry(
             (cw.width()  - ow) // 2,
             (cw.height() - oh) // 2,
             ow, oh,
         )
         ov.done.connect(self._on_setup_done)
+        ov.finished.connect(self._finish_setup)
         ov.show()
         self._overlay = ov
 
-    def _on_setup_done(self, key: str, os_name: str):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
-            encoding="utf-8",
-        )
+    def _on_setup_done(self, settings: dict):
+        was_ready = self._ready
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            data = _read_full_config()
+            if settings.get("gemini_api_key"):
+                data["gemini_api_key"] = settings["gemini_api_key"]
+            else:
+                data.pop("gemini_api_key", None)
+            if settings.get("elevenlabs_api_key"):
+                data["elevenlabs_api_key"] = settings["elevenlabs_api_key"]
+            else:
+                data.pop("elevenlabs_api_key", None)
+            data["os_system"] = settings["os_system"]
+            API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+            from memory.config_manager import save_local_llm_config
+            save_local_llm_config({
+                "mode": settings["mode"],
+                "provider": settings["provider"],
+                "base_url": settings["base_url"],
+                "model": settings["model"],
+                "stt_engine": settings["stt_engine"],
+                "vosk_model": settings["vosk_model"],
+                "tts_engine": settings["tts_engine"],
+                "tts_voice": settings["tts_voice"],
+                "local_voice_override": settings["local_voice_override"],
+                "voice_id": settings["voice_id"],
+                "voice_by_model": settings["voice_by_model"],
+                "tts_voice_by_engine": settings["tts_voice_by_engine"],
+            })
+        except Exception as exc:
+            self._log.append_log(f"ERR: Could not save setup: {exc}")
+            return
         self._ready = True
+        if was_ready and self.on_brain_change:
+            self.on_brain_change()
         if self._overlay:
-            self._overlay.hide()
-            self._overlay = None
+            self._overlay.begin_initialising(settings)
         self._apply_state("LISTENING")
         self._assistant_name = _read_full_config().get("assistant_name", "A.U.R.A") or "AURA"
-        self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
+        self._log.append_log(
+            f"SYS: Setup saved. OS={settings['os_system'].upper()}; "
+            f"mode={settings['mode'].upper()}."
+        )
+
+    def _finish_setup(self):
+        if self._overlay:
+            self._overlay.hide()
+            self._overlay.deleteLater()
+            self._overlay = None
 
 class _RootShim:
     def __init__(self, app: QApplication):
@@ -6860,6 +7836,14 @@ class AuraUI:
     @on_audio_device_change.setter
     def on_audio_device_change(self, cb):
         self._win.on_audio_device_change = cb
+
+    @property
+    def on_brain_change(self):
+        return self._win.on_brain_change
+
+    @on_brain_change.setter
+    def on_brain_change(self, cb):
+        self._win.on_brain_change = cb
 
     def show_confirm(self, title: str, detail: str) -> None:
         """Thread-safe: raise the irreversible-action gate. Called from action

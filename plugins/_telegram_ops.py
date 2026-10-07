@@ -514,8 +514,7 @@ def stt_ready() -> tuple[bool, str]:
 def _decode_pcm(data: bytes, rate: int = 16_000) -> bytes:
     """A Telegram voice note is OGG/Opus; a speech model wants 16 kHz mono PCM.
 
-    PyAV does the decoding, and it is not a new dependency: faster-whisper
-    installs it, so the only route that needs it is the only route that has it.
+    PyAV is required only when decoding a local voice note.
     """
     try:
         import io
@@ -523,8 +522,7 @@ def _decode_pcm(data: bytes, rate: int = 16_000) -> bytes:
         import av
     except ImportError:
         raise RuntimeError(
-            "Decoding a voice note needs PyAV, which normally arrives with "
-            "faster-whisper — run: pip install av"
+            "Decoding a voice note needs PyAV — run: pip install av"
         ) from None
 
     chunks: list[bytes] = []
@@ -552,11 +550,7 @@ def _transcribe_local(data: bytes, pid: str) -> str:
     stt = _build(pid)
     pcm = _decode_pcm(data)
     said = (asyncio.run(stt.transcribe(pcm, 16_000)) or "").strip()
-    # Whisper reports the language it heard as part of the recognition it has
-    # just done, and the pipeline engine uses it to choose the voice for the
-    # reply. Carrying it the same distance here costs nothing and means the
-    # answer comes back in the language it was asked in — without this file
-    # containing a single language name, or a detector, or a setting.
+    # The pipeline uses the detected language to choose the reply voice.
     _spoken_language = getattr(stt, "detected_language", "") or ""
     return said
 

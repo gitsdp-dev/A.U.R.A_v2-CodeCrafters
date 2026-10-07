@@ -1,5 +1,5 @@
 """
-Text-to-Speech engines for MARK XL.
+Text-to-Speech engines for A.U.R.A v2.
 
 EdgeTTS     – free Microsoft TTS (internet required, no API key)
 Kokoro      – fully offline neural TTS (~330 MB model)
@@ -11,6 +11,8 @@ import asyncio
 import os
 import queue as _queue
 import threading
+import time
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -116,6 +118,9 @@ class EdgeTTSEngine:
             loop.close()
         if audio_bytes:
             _play_audio_bytes(audio_bytes)
+
+    async def synthesise(self, text: str) -> bytes:
+        return await self._synth(text)
 
     async def _synth(self, text: str) -> bytes:
         import edge_tts
@@ -349,6 +354,87 @@ class KokoroTTSEngine:
         if synth_error:
             raise synth_error[0]
 
+    def audio_chunks(self, text: str):
+        """Yield Kokoro float32 chunks without opening a playback device."""
+        with self._lock:
+            if self._pipeline is None:
+                self._init()
+            pipeline = self._pipeline
+        for _, _, audio in pipeline(text, voice=self.voice, speed=self.speed):
+            if audio is not None:
+                samples = _compress_silence(_to_numpy(audio))
+                if samples.size:
+                    yield samples
+
+
+_KOKORO_ONNX_CACHE: dict[tuple[str, str], object] = {}
+_KOKORO_ONNX_WARMED: set[tuple[str, str, str, str]] = set()
+_KOKORO_ONNX_LOCK = threading.Lock()
+
+
+class KokoroONNXTTSEngine:
+    """Offline CPU Kokoro ONNX engine used by the local conversation path."""
+
+    def __init__(
+        self,
+        voice: str = "bm_george",
+        speed: float = 1.1,
+        lang: str = "en-gb",
+        model_path: str | None = None,
+        voices_path: str | None = None,
+    ):
+        model_dir = Path(__file__).resolve().parent.parent / "models"
+        self.model_path = Path(model_path) if model_path else model_dir / "kokoro-v1.0.onnx"
+        self.voices_path = (
+            Path(voices_path) if voices_path else model_dir / "voices-v1.0.bin"
+        )
+        self.voice = voice
+        self.speed = speed
+        self.lang = lang
+        self._cache_key = (
+            str(self.model_path.resolve()),
+            str(self.voices_path.resolve()),
+        )
+        self._warm_key = (*self._cache_key, self.voice, self.lang)
+        self._model = self._load_model()
+
+    def _load_model(self):
+        with _KOKORO_ONNX_LOCK:
+            model = _KOKORO_ONNX_CACHE.get(self._cache_key)
+            if model is None:
+                if not self.model_path.is_file() or not self.voices_path.is_file():
+                    raise FileNotFoundError(
+                        "Kokoro ONNX assets are missing. Run "
+                        "scripts/download_models.py."
+                    )
+                from kokoro_onnx import Kokoro
+
+                print("[TTS] Loading Kokoro ONNX model on CPU…")
+                model = Kokoro(str(self.model_path), str(self.voices_path))
+                _KOKORO_ONNX_CACHE[self._cache_key] = model
+            if self._warm_key not in _KOKORO_ONNX_WARMED:
+                started = time.perf_counter()
+                model.create("Ready, sir.", voice=self.voice, speed=self.speed, lang=self.lang)
+                _KOKORO_ONNX_WARMED.add(self._warm_key)
+                print(
+                    f"[TTS] Kokoro ONNX ready "
+                    f"({time.perf_counter() - started:.2f}s warm-up)."
+                )
+            return model
+
+    def audio_chunks(self, text: str):
+        """Synthesize one sentence to mono float32 audio without blocking playback."""
+        samples, sample_rate = self._model.create(
+            text, voice=self.voice, speed=self.speed, lang=self.lang
+        )
+        if sample_rate != 24_000:
+            raise RuntimeError(
+                f"Unexpected Kokoro sample rate {sample_rate}; expected 24000 Hz."
+            )
+        audio = _compress_silence(np.asarray(samples, dtype=np.float32))
+        if audio.size:
+            yield audio
+
 
 class ElevenLabsTTSEngine:
     """ElevenLabs cloud TTS – API key required."""
@@ -358,6 +444,9 @@ class ElevenLabsTTSEngine:
         self.voice_id = voice_id
 
     def speak(self, text: str) -> None:
+        _play_audio_bytes(self.synthesise(text))
+
+    def synthesise(self, text: str) -> bytes:
         import requests
         headers = {
             "xi-api-key":   self.api_key,
@@ -373,7 +462,28 @@ class ElevenLabsTTSEngine:
             json=payload, headers=headers, timeout=30,
         )
         resp.raise_for_status()
-        _play_audio_bytes(resp.content)
+        return resp.content
+
+
+def decode_audio_pcm24(audio_bytes: bytes) -> bytes:
+    """Decode encoded TTS audio to mono 24 kHz signed 16-bit PCM."""
+    import miniaudio
+
+    decoded = miniaudio.decode(
+        audio_bytes,
+        output_format=miniaudio.SampleFormat.FLOAT32,
+        nchannels=1,
+    )
+    samples = np.asarray(decoded.samples, dtype=np.float32).reshape(-1)
+    source_rate = int(decoded.sample_rate)
+    if source_rate <= 0:
+        raise ValueError("TTS audio has an invalid sample rate")
+    if source_rate != 24_000 and samples.size:
+        target_size = max(1, round(samples.size * 24_000 / source_rate))
+        old_positions = np.arange(samples.size, dtype=np.float32)
+        new_positions = np.linspace(0, samples.size - 1, target_size, dtype=np.float32)
+        samples = np.interp(new_positions, old_positions, samples).astype(np.float32)
+    return (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
 
 # ---------------------------------------------------------------------------

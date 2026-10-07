@@ -29,6 +29,7 @@ _CORE: list[tuple[str, str]] = [
     ("mss",                "mss"),
     ("cv2",                "opencv-python"),
     ("soundfile",          "soundfile"),
+    ("av",                 "av"),
     ("miniaudio",          "miniaudio"),
     ("send2trash",         "send2trash"),
     ("pptx",               "python-pptx"),
@@ -45,16 +46,18 @@ _WINDOWS: list[tuple[str, str]] = [
 
 # STT engine packages
 _STT: dict[str, list[tuple[str, str]]] = {
-    "whisper": [("faster_whisper", "faster-whisper")],
     "vosk":    [("vosk",           "vosk")],
 }
 
 # TTS engine packages
 _TTS: dict[str, list[tuple[str, str]]] = {
-    "edgetts":    [("edge_tts", "edge-tts")],
+    "edgetts":    [
+        ("edge_tts", "edge-tts"),
+        ("miniaudio", "miniaudio"),
+    ],
     # kokoro>=0.9 dropped AlbertModel/AutoModel from transformers — version pin is critical
     "kokoro":     [("kokoro",   "kokoro>=0.9"), ("soundfile", "soundfile")],
-    "elevenlabs": [],   # uses only requests, already in core
+    "elevenlabs": [("miniaudio", "miniaudio")],  # requests is already in core
 }
 
 
@@ -91,7 +94,7 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
     Blocking — always call from a background thread.
     Progress is reported via the optional *log* callback (receives a str).
     """
-    stt = config.get("stt_engine", "whisper").lower()
+    stt = "vosk"
     tts = config.get("tts_engine", "edgetts").lower()
 
     needed: list[tuple[str, str]] = list(_CORE)

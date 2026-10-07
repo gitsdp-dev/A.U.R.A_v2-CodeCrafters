@@ -236,6 +236,11 @@ def _live_model() -> str:
     return getattr(sys.modules.get("main"), "LIVE_MODEL", None) or _LIVE_FALLBACK
 
 
+def live_model() -> str:
+    """Return the currently configured Live model for the main conversation."""
+    return _live_model()
+
+
 def _to_live_parts(contents) -> list:
     """REST `contents` -> Live `parts`. Accepts a bare string, a list of
     strings, and the SDK's Part objects (which is how every image is passed

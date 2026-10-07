@@ -35,6 +35,7 @@ for _stream in ("stdout", "stderr"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import queue as _queue
 import re
 import threading
 import time
@@ -72,6 +73,7 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_local_llm_config,
 )
 # Model ladder + quota fallback (core/gemini.py). Guarded so the assistant still
 # starts on the fixed LIVE_MODEL below if that module is not in this project.
@@ -133,12 +135,15 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000 
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+GEMINI_INPUT_AUDIO_MIME = f"audio/pcm;rate={SEND_SAMPLE_RATE}"
 
 # RMS below which 16-bit PCM is treated as room silence; above _LEVEL_FULL it
 # reads as a full-height waveform. Tuned so ordinary speech lands mid-range and
 # the bars still move for a quiet talker — language- and device-independent.
 _LEVEL_FLOOR = 60.0
 _LEVEL_FULL  = 2600.0
+_LOCAL_VOICE_FLOOR = 18.0
+_LOCAL_VOICE_NOISE_RATIO = 2.2
 
 
 def _pcm_level(samples) -> float:
@@ -154,6 +159,11 @@ def _pcm_level(samples) -> float:
     if rms <= _LEVEL_FLOOR:
         return 0.0
     return min(1.0, (rms - _LEVEL_FLOOR) / (_LEVEL_FULL - _LEVEL_FLOOR))
+
+
+def _voice_threshold(noise_rms: float) -> float:
+    """Return a conservative raw-PCM VAD threshold adapted to mic noise."""
+    return max(_LOCAL_VOICE_FLOOR, noise_rms * _LOCAL_VOICE_NOISE_RATIO)
 
 
 # ── Viseme extraction ─────────────────────────────────────────────────────────
@@ -605,8 +615,21 @@ class AuraLive:
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
+        self.ui.on_brain_change  = self._on_brain_change
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
+        self._local_brain = None
+        self._local_mode_active = False
+        self._local_tts_engine = None
+        self._local_tts_init_task: asyncio.Task | None = None
+        self._local_tts_failed = False
+        self._gemini_local_voice_override = False
+        self._gemini_mic_audio_confirmed = False
+        self._local_turn_task: asyncio.Task | None = None
+        self._local_turn_active = threading.Event()
+        self._local_turn_started_at = 0.0
+        self._local_first_audio_pending = False
+        self._local_tts_timing_reported = False
 
         # ── Session resumption ─────────────────────────────────────────
         # The server issues a resumption handle every few seconds and reissues
@@ -843,6 +866,453 @@ class AuraLive:
         landed before this feature did."""
         self.request_reconnect(keep_context=True, reason="audio device")
 
+    def _on_brain_change(self):
+        self._local_tts_engine = None
+        self._local_tts_init_task = None
+        self._local_tts_failed = False
+        self.request_reconnect(keep_context=True, reason="local AI settings")
+
+    async def _preload_local_tts(self):
+        try:
+            self._local_tts_engine = await asyncio.to_thread(self._make_local_tts)
+        except Exception as exc:
+            self.ui.write_log(f"SYS: Local voice unavailable: {exc}")
+            self._local_tts_failed = True
+
+    async def _local_tool_execute(self, name: str, args: dict) -> str:
+        """Send local-model tool calls through the same confirmation/undo path."""
+        from types import SimpleNamespace
+
+        result = await self._execute_tool(SimpleNamespace(
+            name=name,
+            args=args,
+            id=f"local-{time.monotonic_ns()}",
+        ))
+        payload = getattr(result, "response", {})
+        return str(payload.get("result", payload) if isinstance(payload, dict) else payload)
+
+    def _make_local_tts(self):
+        config = get_local_llm_config()
+        voice = config.get("tts_voice") or "af_heart"
+        engine = config.get("tts_engine", "kokoro")
+        if engine == "kokoro":
+            model_dir = Path(__file__).resolve().parent / "models"
+            quantized_model = model_dir / "kokoro-v1.0.int8.onnx"
+            model = (
+                quantized_model
+                if quantized_model.is_file()
+                else model_dir / "kokoro-v1.0.onnx"
+            )
+            voices = model_dir / "voices-v1.0.bin"
+            if model.is_file() and voices.is_file():
+                from core.tts import KokoroONNXTTSEngine
+                return KokoroONNXTTSEngine(
+                    voice=voice,
+                    lang="en-gb" if voice.lower().startswith("b") else "en-us",
+                    model_path=str(model),
+                    voices_path=str(voices),
+                )
+            from core.tts import KokoroTTSEngine
+            return KokoroTTSEngine(voice=voice)
+        if engine == "edgetts":
+            from core.tts import EdgeTTSEngine
+            return EdgeTTSEngine(voice=voice)
+        if engine == "elevenlabs":
+            from core.tts import ElevenLabsTTSEngine
+            from memory.config_manager import load_api_keys
+            api_key = load_api_keys().get("elevenlabs_api_key", "")
+            if not api_key:
+                raise RuntimeError("ElevenLabs TTS needs an API key in config/api_keys.json")
+            return ElevenLabsTTSEngine(api_key, voice)
+        raise ValueError(f"Unsupported local TTS engine: {engine}")
+
+    def _synthesise_local_sentence(self, sentence: str) -> bytes:
+        if self._local_tts_engine is None:
+            raise RuntimeError("Local TTS engine is not initialised")
+        if hasattr(self._local_tts_engine, "audio_chunks"):
+            chunks = []
+            for samples in self._local_tts_engine.audio_chunks(sentence):
+                pcm = np.asarray(samples, dtype=np.float32).reshape(-1)
+                chunks.append(
+                    (np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                )
+            return b"".join(chunks)
+        from core.tts import decode_audio_pcm24
+        if hasattr(self._local_tts_engine, "synthesise"):
+            generated = self._local_tts_engine.synthesise(sentence)
+            if asyncio.iscoroutine(generated):
+                generated = asyncio.run(generated)
+            return decode_audio_pcm24(generated)
+        raise RuntimeError("The selected TTS engine cannot synthesise PCM audio.")
+
+    async def _local_speak_sentence(self, sentence: str):
+        self._visemes.feed_text(sentence)
+        synthesis_started = time.perf_counter()
+        try:
+            if self._local_tts_engine is None:
+                if self._local_tts_init_task is None:
+                    self._local_tts_init_task = asyncio.create_task(
+                        self._preload_local_tts()
+                    )
+                await self._local_tts_init_task
+                if self._local_tts_engine is None:
+                    return
+            audio = await asyncio.to_thread(self._synthesise_local_sentence, sentence)
+            if not self._local_tts_timing_reported:
+                self.ui.write_log(
+                    "SYS: Local TTS first sentence ready after "
+                    f"{time.perf_counter() - synthesis_started:.2f}s."
+                )
+                self._local_tts_timing_reported = True
+            for offset in range(0, len(audio), 2400):
+                if self._interrupted:
+                    break
+                await self.audio_in_queue.put(audio[offset:offset + 2400])
+        except Exception as exc:
+            if not self._local_tts_failed:
+                self.ui.write_log(f"SYS: Local voice unavailable: {exc}")
+                self._local_tts_failed = True
+
+    async def _speak_gemini_reply_with_local_voice(self, text: str) -> bool:
+        if self._local_tts_init_task is None:
+            self._local_tts_init_task = asyncio.create_task(self._preload_local_tts())
+        await self._local_tts_init_task
+        if self._local_tts_engine is None:
+            return False
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", text)
+            if sentence.strip()
+        ]
+        generated_audio = []
+        for sentence in sentences:
+            try:
+                audio = await asyncio.to_thread(
+                    self._synthesise_local_sentence, sentence
+                )
+            except Exception as exc:
+                if not self._local_tts_failed:
+                    self.ui.write_log(f"SYS: Local voice unavailable: {exc}")
+                    self._local_tts_failed = True
+                return False
+            generated_audio.append((sentence, audio))
+        for sentence, audio in generated_audio:
+            self._visemes.feed_text(sentence)
+            for offset in range(0, len(audio), 2400):
+                if self._interrupted:
+                    return False
+                await self.audio_in_queue.put(audio[offset:offset + 2400])
+        return bool(sentences)
+
+    async def _local_turn(
+        self, text: str, log_user: bool = True, record_user: bool = True,
+        started_at: float | None = None,
+    ):
+        if self._local_brain is None:
+            self.ui.write_log("SYS: Local brain is not ready.")
+            return
+        if not hasattr(self, "_local_turn_lock"):
+            self._local_turn_lock = asyncio.Lock()
+        async with self._local_turn_lock:
+            self._local_turn_task = asyncio.current_task()
+            self._local_turn_active.set()
+            if self._turn_done_event is not None:
+                self._turn_done_event.clear()
+            self._interrupted = False
+            self._local_turn_started_at = started_at or time.perf_counter()
+            self._local_first_audio_pending = True
+            self._local_tts_timing_reported = False
+            self.ui.set_state("THINKING")
+            if log_user:
+                self.ui.write_log(f"You: {text}")
+            self._last_user_speech = time.monotonic()
+            try:
+                reply = await self._local_brain.ask(text)
+                if reply:
+                    self.ui.write_log(f"{self._asst_name}: {reply}")
+                    if record_user:
+                        self._session_log.append(f"User: {text}")
+                    self._session_log.append(f"{self._asst_name}: {reply}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.ui.write_log(f"SYS: Local AI request failed: {exc}")
+            finally:
+                self.ui.write_log(
+                    "SYS: Local turn processing completed in "
+                    f"{time.perf_counter() - self._local_turn_started_at:.2f}s "
+                    "(from end of speech; excludes playback)."
+                )
+                self._local_turn_task = None
+                self._local_turn_active.clear()
+                if self._turn_done_event is not None:
+                    self._turn_done_event.set()
+                if not self._is_speaking and not self.ui.muted:
+                    self.ui.set_state("LISTENING")
+
+    async def _listen_local_audio(self):
+        """Endpoint mic speech locally; raw audio never leaves the device."""
+        config = get_local_llm_config()
+        try:
+            from core.stt import VoskSTT
+            from core.vosk_models import (
+                DEFAULT_VOSK_MODEL, ensure_vosk_model,
+            )
+            model_name = config.get("vosk_model", DEFAULT_VOSK_MODEL)
+            self.ui.write_log(
+                f"SYS: Preparing Vosk model '{model_name}' "
+                "(first use may download it)."
+            )
+            model_path = await asyncio.to_thread(
+                ensure_vosk_model, model_name
+            )
+            stt = await asyncio.to_thread(VoskSTT, model_path=model_path)
+            if self._local_tts_init_task is None:
+                self._local_tts_init_task = asyncio.create_task(
+                    self._preload_local_tts()
+                )
+        except Exception as exc:
+            self.ui.write_log(f"SYS: Local STT could not start: {exc}")
+            if self._reconnect_event is not None:
+                await asyncio.sleep(2)
+                self._reconnect_event.set()
+            return
+
+        frames: _queue.Queue[bytes] = _queue.Queue(maxsize=40)
+        loop = asyncio.get_running_loop()
+
+        def callback(indata, _count, _time_info, status):
+            if status:
+                loop.call_soon_threadsafe(
+                    self.ui.write_log, f"SYS: Local microphone status: {status}"
+                )
+            loop.call_soon_threadsafe(
+                self.ui.set_audio_level, _pcm_level(indata)
+            )
+            if self._wake_enabled and not self._awake:
+                if self._wake_detector is not None:
+                    self._wake_detector.feed(indata)
+                return
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if (
+                speaking
+                or self._local_turn_active.is_set()
+                or self.ui.muted
+                or self._phone_active
+            ):
+                return
+            if self._ptt_enabled and not self._ptt_held:
+                return
+            if self._tail_active():
+                try:
+                    if not self._echo.is_user_speech(indata, SEND_SAMPLE_RATE,
+                                                     _pcm_level(indata)):
+                        return
+                    self._tail_until = 0.0
+                except Exception:
+                    return
+            elif self._echo._hist:
+                self._echo.reset()
+            try:
+                frames.put_nowait(indata.tobytes())
+            except _queue.Full:
+                pass
+
+        def open_mic(device):
+            return sd.InputStream(
+                samplerate=SEND_SAMPLE_RATE, channels=CHANNELS, dtype="int16",
+                blocksize=CHUNK_SIZE, device=device, callback=callback,
+            )
+
+        mic_name = get_input_device()
+        mic_device = audio_devices.resolve(mic_name, "input")
+        try:
+            try:
+                mic_stream = open_mic(mic_device)
+            except Exception as exc:
+                if mic_device is None:
+                    raise
+                self.ui.write_log(f"SYS: Microphone '{mic_name}' unavailable ({exc}); using default.")
+                mic_stream = open_mic(None)
+            self.ui.write_log("SYS: Local microphone active; speech remains on this device.")
+            with mic_stream:
+                preroll: list[bytes] = []
+                voiced = False
+                silence_blocks = 0
+                noise_rms = _LOCAL_VOICE_FLOOR
+                transcript_parts: list[str] = []
+                while True:
+                    try:
+                        block = await asyncio.to_thread(frames.get, True, 0.15)
+                    except _queue.Empty:
+                        continue
+                    samples = np.frombuffer(block, dtype=np.int16)
+                    rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+                    threshold = _voice_threshold(noise_rms)
+                    blocks_to_feed: tuple[bytes, ...] = ()
+                    if rms > threshold:
+                        if not voiced:
+                            blocks_to_feed = (*preroll, block)
+                            preroll = []
+                            transcript_parts = []
+                        else:
+                            blocks_to_feed = (block,)
+                        voiced = True
+                        silence_blocks = 0
+                    elif voiced:
+                        silence_blocks += 1
+                        blocks_to_feed = (block,)
+                    else:
+                        noise_rms = noise_rms * 0.95 + rms * 0.05
+                        preroll.append(block)
+                        if len(preroll) > 3:
+                            preroll.pop(0)
+                    for audio_frame in blocks_to_feed:
+                        completed_text, is_final = stt.feed_audio(audio_frame)
+                        if is_final and completed_text:
+                            transcript_parts.append(completed_text)
+                    if voiced and silence_blocks >= 4:
+                        preroll = []
+                        voiced = False
+                        silence_blocks = 0
+                        turn_started_at = time.perf_counter()
+                        self.ui.write_log(
+                            "SYS: Local speech captured; finalizing transcript..."
+                        )
+                        final_text = stt.finalize()
+                        if final_text:
+                            transcript_parts.append(final_text)
+                        transcript = " ".join(transcript_parts).strip()
+                        transcript_parts = []
+                        if transcript.strip():
+                            self.ui.write_log(
+                                "SYS: Local STT recognized "
+                                f"'{transcript.strip()}' in "
+                                f"{time.perf_counter() - turn_started_at:.2f}s."
+                            )
+                            await self._local_turn(
+                                transcript.strip(), started_at=turn_started_at
+                            )
+                        else:
+                            self.ui.write_log(
+                                "SYS: Speech was detected, but STT returned no words. "
+                                "Check the selected microphone, input level, and STT language/model."
+                            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ui.write_log(f"SYS: Local microphone stopped: {exc}")
+            if self._reconnect_event is not None:
+                await asyncio.sleep(2)
+                self._reconnect_event.set()
+
+    async def _run_local_session(self, retry_after: float | None = None):
+        """Run the independent local STT → LLM → TTS path."""
+        self.session = None
+        self.audio_in_queue = asyncio.Queue()
+        self.out_queue = None
+        self._turn_done_event = asyncio.Event()
+        self._turn_done_event.set()
+        self._local_mode_active = True
+        self._interrupted = False
+        self._local_tts_failed = False
+        if self._wake_enabled:
+            self._ensure_wake_detector()
+            self._awake = False
+            self.ui.set_state("SLEEPING")
+        else:
+            self._awake = True
+            self.ui.set_state("LISTENING")
+        try:
+            local_config = self._build_config()
+            declarations = (
+                TOOL_DECLARATIONS
+                + self._action_registry.get_tool_declarations()
+                + self._plugin_registry.get_tool_declarations()
+            )
+            declarations = [
+                item for item in declarations
+                if (item.get("name") if isinstance(item, dict)
+                    else getattr(item, "name", "")) != "screen_process"
+            ]
+            from core.local_brain import LocalBrain
+            self._local_brain = LocalBrain(
+                system_prompt=(
+                    str(getattr(local_config, "system_instruction", "") or "")
+                    + "\n\nVision is unavailable in this local session."
+                    + "\nFor spoken replies, be concise: usually one or two short sentences."
+                ),
+                declarations=declarations,
+                execute_tool=self._local_tool_execute,
+                on_sentence=self._local_speak_sentence,
+                notify=self.ui.write_log,
+                on_timing=self.ui.write_log,
+            )
+            if retry_after is not None:
+                self.ui.write_log("SYS: Gemini unavailable — switching to local brain.")
+            else:
+                from core.llm_client import get_llm_provider, get_llm_settings
+                _, local_model = get_llm_settings()
+                self.ui.write_log(
+                    "SYS: Local brain online "
+                    f"({get_llm_provider()}, {local_model})."
+                )
+            if self._dashboard:
+                await self._dashboard.broadcast({"type": "status", "state": "active"})
+            started_at = asyncio.get_running_loop().time()
+            tasks = {
+                asyncio.create_task(self._listen_local_audio()),
+                asyncio.create_task(self._play_audio()),
+            }
+            if self._wake_enabled:
+                tasks.add(asyncio.create_task(self._run_sleep_watch()))
+            reconnect = asyncio.create_task(self._reconnect_event.wait())
+            try:
+                done, pending = await asyncio.wait(
+                    tasks | {reconnect},
+                    timeout=retry_after,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if reconnect in done:
+                    reconnect.result()
+                    self._reconnect_event.clear()
+                for task in done:
+                    if task is not reconnect:
+                        try:
+                            task.result()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            self.ui.write_log(
+                                f"SYS: Local audio task stopped: {exc}; restarting voice session."
+                            )
+                            self._reconnect_event.set()
+                if retry_after is not None and not done.intersection({reconnect}):
+                    remaining = retry_after - (asyncio.get_running_loop().time() - started_at)
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                if retry_after is not None and not done:
+                    self.ui.write_log("SYS: Retrying Gemini connection.")
+            finally:
+                for task in tasks | {reconnect}:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, reconnect, return_exceptions=True)
+        finally:
+            if self._local_tts_init_task is not None:
+                if not self._local_tts_init_task.done():
+                    self._local_tts_init_task.cancel()
+                await asyncio.gather(
+                    self._local_tts_init_task, return_exceptions=True
+                )
+                self._local_tts_init_task = None
+            self._local_mode_active = False
+            self._local_brain = None
+            self._local_tts_engine = None
+            self._local_tts_failed = False
+            self.set_speaking(False)
+
     async def _watch_reconnect(self):
         """Session-scoped task: when a voluntary reconnect is requested, raise a
         signal that unwinds the TaskGroup so the run loop rebuilds the session."""
@@ -871,7 +1341,14 @@ class AuraLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
+        if not self._loop:
+            return
+        if self._local_mode_active and self._local_brain is not None:
+            asyncio.run_coroutine_threadsafe(
+                self._local_turn(text, log_user=False), self._loop
+            )
+            return
+        if not self.session:
             return
         # Respect wake-word sleep: a typed command must not be answered while
         # asleep either (the sleep gate is not just for the mic). Wake first with
@@ -956,6 +1433,8 @@ class AuraLive:
     def interrupt(self) -> None:
         """Stop AURA mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        if self._local_turn_task and self._loop:
+            self._loop.call_soon_threadsafe(self._local_turn_task.cancel)
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -976,6 +1455,11 @@ class AuraLive:
         self.ui.write_log("SYS: Interrupted — listening...")
 
     def speak(self, text: str):
+        if self._local_mode_active and self._local_brain is not None and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self._local_turn(text, log_user=False, record_user=False), self._loop
+            )
+            return
         if not self._loop or not self.session:
             return
         asyncio.run_coroutine_threadsafe(
@@ -1334,6 +1818,10 @@ class AuraLive:
                     mime_type=msg.get("mime_type", "audio/pcm"),
                 )
             )
+            if msg.get("source") == "mic" and not self._gemini_mic_audio_confirmed:
+                self._gemini_mic_audio_confirmed = True
+                print("[AURA] 🎤 First microphone audio chunk sent to Gemini.")
+                self.ui.write_log("SYS: Microphone audio reached the Gemini session.")
 
     async def _listen_audio(self):
         print("[AURA] 🎤 Mic started")
@@ -1403,7 +1891,11 @@ class AuraLive:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
+                    {
+                        "data": data,
+                        "mime_type": GEMINI_INPUT_AUDIO_MIME,
+                        "source": "mic",
+                    }
                 )
                 # Feed the live mic level to the HUD so the waveform reacts to
                 # the user's actual voice while listening. Purely cosmetic — any
@@ -1449,6 +1941,10 @@ class AuraLive:
 
             with _mic_stream:
                 print("[AURA] 🎤 Mic stream open")
+                self.ui.write_log(
+                    "SYS: Gemini microphone forwarding active "
+                    f"({SEND_SAMPLE_RATE} Hz PCM)."
+                )
                 while True:
                     await asyncio.sleep(0.1)
         except Exception as e:
@@ -1501,6 +1997,7 @@ class AuraLive:
     async def _receive_audio(self):
         print("[AURA] 👂 Recv started")
         out_buf, in_buf = [], []
+        gemini_audio_buffer: list[bytes] = []
 
         try:
             while True:
@@ -1530,7 +2027,11 @@ class AuraLive:
                             _audio_data = response.data
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
-                                self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
+                                chunk = _audio_data[_i : _i + _SLICE]
+                                if self._gemini_local_voice_override:
+                                    gemini_audio_buffer.append(chunk)
+                                else:
+                                    self.audio_in_queue.put_nowait(chunk)
 
                     if response.server_content:
                         sc = response.server_content
@@ -1553,7 +2054,8 @@ class AuraLive:
                                 # runs the same whether Gemini's or the local
                                 # voice is speaking — it's driven by the words,
                                 # not by which audio is playing.
-                                self._visemes.feed_text(txt)
+                                if not self._gemini_local_voice_override:
+                                    self._visemes.feed_text(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
@@ -1562,16 +2064,16 @@ class AuraLive:
                                 self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
-                            if self._turn_done_event:
-                                self._turn_done_event.set()
-
                             # If this turn_complete ends an interrupted response, clear the
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
                                 self._interrupted = False
                                 in_buf    = []
                                 out_buf   = []
+                                gemini_audio_buffer.clear()
                                 self._visemes.reset()
+                                if self._turn_done_event:
+                                    self._turn_done_event.set()
                                 continue
 
                             full_in = " ".join(in_buf).strip()
@@ -1604,7 +2106,33 @@ class AuraLive:
                                         "text": full_out,
                                         "ts": datetime.now().isoformat(),
                                     }))
+                            if self._gemini_local_voice_override:
+                                used_local_voice = False
+                                if full_out:
+                                    self._local_tts_timing_reported = False
+                                    used_local_voice = (
+                                        await self._speak_gemini_reply_with_local_voice(full_out)
+                                    )
+                                if (
+                                    not used_local_voice
+                                    and not self._interrupted
+                                    and gemini_audio_buffer
+                                ):
+                                    self.ui.write_log(
+                                        "SYS: Local voice override unavailable for this reply; "
+                                        "using Gemini voice."
+                                    )
+                                    for chunk in gemini_audio_buffer:
+                                        self.audio_in_queue.put_nowait(chunk)
+                                elif not used_local_voice and not self._interrupted:
+                                    self.ui.write_log(
+                                        "SYS: Local voice override could not synthesize this reply, "
+                                        "and Gemini supplied no audio fallback."
+                                    )
+                            gemini_audio_buffer.clear()
                             out_buf = []
+                            if self._turn_done_event:
+                                self._turn_done_event.set()
 
                             if self._vision_close_pending:
                                 # This turn_complete IS the vision answer — close camera + release busy flag
@@ -1691,6 +2219,13 @@ class AuraLive:
                         self._turn_done_event.clear()
                     continue
 
+                if self._local_mode_active and self._local_first_audio_pending:
+                    self._local_first_audio_pending = False
+                    self.ui.write_log(
+                        "SYS: Local first audio started after "
+                        f"{time.perf_counter() - self._local_turn_started_at:.2f}s "
+                        "from end of speech."
+                    )
                 self.set_speaking(True)
 
                 # Batch all immediately-available chunks into one write to reduce
@@ -2064,7 +2599,7 @@ class AuraLive:
                     continue
                 # Wait up to 8s for session to become ready after a wake
                 for _ in range(80):
-                    if self.session:
+                    if self.session or (self._local_mode_active and self._local_brain):
                         break
                     await asyncio.sleep(0.1)
                 if self.session:
@@ -2076,6 +2611,11 @@ class AuraLive:
                         turns={"role": "user", "parts": [{"text": text}]},
                         turn_complete=True,
                     )
+                    self.ui.write_log(f"[Web]: {text}")
+                elif self._local_mode_active and self._local_brain:
+                    if self._wake_enabled and not self._awake:
+                        self.wake(reason="remote command")
+                    await self._local_turn(text, log_user=False)
                     self.ui.write_log(f"[Web]: {text}")
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
@@ -2090,6 +2630,9 @@ class AuraLive:
     async def run(self):
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
+
+        while not self.ui._win._ready:
+            await asyncio.sleep(0.2)
 
         # ── Wire the shared core services to the interface ───────────────────
         # The confirmation gate is useless without a way to ask, and a memory
@@ -2125,6 +2668,19 @@ class AuraLive:
 
         while True:
             try:
+                local_settings = get_local_llm_config()
+                current_mode = local_settings.get("mode", "gemini")
+                self._gemini_local_voice_override = (
+                    current_mode == "fallback"
+                    and bool(local_settings.get("local_voice_override", False))
+                )
+                if current_mode == "local":
+                    self._gemini_local_voice_override = False
+                    await self._run_local_session()
+                    if get_local_llm_config().get("mode") == "local":
+                        await asyncio.sleep(2)
+                    continue
+
                 print("[AURA] Connecting...")
                 self.ui.set_state("THINKING")
 
@@ -2159,6 +2715,7 @@ class AuraLive:
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
+                    self._gemini_mic_audio_confirmed = False
 
                     # Reset transient state that must not carry over from a previous session
                     self._pending_vision       = None
@@ -2250,31 +2807,18 @@ class AuraLive:
                     continue
 
                 err_str = str(e)
+                local_settings = get_local_llm_config()
+                from core.local_brain import should_fallback_to_local
+                if should_fallback_to_local(local_settings.get("mode", "gemini"), e):
+                    print("[AURA] Gemini Live connection failed; switching to local voice mode.")
+                    self.ui.write_log(
+                        "SYS: Gemini Live disconnected — local voice fallback is listening."
+                    )
+                    await self._run_local_session(retry_after=60)
+                    continue
+
                 print(f"[AURA] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
-
-                # Out of quota, or this model is not available to this key —
-                # step down the ladder and reconnect straight away. This is the
-                # difference between "AURA is quieter today" and "AURA does
-                # not start today": one model means one daily limit, and the
-                # limit always arrives mid-conversation.
-                _stepped = False
-                if _gemini is not None:
-                    try:
-                        _stepped = _gemini.note_live_failure(live_model, err_str)
-                    except Exception as _ge:
-                        print(f"[AURA] note_live_failure() failed: {_ge}")
-                if _stepped:
-                    nxt = _gemini.live_model()
-                    self.ui.write_log(
-                        f"SYS: Switching to {nxt.split('/')[-1]} — the previous "
-                        f"model is out of quota."
-                        if nxt != live_model else
-                        "SYS: Every live model is rate-limited — retrying.")
-                    self._conn_backoff = 0 if nxt != live_model else 15
-                    if nxt == live_model:
-                        await asyncio.sleep(self._conn_backoff)
-                    continue
 
                 # Turn-taking / media / thinking knobs rejected by the server
                 # (preview API drift) — drop them first, because they are the
@@ -2348,6 +2892,37 @@ class AuraLive:
             await asyncio.sleep(delay)
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="A.U.R.A AI")
+    parser.add_argument(
+        "--voice", action="store_true",
+        help="Run the offline Vosk-to-local-LLM voice assistant.",
+    )
+    parser.add_argument(
+        "--provider", choices=("ollama", "lmstudio", "auto"),
+        help="Override the local LLM provider in voice mode.",
+    )
+    args = parser.parse_args()
+
+    if args.voice:
+        import yaml
+
+        from aura.voice.pipeline import VoicePipeline
+
+        config_path = Path(__file__).resolve().parent / "config.yaml"
+        try:
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            print(f"[Config] Cannot read {config_path}: {exc}")
+            return
+        config["_base_dir"] = str(config_path.parent)
+        try:
+            VoicePipeline(config, args.provider).run()
+        except (RuntimeError, ValueError) as exc:
+            print(f"[Voice] {exc}")
+        return
+
     ui = AuraUI("face.png")
 
     def runner():

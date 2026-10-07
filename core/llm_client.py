@@ -48,7 +48,9 @@ _DEFAULTS = {
 
 def get_llm_provider() -> str:
     """Returns 'ollama' or 'openai' (covers LM Studio, LocalAI, Jan, etc.)."""
-    raw = _load_config().get("llm_provider", "ollama").strip().lower()
+    local = _load_config().get("local_llm", {})
+    raw = (local.get("provider") if isinstance(local, dict) else None)
+    raw = (raw or _load_config().get("llm_provider", "ollama")).strip().lower()
     return "openai" if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp") else "ollama"
 
 
@@ -57,6 +59,72 @@ def _load_config() -> dict:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _provider_root(provider: str, url: str) -> str:
+    url = url.rstrip("/")
+    if provider in ("lmstudio", "openai") and url.endswith("/v1"):
+        return url[:-3]
+    return url
+
+
+def is_reachable(provider: str, url: str, timeout: float = 2.0) -> bool:
+    """Check an inference server without starting it or blocking the UI."""
+    root = _provider_root(provider, url)
+    endpoint = f"{root}/api/tags" if provider == "ollama" else f"{root}/v1/models"
+    try:
+        return requests.get(endpoint, timeout=timeout).ok
+    except requests.RequestException:
+        return False
+
+
+def list_models(provider: str, url: str, timeout: float = 2.0) -> list[str]:
+    """Return model names exposed by Ollama or LM Studio."""
+    root = _provider_root(provider, url)
+    endpoint = f"{root}/api/tags" if provider == "ollama" else f"{root}/v1/models"
+    response = requests.get(endpoint, timeout=timeout)
+    response.raise_for_status()
+    body = response.json()
+    records = (
+        body.get("models", body.get("data", []))
+        if isinstance(body, dict) else []
+    )
+    return [
+        name.strip()
+        for record in records
+        if isinstance(record, dict)
+        for name in [record.get("name") or record.get("id")]
+        if isinstance(name, str) and name.strip()
+    ]
+
+
+def gemini_tools_to_openai(declarations: list[dict]) -> list[dict]:
+    """Convert Gemini function declarations to the OpenAI tool schema."""
+    def normalize(schema):
+        if isinstance(schema, list):
+            return [normalize(item) for item in schema]
+        if not isinstance(schema, dict):
+            return schema
+        return {
+            key: (value.lower() if key == "type" and isinstance(value, str)
+                  else normalize(value))
+            for key, value in schema.items()
+        }
+
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": declaration["name"],
+                "description": declaration.get("description", ""),
+                "parameters": normalize(declaration.get(
+                    "parameters", {"type": "OBJECT", "properties": {}}
+                )),
+            },
+        }
+        for declaration in declarations
+        if isinstance(declaration, dict) and isinstance(declaration.get("name"), str)
+    ]
 
 
 def ensure_ollama_running(timeout: int = 15) -> bool:
@@ -170,9 +238,7 @@ def warmup_model(system_prompt: str | None = None) -> bool:
         "messages":   messages,
         "stream":     False,
         "keep_alive": -1,
-        # num_gpu:99 → push ALL transformer layers to GPU (Ollama caps at available)
-        # This is safe even without a GPU — Ollama silently ignores if n_gpu_layers=0
-        "options":    {"num_predict": 1, "num_gpu": 99},
+        "options":    {"num_predict": 1, "num_ctx": 2048},
     }
     try:
         resp = requests.post(f"{url}/api/chat", json=payload, timeout=180)
@@ -220,7 +286,17 @@ def check_model_available(log: Callable | None = None) -> bool:
 
 def get_llm_settings() -> tuple[str, str]:
     """Returns (base_url, model_name)."""
-    cfg   = _load_config()
+    cfg = _load_config()
+    local = cfg.get("local_llm")
+    if isinstance(local, dict):
+        provider = str(local.get("provider", "ollama")).lower()
+        url = str(local.get(
+            "base_url",
+            "http://127.0.0.1:11434" if provider == "ollama"
+            else "http://127.0.0.1:1234/v1",
+        )).rstrip("/")
+        model = str(local.get("model") or _DEFAULTS["llm_model"])
+        return _provider_root(provider, url), model
     url   = cfg.get("llm_url",   _DEFAULTS["llm_url"]).rstrip("/")
     model = cfg.get("llm_model", _DEFAULTS["llm_model"])
     return url, model
@@ -286,7 +362,7 @@ def call_llm(
         "messages":   messages,
         "stream":     False,
         "keep_alive": -1,
-        "options":    {"num_predict": 150, "num_gpu": 99},
+        "options":    {"num_predict": 150, "num_ctx": 2048},
     }
     if tools:
         payload["tools"] = tools
@@ -373,6 +449,7 @@ def _stream_openai(
     messages: list,
     tools:    list | None,
     timeout:  int,
+    max_tokens: int,
 ) -> Generator[dict, None, None]:
     """
     Streaming backend for OpenAI-compatible servers (LM Studio, LocalAI, Jan…).
@@ -387,7 +464,7 @@ def _stream_openai(
         "model":      model,
         "messages":   messages,
         "stream":     True,
-        "max_tokens": 150,
+        "max_tokens": max_tokens,
     }
     if tools:
         payload["tools"]       = tools
@@ -480,7 +557,10 @@ def _stream_openai(
     except requests.exceptions.Timeout:
         raise RuntimeError("OpenAI-compatible stream timed out.")
     except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
+        details = (getattr(e.response, "text", "") or "")[:300]
+        raise RuntimeError(
+            f"OpenAI-compatible HTTP error: {e.response.status_code}: {details}"
+        )
     except Exception as e:
         raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
 
@@ -489,6 +569,7 @@ def call_llm_stream(
     messages: list,
     tools:    list | None = None,
     timeout:  int = 120,
+    max_tokens: int = 150,
 ) -> Generator[dict, None, None]:
     """
     Streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
@@ -502,7 +583,7 @@ def call_llm_stream(
     """
     provider = get_llm_provider()
     if provider == "openai":
-        yield from _stream_openai(messages, tools, timeout)
+        yield from _stream_openai(messages, tools, timeout, max_tokens)
         return
 
     url, model = get_llm_settings()
@@ -513,9 +594,9 @@ def call_llm_stream(
         "messages":   messages,
         "stream":     True,
         "keep_alive": -1,
-        # 150 tokens ≈ 100 words ≈ 3-4 sentences — enough for any voice reply.
+        # Keep the default generous for existing callers; local speech sets a lower cap.
         # num_gpu:99 pushes all layers to GPU; num_thread removed (Ollama auto-tunes).
-        "options":    {"num_predict": 150, "num_gpu": 99},
+        "options":    {"num_predict": max_tokens, "num_ctx": 2048},
     }
     if tools:
         payload["tools"] = tools
@@ -580,7 +661,8 @@ def call_llm_stream(
     except requests.exceptions.Timeout:
         raise RuntimeError("Ollama stream timed out.")
     except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"Ollama HTTP error: {e.response.status_code}")
+        details = (getattr(e.response, "text", "") or "")[:300]
+        raise RuntimeError(f"Ollama HTTP error: {e.response.status_code}: {details}")
     except Exception as e:
         print(f"[LLM] Stream error: {type(e).__name__}: {e}")
         raise RuntimeError(f"LLM stream failed: {e}")

@@ -51,6 +51,110 @@ def is_configured() -> bool:
     return bool(key and len(key) > 15)
 
 
+def get_local_llm_config() -> dict:
+    """Return validated local-AI settings with backwards-compatible defaults."""
+    api_config = load_api_keys()
+    raw = api_config.get("local_llm", {}) if isinstance(api_config, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    mode = raw.get("mode", "gemini")
+    if not isinstance(mode, str) or mode not in {"gemini", "local", "fallback"}:
+        mode = "gemini"
+    provider = raw.get("provider", "ollama")
+    if not isinstance(provider, str) or provider not in {"ollama", "lmstudio"}:
+        provider = "ollama"
+    base_url = str(raw.get(
+        "base_url",
+        "http://127.0.0.1:11434" if provider == "ollama"
+        else "http://127.0.0.1:1234/v1",
+    )).strip().rstrip("/")
+    voices = raw.get("voice_by_model", {})
+    if not isinstance(voices, dict):
+        voices = {}
+    engine_voices = raw.get("tts_voice_by_engine", {})
+    if not isinstance(engine_voices, dict):
+        engine_voices = {}
+    return {
+        "mode": mode,
+        "provider": provider,
+        "base_url": base_url,
+        "model": str(raw.get("model", "")).strip(),
+        "voice_id": str(raw.get("voice_id", "")).strip(),
+        "voice_by_model": {
+            str(model): str(voice) for model, voice in voices.items()
+        },
+        "stt_engine": "vosk",
+        "vosk_model": str(
+            raw.get("vosk_model", "vosk-model-small-en-us-0.15")
+        ).strip() or "vosk-model-small-en-us-0.15",
+        "tts_engine": str(raw.get("tts_engine", "kokoro")).strip().lower(),
+        "tts_voice": str(raw.get("tts_voice", "af_heart")).strip(),
+        "tts_voice_by_engine": {
+            str(engine): str(voice) for engine, voice in engine_voices.items()
+        },
+        "local_voice_override": bool(raw.get("local_voice_override", False)),
+    }
+
+
+def is_setup_configured(data: dict) -> bool:
+    """Check whether the selected brain mode has the credentials/settings it needs."""
+    if not isinstance(data, dict) or not data.get("os_system"):
+        return False
+    local = data.get("local_llm", {})
+    if not isinstance(local, dict):
+        local = {}
+    mode = local.get("mode", "gemini")
+    if mode == "local":
+        return bool(str(local.get("model", "")).strip())
+    if mode == "fallback":
+        return bool(data.get("gemini_api_key")) and bool(
+            str(local.get("model", "")).strip()
+        )
+    return mode == "gemini" and bool(data.get("gemini_api_key"))
+
+
+def save_local_llm_config(settings: dict) -> None:
+    """Persist local-AI settings without dropping unrelated API configuration."""
+    if not isinstance(settings, dict):
+        raise TypeError("Local AI settings must be a dictionary")
+    ensure_config_dir()
+    data = load_api_keys()
+    current = get_local_llm_config()
+    current.update(settings)
+    provider = current.get("provider")
+    if provider not in {"ollama", "lmstudio"}:
+        raise ValueError("provider must be 'ollama' or 'lmstudio'")
+    if (not isinstance(current.get("mode"), str)
+            or current.get("mode") not in {"gemini", "local", "fallback"}):
+        raise ValueError("mode must be 'gemini', 'local', or 'fallback'")
+    current["base_url"] = str(current.get("base_url", "")).strip().rstrip("/")
+    if not current["base_url"]:
+        current["base_url"] = (
+            "http://127.0.0.1:11434" if provider == "ollama"
+            else "http://127.0.0.1:1234/v1"
+        )
+    if not isinstance(current.get("voice_by_model"), dict):
+        raise TypeError("voice_by_model must be a dictionary")
+    current["voice_by_model"] = {
+        str(model): str(voice)
+        for model, voice in current["voice_by_model"].items()
+    }
+    if not isinstance(current.get("tts_voice_by_engine"), dict):
+        raise TypeError("tts_voice_by_engine must be a dictionary")
+    current["tts_voice_by_engine"] = {
+        str(engine): str(voice)
+        for engine, voice in current["tts_voice_by_engine"].items()
+    }
+    current["stt_engine"] = "vosk"
+    current.pop("stt_model", None)
+    current["vosk_model"] = str(
+        current.get("vosk_model", "vosk-model-small-en-us-0.15")
+    ).strip() or "vosk-model-small-en-us-0.15"
+    current["local_voice_override"] = bool(current.get("local_voice_override", False))
+    data["local_llm"] = current
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
 def get_assistant_name() -> str:
     """Return the configured assistant name, or 'JARVIS' if not set."""
     return load_api_keys().get("assistant_name", "JARVIS") or "JARVIS"
