@@ -1,0 +1,78 @@
+# ── A.U.R.A v2 — local state and private assets that must not be committed ────
+# Keep source, tests, and other program features trackable; ignore credentials,
+# personal data, downloaded models, and machine-specific runtime files.
+
+# ── Secrets. Committing any of these publishes them. ──────────────────────────
+# API keys, biometric data, certificates/private keys, and linked sessions.
+**/api_keys.json
+**/api_key.json
+**/secrets.json
+config/whatsapp_web/
+**/face_unlock.json
+**/face_unlock/
+**/face_data/
+**/face_id/
+**/face_embeddings/
+**/certs/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+# Google OAuth tokens and client secrets.
+**/token*.json
+**/client_secret*.json
+**/*credentials*.json
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# ── Personal data the assistant accumulates about you ─────────────────────────
+# Memory stores may contain names, preferences, relationships, and session data.
+memory/*.json
+memory/*.db*
+memory/*.sqlite*
+memory/*.jsonl
+.aura-task.json
+workspace/
+
+# ── Downloaded assets and local backups ───────────────────────────────────────
+models/
+voice_models/
+tts_models/
+stt_models/
+voice_samples/
+voiceprints/
+recordings/
+bugs_backup.txt
+
+# ── Python build noise ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Editors and operating systems ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Runtime output ────────────────────────────────────────────────────────────
+*.log
+logs/
+downloads/
+screenshots/
