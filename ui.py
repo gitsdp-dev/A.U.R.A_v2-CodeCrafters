@@ -4989,11 +4989,19 @@ class MainWindow(QMainWindow):
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
     _video_open_sig  = pyqtSignal(str, str, bool, str)  # video, title, muted, audio
+<<<<<<< HEAD
+=======
+    _wake_btns_sig   = pyqtSignal()          # wake state resolved off-thread
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
     _video_close_sig = pyqtSignal()
     _video_mute_sig  = pyqtSignal(bool)
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
+<<<<<<< HEAD
+=======
+    _wake_dl_sig    = pyqtSignal(bool, str)  # wake-word install finished (ok, message)
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
@@ -5036,8 +5044,16 @@ class MainWindow(QMainWindow):
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by AuraLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by AuraLive
+<<<<<<< HEAD
         self.on_push_to_talk   = None   # callable: (enable: bool) -> str scope
         self.ptt_hold          = None   # callable: (held: bool) -> None — windowed chord
+=======
+        self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by AuraLive
+        self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
+        self.on_push_to_talk   = None   # callable: (enable: bool) -> str scope
+        self.ptt_hold          = None   # callable: (held: bool) -> None — windowed chord
+        self.wake_get_state    = None   # callable: () -> dict {enabled, awake, ready}
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
         self._muted            = False
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
@@ -5136,6 +5152,10 @@ class MainWindow(QMainWindow):
 
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
+<<<<<<< HEAD
+=======
+        self._warm_wake_state()
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
         self._update_autostart_btn(self._check_autostart())
         from memory.config_manager import get_brief_enabled as _gbe
         self._update_brief_btn(_gbe())
@@ -5161,6 +5181,11 @@ class MainWindow(QMainWindow):
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
+<<<<<<< HEAD
+=======
+        self._wake_dl_sig.connect(self._on_wake_install_done)
+        self._wake_btns_sig.connect(self._refresh_wake_btns)
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
         self._video_open_sig.connect(self._on_video_open)
         self._video_close_sig.connect(self._on_video_close)
         self._video_mute_sig.connect(self._on_video_mute)
@@ -6061,6 +6086,24 @@ class MainWindow(QMainWindow):
     def video_is_playing(self) -> bool:
         return bool(self._video_on)
 
+<<<<<<< HEAD
+=======
+    def _warm_wake_state(self) -> None:
+        """Resolve the wake-word state off the UI thread, once. Checking it used
+        to happen when the settings drawer opened, and the first check blocks on
+        an `import openwakeword` (which drags in onnxruntime) — opening the
+        drawer stalled for about two seconds. Afterwards the same check is
+        near-instant, so it only needed to happen somewhere other than in front
+        of the user."""
+        def work():
+            try:
+                self._wake_state()
+            except Exception:
+                pass
+            self._wake_btns_sig.emit()
+        threading.Thread(target=work, daemon=True, name="wake-state-warm").start()
+
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
     # ------------------------------------------------------------------
     # Icon generation — arc-reactor style, rendered with Pillow
     # ------------------------------------------------------------------
@@ -6765,6 +6808,31 @@ class MainWindow(QMainWindow):
         self._face_re_btn.hide()
         lay.addWidget(self._face_re_btn)
 
+<<<<<<< HEAD
+=======
+        # ── Wake word ──────────────────────────────────────────────────────────
+        # WAKE WORD button (and its paired SLEEP/WAKE NOW button) removed from
+        # the settings menu. Both are still instantiated — just never added to
+        # the layout — because _refresh_wake_btns(), _toggle_wake_word(), and
+        # other call sites reference self._wake_btn / self._wake_sleep_btn.
+        self._wake_btn = QPushButton()
+        self._wake_btn.setFixedHeight(26)
+        self._wake_btn.setFont(QFont("Courier New", 7))
+        self._wake_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._wake_btn.clicked.connect(self._toggle_wake_word)
+
+        self._wake_sleep_btn = QPushButton()
+        self._wake_sleep_btn.setFixedHeight(26)
+        self._wake_sleep_btn.setFont(QFont("Courier New", 7))
+        self._wake_sleep_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._wake_sleep_btn.clicked.connect(self._tap_wake_manual)
+        # Neutral placeholder now; the real state (which may load the model to
+        # check readiness) is resolved lazily the first time the drawer opens.
+        self._wake_btn.setText("🎙  WAKE WORD")
+        self._wake_btn.setStyleSheet(_BTN_STYLE_DIM)
+        self._wake_sleep_btn.hide()
+
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
         self._ptt_btn = QPushButton()
         self._ptt_btn.setFixedHeight(26)
         self._ptt_btn.setFont(QFont("Courier New", 7))
@@ -6811,6 +6879,10 @@ class MainWindow(QMainWindow):
 
     def _toggle_drawer(self, checked: bool):
         if checked:
+<<<<<<< HEAD
+=======
+            self._refresh_wake_btns()   # resolve wake state on open (lazy)
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
             self._position_quick_drawer()
             self._quick_drawer.show()
             self._quick_drawer.raise_()
@@ -7539,6 +7611,63 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
             """)
 
+<<<<<<< HEAD
+=======
+    # ── Wake word settings ───────────────────────────────────────────────────
+
+    def _wake_state(self) -> dict:
+        """Combined state for the two wake-word buttons. Readiness is a cheap,
+        deterministic on-disk check, so there is nothing to cache — the button
+        never flickers to a stale value."""
+        if self.wake_get_state:
+            try:
+                s = self.wake_get_state()
+                return {"ready": bool(s.get("ready")),
+                        "enabled": bool(s.get("enabled")),
+                        "awake": bool(s.get("awake"))}
+            except Exception:
+                pass
+        # Before AuraLive has wired its callback (drawer built at startup).
+        ready, enabled = False, False
+        try:
+            from core.wake_word import is_ready
+            from memory.config_manager import get_wake_word_enabled
+            ready, enabled = is_ready(), get_wake_word_enabled()
+        except Exception:
+            pass
+        return {"ready": ready, "enabled": enabled, "awake": True}
+
+    def _refresh_wake_btns(self):
+        if not hasattr(self, '_wake_btn'):
+            return
+        st = self._wake_state()
+        _on = f"""
+            QPushButton {{ background: #001a08; color: {C.GREEN};
+                border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                text-align: left; padding: 0 8px; }}
+            QPushButton:hover {{ background: #002010; }}"""
+        _off = f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                text-align: left; padding: 0 8px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}"""
+        self._wake_btn.setEnabled(True)
+        if not st["ready"]:
+            self._wake_btn.setText("⬇  WAKE WORD: DOWNLOAD")
+            self._wake_btn.setStyleSheet(_off)
+            self._wake_sleep_btn.hide()
+        elif st["enabled"]:
+            self._wake_btn.setText("🎙  WAKE WORD: ON")
+            self._wake_btn.setStyleSheet(_on)
+            self._wake_sleep_btn.show()
+            self._wake_sleep_btn.setText("😴  SLEEP NOW" if st["awake"] else "👂  WAKE NOW")
+            self._wake_sleep_btn.setStyleSheet(_off)
+        else:
+            self._wake_btn.setText("🎙  WAKE WORD: OFF")
+            self._wake_btn.setStyleSheet(_off)
+            self._wake_sleep_btn.hide()
+
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
     def _refresh_talk_btns(self):
         """Repaint the push-to-talk row from the saved setting."""
         if not hasattr(self, "_ptt_btn"):
@@ -7635,6 +7764,50 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+<<<<<<< HEAD
+=======
+    def _toggle_wake_word(self):
+        st = self._wake_state()
+        if not st["ready"]:
+            # First time: download the wake-word model in a worker thread.
+            self._wake_btn.setText("⬇  DOWNLOADING… (one-time)")
+            self._wake_btn.setEnabled(False)
+            def _work():
+                try:
+                    from core.wake_word import install_and_download
+                    ok, msg = install_and_download(
+                        logger=lambda m: self._log_sig.emit(f"SYS: {m}"))
+                except Exception as e:
+                    ok, msg = False, str(e)
+                if ok and self.on_wake_toggle:
+                    try:
+                        self.on_wake_toggle(True)   # auto-enable after a successful download
+                    except Exception:
+                        pass
+                self._wake_dl_sig.emit(ok, msg)
+            threading.Thread(target=_work, daemon=True).start()
+            return
+        # Already downloaded → just flip enabled/disabled through AuraLive.
+        if self.on_wake_toggle:
+            try:
+                self.on_wake_toggle(not st["enabled"])
+            except Exception:
+                pass
+        self._refresh_wake_btns()
+
+    def _on_wake_install_done(self, ok: bool, msg: str):
+        self._log_sig.emit(f"SYS: {'Wake word ready.' if ok else 'Wake word setup failed: ' + msg}")
+        self._refresh_wake_btns()
+
+    def _tap_wake_manual(self):
+        if self.on_wake_manual:
+            try:
+                self.on_wake_manual()
+            except Exception:
+                pass
+        self._refresh_wake_btns()
+
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
     # ── Customization ────────────────────────────────────────────────────────────
 
     def _open_customize(self):
@@ -8090,6 +8263,33 @@ class AuraUI:
         self._win.get_plugin_settings = cb
 
     @property
+<<<<<<< HEAD
+=======
+    def on_wake_toggle(self):
+        return self._win.on_wake_toggle
+
+    @on_wake_toggle.setter
+    def on_wake_toggle(self, cb):
+        self._win.on_wake_toggle = cb
+
+    @property
+    def on_wake_manual(self):
+        return self._win.on_wake_manual
+
+    @on_wake_manual.setter
+    def on_wake_manual(self, cb):
+        self._win.on_wake_manual = cb
+
+    @property
+    def wake_get_state(self):
+        return self._win.wake_get_state
+
+    @wake_get_state.setter
+    def wake_get_state(self, cb):
+        self._win.wake_get_state = cb
+
+    @property
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
     def ptt_hold(self):
         return self._win.ptt_hold
 

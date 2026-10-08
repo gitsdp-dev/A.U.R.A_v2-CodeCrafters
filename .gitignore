@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ── A.U.R.A v2 — local state and private assets that must not be committed ────
 # Keep source, tests, and other program features trackable; ignore credentials,
 # personal data, downloaded models, and machine-specific runtime files.
@@ -45,6 +46,34 @@ stt_models/
 voice_samples/
 voiceprints/
 recordings/
+=======
+# ── A.U.R.A v2 (Local Ai Integration) — what never belongs in the repository ──────────────────────────
+# Everything listed here is created by the app on first run. A fresh clone with
+# none of it present boots straight to the setup screen, which is the intended
+# first experience — so nothing here needs to be committed, and some of it must
+# never be.
+
+# ── Secrets. Committing any of these publishes them. ──────────────────────────
+# API keys, biometric data, certificates/private keys, and linked sessions.
+config/api_keys.json
+config/face_unlock.json
+config/face_unlock/
+config/certs/
+config/whatsapp_web/
+# Google OAuth tokens and client secrets.
+**/token*.json
+**/client_secret*.json
+*credentials*.json
+.env
+.env.*
+
+# ── Personal data the assistant accumulates about you ─────────────────────────
+memory/long_term.json
+memory/*.db
+
+# ── Downloaded assets and local backups ───────────────────────────────────────
+models/
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
 bugs_backup.txt
 
 # ── Python build noise ────────────────────────────────────────────────────────

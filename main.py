@@ -72,7 +72,11 @@ from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
+<<<<<<< HEAD
     get_input_device, get_output_device,
+=======
+    get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
     get_local_llm_config,
 )
 # Model ladder + quota fallback (core/gemini.py). Guarded so the assistant still
@@ -89,6 +93,12 @@ from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
+<<<<<<< HEAD
+=======
+from core.wake_word            import (
+    WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
+)
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
 
 def _capture_camera_shared(ui):
     """Grab a webcam frame while the always-on room watch briefly lets go of the device."""
@@ -108,6 +118,13 @@ def _capture_camera_shared(ui):
         except Exception as _e:
             print(f"[RoomWatch] resume failed: {_e}")
 
+<<<<<<< HEAD
+=======
+# How long the assistant stays awake with no user speech before it auto-sleeps
+# again (wake-word mode only).
+WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
+
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
 def get_base_dir():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
@@ -677,6 +694,17 @@ class AuraLive:
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
+<<<<<<< HEAD
+=======
+        # ── Wake word ────────────────────────────────────────────────────────
+        # _awake gates the mic (see _listen_audio) and the background speakers.
+        # It is True whenever wake word is OFF, so default behaviour is unchanged.
+        self._wake_enabled     = get_wake_word_enabled()
+        self._awake            = not self._wake_enabled
+        self._wake_detector: WakeWordDetector | None = None
+        self._wake_sleep_timeout = WAKE_SLEEP_TIMEOUT
+
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
         # Restore the saved push-to-talk preference. Doing it here rather than
         # in __init__ means the hotkey thread only exists once there is a
         # session to talk to.
@@ -685,6 +713,114 @@ class AuraLive:
                 self.set_push_to_talk(True)
             except Exception as e:
                 print(f"[AURA] ⚠ Push-to-talk unavailable: {e}")
+<<<<<<< HEAD
+=======
+        # UI control surface for the Wake Word settings section.
+        self.ui.wake_is_ready    = wake_is_ready          # () -> bool
+        self.ui.wake_get_state   = self._wake_state       # () -> dict
+        self.ui.on_wake_toggle   = self._ui_wake_toggle   # (enable: bool) -> str
+        self.ui.on_wake_manual   = self._ui_wake_manual   # () -> toggle awake/asleep
+        self.ui.on_wake_install  = self._ui_wake_install  # () -> (ok, msg)
+
+    # ── Wake word: state machine ─────────────────────────────────────────────
+
+    def _wake_state(self) -> dict:
+        # A loaded, running detector is definitively ready; otherwise fall back
+        # to the cheap on-disk model-file check (no Model construction).
+        ready = bool(self._wake_detector and self._wake_detector.ready) or wake_is_ready()
+        return {"enabled": self._wake_enabled, "awake": self._awake, "ready": ready}
+
+    def _ensure_wake_detector(self) -> bool:
+        """Load the detector once (model loads on first start). Idempotent."""
+        if self._wake_detector is None:
+            self._wake_detector = WakeWordDetector(
+                on_detect=self._on_wake_detected,
+                logger=lambda m: print(f"[Wake] {m}"),
+                notify=lambda m: self.ui.write_log(f"SYS: {m}"),
+            )
+        if not self._wake_detector.ready:
+            return self._wake_detector.start()
+        return True
+
+    def _on_wake_detected(self, trigger: str = "hey_aura", response: str = "") -> None:
+        """Called from the detector thread on 'Hey Aura', 'Wake Up, Daddy's Home',
+        or a double clap. `response` (e.g. "Welcome Home, Sir.") is spoken back
+        for the phrases/gestures that have one — plain 'Hey Aura' stays silent
+        on wake, same as before."""
+        reason = {
+            "hey_aura": "wake word",
+            "wake_up_daddys_home": "\u2018Wake Up, Daddy's Home\u2019",
+            "clap": "clap",
+        }.get(trigger, "wake word")
+        self.wake(reason=reason)
+        if response:
+            self.speak(response)
+
+    def wake(self, reason: str = "wake word") -> None:
+        if self._awake:
+            return
+        self._awake = True
+        self._last_user_speech = time.monotonic()   # start the auto-sleep clock now
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
+        self.ui.write_log(f"SYS: Awake — {reason}.")
+
+    def sleep(self, reason: str = "timeout") -> None:
+        if not self._awake:
+            return
+        self._awake = False
+        self.set_speaking(False)
+        self.ui.set_state("SLEEPING")
+        self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Aura' or 'Wake Up, Daddy's Home' to wake me.")
+
+    async def _run_sleep_watch(self) -> None:
+        """Auto-sleep after the configured silence window (wake-word mode only)."""
+        while True:
+            await asyncio.sleep(5)
+            if not self._wake_enabled or not self._awake:
+                continue
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking:
+                continue
+            if (time.monotonic() - self._last_user_speech) > self._wake_sleep_timeout:
+                self.sleep(reason="no speech for 2 minutes")
+
+    # ── Wake word: UI callbacks (called from the Qt thread) ──────────────────
+
+    def _ui_wake_toggle(self, enable: bool) -> str:
+        """Enable/disable wake word from the settings UI. Returns a status token:
+        'enabled' | 'disabled' | 'need_download'."""
+        if enable:
+            if not wake_is_ready():
+                return "need_download"
+            self._wake_enabled = True
+            save_wake_word_enabled(True)
+            self._ensure_wake_detector()
+            self.sleep(reason="wake word enabled")
+            return "enabled"
+        else:
+            self._wake_enabled = False
+            save_wake_word_enabled(False)
+            self.wake(reason="wake word disabled")
+            return "disabled"
+
+    def _ui_wake_manual(self) -> None:
+        """Manual sleep/wake button in the UI."""
+        if not self._wake_enabled:
+            return
+        if self._awake:
+            self.sleep(reason="you tapped sleep")
+        else:
+            self.wake(reason="you tapped wake")
+
+    def _ui_wake_install(self) -> tuple[bool, str]:
+        """Download openwakeword + the model (runs in a UI worker thread)."""
+        # Triggered by the user pressing the button, so its progress is exactly
+        # what they are waiting to see.
+        return wake_install(logger=lambda m: print(f"[Wake] {m}"),
+                            notify=lambda m: self.ui.write_log(f"SYS: {m}"))
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -969,6 +1105,13 @@ class AuraLive:
             loop.call_soon_threadsafe(
                 self.ui.set_audio_level, _pcm_level(indata)
             )
+<<<<<<< HEAD
+=======
+            if self._wake_enabled and not self._awake:
+                if self._wake_detector is not None:
+                    self._wake_detector.feed(indata)
+                return
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
             with self._speaking_lock:
                 speaking = self._is_speaking
             if (
@@ -1093,7 +1236,17 @@ class AuraLive:
         self._local_mode_active = True
         self._interrupted = False
         self._local_tts_failed = False
+<<<<<<< HEAD
         self.ui.set_state("LISTENING")
+=======
+        if self._wake_enabled:
+            self._ensure_wake_detector()
+            self._awake = False
+            self.ui.set_state("SLEEPING")
+        else:
+            self._awake = True
+            self.ui.set_state("LISTENING")
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
         try:
             local_config = self._build_config()
             declarations = (
@@ -1135,6 +1288,11 @@ class AuraLive:
                 asyncio.create_task(self._listen_local_audio()),
                 asyncio.create_task(self._play_audio()),
             }
+<<<<<<< HEAD
+=======
+            if self._wake_enabled:
+                tasks.add(asyncio.create_task(self._run_sleep_watch()))
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
             reconnect = asyncio.create_task(self._reconnect_event.wait())
             try:
                 done, pending = await asyncio.wait(
@@ -1218,6 +1376,15 @@ class AuraLive:
             return
         if not self.session:
             return
+<<<<<<< HEAD
+=======
+        # Respect wake-word sleep: a typed command must not be answered while
+        # asleep either (the sleep gate is not just for the mic). Wake first with
+        # "Hey Aura" or the WAKE NOW button.
+        if self._wake_enabled and not self._awake:
+            self.ui.write_log("SYS: I'm asleep — say 'Hey Aura' or tap WAKE NOW first.")
+            return
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
@@ -1282,7 +1449,15 @@ class AuraLive:
         """Chord pressed or released — may arrive on the hotkey thread."""
         self._ptt_held = held
         if held:
+<<<<<<< HEAD
             self._last_user_speech = time.monotonic()
+=======
+            # Holding the key is also a way to wake it, so push-to-talk works
+            # without having to say the wake word first.
+            if self._wake_enabled and not self._awake:
+                self._awake = True
+                self._last_user_speech = time.monotonic()
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
         try:
             self.ui.set_state("LISTENING" if held else "SLEEPING")
         except Exception:
@@ -1686,6 +1861,21 @@ class AuraLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+<<<<<<< HEAD
+=======
+            # ── Wake-word gate ───────────────────────────────────────────────
+            # While asleep, the mic audio NEVER goes to Gemini (nothing is
+            # streamed, so AURA can't respond to speech not addressed to it and
+            # nothing leaves the machine). Frames are instead handed to the local
+            # detector, which runs its model in ITS OWN thread — the cost here is
+            # only a queue push, so the audio path is never slowed. When wake word
+            # is off (default) or we're awake, this is a single boolean check.
+            if self._wake_enabled and not self._awake:
+                det = self._wake_detector
+                if det is not None:
+                    det.feed(indata)
+                return
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
             with self._speaking_lock:
                 aura_speaking = self._is_speaking
 
@@ -2319,7 +2509,11 @@ class AuraLive:
         while True:
             await asyncio.sleep(10)
             alert = await asyncio.to_thread(self._sys_monitor.check)
+<<<<<<< HEAD
             if not alert or not self.session:
+=======
+            if not alert or not self.session or not self._awake:
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
                 continue
             # Don't interrupt an active conversation
             with self._speaking_lock:
@@ -2340,7 +2534,11 @@ class AuraLive:
         """Check user-configured topics once per day; speak alerts when new headlines appear."""
         await asyncio.sleep(300)          # wait 5 min after startup before first check
         while True:
+<<<<<<< HEAD
             if self.session:
+=======
+            if self.session and self._awake:
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
                 # Don't interrupt if user spoke recently or AURA is mid-sentence
                 with self._speaking_lock:
                     speaking = self._is_speaking
@@ -2378,7 +2576,11 @@ class AuraLive:
         while True:
             await asyncio.sleep(60)   # evaluate once per minute
 
+<<<<<<< HEAD
             if not self.session:
+=======
+            if not self.session or not self._awake:
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
                 continue
 
             with self._speaking_lock:
@@ -2443,18 +2645,34 @@ class AuraLive:
                 )
                 if not text:
                     continue
+<<<<<<< HEAD
                 # Wait up to 8s for the session to become ready
+=======
+                # Wait up to 8s for session to become ready after a wake
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
                 for _ in range(80):
                     if self.session or (self._local_mode_active and self._local_brain):
                         break
                     await asyncio.sleep(0.1)
                 if self.session:
+<<<<<<< HEAD
+=======
+                    # A remote command is deliberate control and the phone user
+                    # has no desktop WAKE button — so it wakes AURA if asleep.
+                    if self._wake_enabled and not self._awake:
+                        self.wake(reason="remote command")
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
                     await self.session.send_client_content(
                         turns={"role": "user", "parts": [{"text": text}]},
                         turn_complete=True,
                     )
                     self.ui.write_log(f"[Web]: {text}")
                 elif self._local_mode_active and self._local_brain:
+<<<<<<< HEAD
+=======
+                    if self._wake_enabled and not self._awake:
+                        self.wake(reason="remote command")
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
                     await self._local_turn(text, log_user=False)
                     self.ui.write_log(f"[Web]: {text}")
                 else:
@@ -2572,8 +2790,22 @@ class AuraLive:
                         # is the whole point, and it is invisible otherwise.
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
 
+<<<<<<< HEAD
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: AURA online.")
+=======
+                    # Wake word: if enabled, come up ASLEEP (mic gated, silent)
+                    # until the user says "Hey AURA" or taps wake in the UI.
+                    if self._wake_enabled:
+                        self._ensure_wake_detector()
+                        self._awake = False
+                        self.ui.set_state("SLEEPING")
+                        self.ui.write_log("SYS: AURA online — sleeping. Say 'Hey AURA' to wake me.")
+                    else:
+                        self._awake = True
+                        self.ui.set_state("LISTENING")
+                        self.ui.write_log("SYS: AURA online.")
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
@@ -2587,11 +2819,21 @@ class AuraLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+<<<<<<< HEAD
+=======
+                    tg.create_task(self._run_sleep_watch())
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
                     # Morning briefing — fires once per process launch (if enabled).
+<<<<<<< HEAD
                     if not self._briefing_sent and get_brief_enabled():
+=======
+                    # Skipped in wake-word mode: it comes up asleep, and a briefing
+                    # would mean talking while "asleep".
+                    if not self._briefing_sent and get_brief_enabled() and self._awake:
+>>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
 
