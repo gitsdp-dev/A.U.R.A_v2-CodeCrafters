@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # ── A.U.R.A v2 — local state and private assets that must not be committed ────
 # Keep source, tests, and other program features trackable; ignore credentials,
 # personal data, downloaded models, and machine-specific runtime files.
@@ -46,7 +46,7 @@ stt_models/
 voice_samples/
 voiceprints/
 recordings/
-=======
+
 # ── A.U.R.A v2 (Local Ai Integration) — what never belongs in the repository ──────────────────────────
 # Everything listed here is created by the app on first run. A fresh clone with
 # none of it present boots straight to the setup screen, which is the intended
