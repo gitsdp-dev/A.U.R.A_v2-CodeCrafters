@@ -68,6 +68,7 @@ Existing Gemini configuration files remain compatible with the newer configurati
 | **Room Checking** | Monitor the room through the camera with a draggable preview window. |
 | **Assistant Customization** | Configure AI, voice, audio devices, and assistant preferences. |
 | **Modular Architecture** | Separates core logic, actions, memory, plugins, configuration, UI, and voice components. |
+| **GOD'S EYE (Earth View)** | Advanced Earth View Feature which allows you to track air routes and inspect locations inside A.U.R.A itself |
 
 ---
 
@@ -379,6 +380,7 @@ A.U.R.A v2
 ├── config/           # Configuration and preferences
 ├── core/             # Core assistant and voice logic
 ├── dashboard/        # Dashboard components
+|-- earth/            # Earth View Assets
 ├── memory/           # Persistent memory system
 ├── plugins/          # Plugin architecture
 ├── voices/           # Voice-related resources
