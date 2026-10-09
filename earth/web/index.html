@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A.U.R.A. — God's Eye</title>
+  <link rel="stylesheet" href="vendor/maplibre-gl.css">
+  <style>
+    :root { color-scheme: dark; font-family: "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    html, body, #map { width: 100%; height: 100%; margin: 0; }
+    body { overflow: hidden; background: #03080e; color: #ffe4c2; }
+    #map {
+      position: absolute; inset: 0; overflow: hidden;
+      clip-path: inset(0 round 5px);
+    }
+    #fallback {
+      display: none; position: absolute; inset: 0; place-items: center;
+      background: radial-gradient(circle, #18405b, #061321 58%, #02060a);
+    }
+    body.compact .toolbar, body.compact .route-panel,
+    body.compact .status,
+    body.compact .maplibregl-ctrl-group { display: none; }
+    .compact-hint {
+      position: absolute; z-index: 3; right: 7px; bottom: 22px;
+      color: #d59a5c; font: 8px "Courier New", monospace;
+      text-shadow: 0 1px 3px #000; pointer-events: none;
+    }
+    body.maximized .compact-hint { display: none; }
+    body.compact .maplibregl-ctrl-bottom-right { display: none; }
+    #fallback::before {
+      content: ""; width: min(55vw, 55vh, 80%); max-width: 80%; max-height: 80%;
+      aspect-ratio: 1; border-radius: 50%;
+      background: radial-gradient(circle at 32% 28%, #9ddfff, #286c9f 28%, #0b3048 65%, #030a11);
+      border: 1px solid #7cc7ff; box-shadow: 0 0 38px #287cb766, inset -20px -10px 40px #000b;
+      animation: fallback-spin 20s linear infinite;
+    }
+    @keyframes fallback-spin { to { transform: rotate(360deg); } }
+    .toolbar, .route-panel, .status, .attribution {
+      position: absolute; z-index: 5; background: #05090ee8;
+      border: 1px solid #8a4f22; box-shadow: 0 2px 14px #0009;
+    }
+    .toolbar {
+      top: 10px; left: 10px; right: 10px; display: flex; flex-wrap: wrap;
+      gap: 5px; align-items: center; padding: 6px; border-radius: 5px;
+    }
+    button, input {
+      min-height: 28px; border: 1px solid #68421f; border-radius: 3px;
+      background: #0b1118; color: #ffdcb0; font: 700 11px "Segoe UI", sans-serif;
+    }
+    button { padding: 4px 9px; cursor: pointer; }
+    button:hover, button.active { border-color: #ff9224; color: #ffb456; background: #251508; }
+    .toolbar .grow { flex: 1; }
+    .toolbar .hint { color: #ad8058; font-size: 10px; padding: 0 4px; }
+    .route-panel {
+      display: none; top: 55px; left: 10px; width: min(390px, calc(100% - 20px));
+      padding: 9px; border-radius: 5px;
+    }
+    .route-panel.open { display: block; }
+    .route-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    input { width: 100%; padding: 4px 7px; font-weight: 400; }
+    .route-actions { display: flex; gap: 6px; margin-top: 7px; }
+    #route-result { margin-top: 8px; color: #ffe4c2; font-size: 11px; line-height: 1.5; }
+    #route-result:empty { display: none; }
+    .status {
+      left: 10px; bottom: 24px; max-width: calc(100% - 20px); padding: 5px 8px;
+      color: #c99a69; font-size: 10px; border-radius: 3px; pointer-events: none;
+    }
+    .attribution {
+      right: 4px; bottom: 3px; padding: 2px 5px; color: #c99a69;
+      font-size: 9px; border-radius: 3px; opacity: .9;
+    }
+    .attribution a { color: #ffdcb0; }
+    .maplibregl-popup-content {
+      max-width: 270px; padding: 10px 12px; color: #ffe4c2; background: #080d13f2;
+      border: 1px solid #ff9224; border-radius: 5px; font: 12px "Segoe UI", sans-serif;
+    }
+    .maplibregl-popup-tip { border-top-color: #ff9224 !important; }
+    .popup-title { margin-bottom: 5px; color: #ffb456; font-weight: 700; }
+    .maplibregl-ctrl-group { background: #080d13e8 !important; }
+    .maplibregl-ctrl-group button { background-color: transparent !important; }
+  </style>
+</head>
+<body class="compact">
+  <div id="map"></div>
+  <div id="fallback" aria-hidden="true"></div>
+  <div class="compact-hint">CLICK GLOBE OR SCROLL UP TO EXPAND</div>
+  <div class="toolbar">
+    <button class="mode active" data-mode="street">STREET</button>
+    <button class="mode" data-mode="satellite">SATELLITE</button>
+    <button class="mode" data-mode="terrain">TERRAIN</button>
+    <button class="mode" data-mode="air">AIR ROUTES</button>
+    <span class="grow"></span>
+    <button id="route-toggle">ROUTE FINDER</button>
+    <button id="zoom-in" aria-label="Zoom in">＋</button>
+    <button id="zoom-out" aria-label="Zoom out">−</button>
+  </div>
+  <div class="route-panel" id="route-panel">
+    <div class="route-inputs">
+      <input id="origin" autocomplete="off" placeholder="Origin">
+      <input id="destination" autocomplete="off" placeholder="Destination">
+    </div>
+    <div class="route-actions">
+      <button id="route-search">FIND ROUTE</button>
+      <button id="route-pick">PICK TWO PLACES</button>
+      <button id="route-clear">CLEAR</button>
+    </div>
+    <div id="route-result"></div>
+  </div>
+  <div class="status" id="status">Loading interactive globe…</div>
+  <div class="attribution" id="attribution"></div>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="vendor/maplibre-gl.js"></script>
+  <script>
+    (() => {
+      "use strict";
+      const byId = id => document.getElementById(id);
+      const status = byId("status");
+      const routePanel = byId("route-panel");
+      const resultBox = byId("route-result");
+      let bridge = null;
+      let requestSequence = 0;
+      const pendingRequests = new Map();
+      let map = null;
+      let currentMode = "street";
+      let activePopup = null;
+      let route = null;
+      let picking = false;
+      let picks = [];
+      let displayMode = null;
+      let expandedCamera = null;
+      let lastReverseRequest = 0;
+      let reverseQueue = Promise.resolve();
+
+      if (window.qt && window.QWebChannel) {
+        new QWebChannel(qt.webChannelTransport, channel => {
+          bridge = channel.objects.earthBridge;
+          bridge.requestCompleted.connect((requestId, rawResult) => {
+            const resolve = pendingRequests.get(requestId);
+            if (!resolve) return;
+            pendingRequests.delete(requestId);
+            try {
+              const result = JSON.parse(rawResult);
+              if (result.ok) {
+                resolve({
+                  ok: true,
+                  status: result.status,
+                  json: async () => JSON.parse(result.body)
+                });
+              } else {
+                resolve({
+                  ok: false,
+                  status: 0,
+                  json: async () => { throw new Error(result.error || "Earth data request failed."); }
+                });
+              }
+            } catch (error) {
+              resolve({
+                ok: false,
+                status: 0,
+                json: async () => { throw new Error(error.message || "Invalid Earth data response."); }
+              });
+            }
+          });
+        });
+      }
+
+      function requestJson(url) {
+        return new Promise((resolve, reject) => {
+          if (!bridge) {
+            reject(new Error("Earth data service is not connected."));
+            return;
+          }
+          const requestId = String(++requestSequence);
+          const timeoutId = setTimeout(() => {
+            pendingRequests.delete(requestId);
+            reject(new Error("Earth data request timed out. Check your internet connection."));
+          }, 15000);
+          pendingRequests.set(requestId, response => {
+            clearTimeout(timeoutId);
+            resolve(response);
+          });
+          bridge.requestJson(requestId, url);
+        });
+      }
+
+      const escapeHtml = value => String(value).replace(/[&<>"']/g, ch => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      })[ch]);
+      const setStatus = text => { status.textContent = text; };
+      const osmStyle = (mode) => {
+        const imagery = mode === "satellite";
+        const style = {
+          version: 8,
+          sources: {
+            base: {
+              type: "raster", tileSize: 256,
+              tiles: [imagery
+                ? "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                : "https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+              attribution: imagery
+                ? "Imagery © Esri, Maxar, Earthstar Geographics"
+                : "© OpenStreetMap contributors"
+            }
+          },
+          layers: [
+            { id: "background", type: "background", paint: { "background-color": "#03080e" } },
+            { id: "base", type: "raster", source: "base" }
+          ],
+          projection: { type: "globe" }
+        };
+        if (mode === "terrain") {
+          style.sources.dem = {
+            type: "raster-dem", tileSize: 256, encoding: "terrarium",
+            tiles: ["https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"],
+            attribution: "Elevation data © AWS Terrain Tiles"
+          };
+          style.layers.push({
+            id: "terrain-shading", type: "hillshade", source: "dem",
+            paint: { "hillshade-exaggeration": 0.35 }
+          });
+        }
+        return style;
+      };
+
+      const routeCoordinates = () => route && (
+        currentMode === "air"
+          ? [route.origin.coordinate, route.destination.coordinate]
+          : route.geometry && route.geometry.coordinates
+      );
+      function drawRoute() {
+        if (!map || !map.isStyleLoaded()) return;
+        const coordinates = routeCoordinates();
+        if (map.getLayer("aura-route")) map.removeLayer("aura-route");
+        if (map.getSource("aura-route")) map.removeSource("aura-route");
+        if (!coordinates || coordinates.length < 2) return;
+        const geometry = currentMode === "air"
+          ? airGeometry(route.origin.coordinate, route.destination.coordinate)
+          : route.geometry;
+        map.addSource("aura-route", {
+          type: "geojson",
+          data: { type: "Feature", geometry, properties: {} }
+        });
+        map.addLayer({
+          id: "aura-route", type: "line", source: "aura-route",
+          paint: { "line-color": "#ff9224", "line-width": 4, "line-opacity": 0.95,
+            "line-blur": 0.5 }
+        });
+      }
+
+      function setMode(mode) {
+        currentMode = mode;
+        document.querySelectorAll(".mode").forEach(button =>
+          button.classList.toggle("active", button.dataset.mode === mode));
+        if (!map) return;
+        map.setStyle(osmStyle(mode));
+        map.once("style.load", () => {
+          if (mode === "air") {
+            const base = map.getLayer("base");
+            if (base) map.setLayoutProperty("base", "visibility", "none");
+            map.setPaintProperty("background", "background-color", "#03080e");
+          }
+          drawRoute();
+        });
+        byId("attribution").innerHTML = mode === "satellite"
+          ? "Imagery © Esri, Maxar, Earthstar Geographics"
+          : mode === "terrain"
+            ? "© OpenStreetMap contributors · Elevation © AWS"
+            : "© OpenStreetMap contributors";
+        setStatus(mode === "air"
+          ? "Air-route view — plotted lines are estimates, not live flight tracking."
+          : "Map data is provided by open community services; an internet connection is required.");
+      }
+
+      function greatCircleKm(a, b) {
+        const rad = n => n * Math.PI / 180;
+        const dLat = rad(b[1] - a[1]), dLon = rad(b[0] - a[0]);
+        const h = Math.sin(dLat / 2) ** 2
+          + Math.cos(rad(a[1])) * Math.cos(rad(b[1])) * Math.sin(dLon / 2) ** 2;
+        return 6371.0088 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+      }
+
+      async function geocode(query) {
+        const coordinateMatch = query.trim().match(
+          /^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/
+        );
+        if (coordinateMatch) {
+          const latitude = Number(coordinateMatch[1]);
+          const longitude = Number(coordinateMatch[2]);
+          if (Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180) {
+            return { name: query.trim(), coordinate: [longitude, latitude] };
+          }
+        }
+        const url = "https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name="
+          + encodeURIComponent(query);
+        const response = await requestJson(url);
+        if (!response.ok) throw new Error("Place search failed (" + response.status + ").");
+        const payload = await response.json();
+        const place = payload.results && payload.results[0];
+        if (!place) throw new Error("Could not find “" + query + "”.");
+        return {
+          name: [place.name, place.admin1, place.country].filter(Boolean).join(", "),
+          coordinate: [place.longitude, place.latitude]
+        };
+      }
+
+      function airGeometry(from, to) {
+        return { type: "LineString", coordinates: [from, to] };
+      }
+
+      async function findRoute(originText, destinationText) {
+        const origin = byId("origin"), destination = byId("destination");
+        if (originText) origin.value = originText;
+        if (destinationText) destination.value = destinationText;
+        routePanel.classList.add("open");
+        const fromText = origin.value.trim(), toText = destination.value.trim();
+        if (!fromText || !toText) {
+          setStatus("Enter an origin and destination, or choose two places on the map.");
+          return;
+        }
+        resultBox.textContent = "Finding places and calculating route…";
+        try {
+          const [from, to] = await Promise.all([geocode(fromText), geocode(toText)]);
+          const directKm = greatCircleKm(from.coordinate, to.coordinate);
+          let roadKm = null;
+          let roadGeometry = airGeometry(from.coordinate, to.coordinate);
+          try {
+            const [a, b] = [from.coordinate, to.coordinate].map(pair => pair.join(","));
+            const r = await requestJson(
+              "https://router.project-osrm.org/route/v1/driving/" + a + ";" + b
+              + "?overview=full&geometries=geojson"
+            );
+            if (r.ok) {
+              const data = await r.json();
+              if (data.routes && data.routes[0]) {
+                roadKm = data.routes[0].distance / 1000;
+                roadGeometry = data.routes[0].geometry;
+              }
+            }
+          } catch (_) {
+            setStatus("Road routing is temporarily unavailable; showing estimated distances.");
+          }
+          route = {
+            origin: from, destination: to,
+            directKm, roadKm,
+            geometry: currentMode === "air"
+              ? airGeometry(from.coordinate, to.coordinate) : roadGeometry
+          };
+          drawRoute();
+          const mid = [
+            (from.coordinate[0] + to.coordinate[0]) / 2,
+            (from.coordinate[1] + to.coordinate[1]) / 2
+          ];
+          map.fitBounds([from.coordinate, to.coordinate], { padding: 80, maxZoom: 6 });
+          resultBox.innerHTML =
+            "<strong>" + escapeHtml(from.name) + " → " + escapeHtml(to.name) + "</strong><br>"
+            + "Great-circle: " + Math.round(directKm).toLocaleString() + " km<br>"
+            + (roadKm === null
+              ? "No connected road route returned by the public routing service.<br>"
+              : "Road route: " + Math.round(roadKm).toLocaleString() + " km<br>"
+                + "Car: ~" + Math.round(roadKm / 80) + " h · Bus: ~" + Math.round(roadKm / 65) + " h")
+            + (directKm < 1500 && roadKm !== null
+              ? " · Train (rough estimate): ~" + Math.round(directKm / 100) + " h" : "")
+            + (directKm >= 150 ? " · Flight (rough estimate): ~"
+              + Math.max(1, Math.round(directKm / 800 + 0.5)) + " h" : "")
+            + "<br><small>Travel times are broad estimates, not live schedules.</small>";
+          setStatus("Route plotted. Distances and travel times are estimates.");
+          return { from, to, directKm, roadKm, mid };
+        } catch (error) {
+          resultBox.textContent = error.message || "Could not calculate this route.";
+          setStatus(error.message || "Route lookup failed.");
+          return null;
+        }
+      }
+
+      async function showPlace(coordinate) {
+        if (activePopup) activePopup.remove();
+        const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: false, maxWidth: "270px" })
+          .setLngLat(coordinate)
+          .setHTML("<div class='popup-title'>Loading place information…</div><div>Fetching weather and location.</div>")
+          .addTo(map);
+        activePopup = popup;
+        try {
+          const [weather, place] = await Promise.all([
+            requestJson("https://api.open-meteo.com/v1/forecast?latitude=" + coordinate[1]
+              + "&longitude=" + coordinate[0] + "&current=temperature_2m,relative_humidity_2m,"
+              + "apparent_temperature,wind_speed_10m,weather_code&timezone=auto")
+              .then(response => {
+                if (!response.ok) throw new Error("Weather lookup is unavailable.");
+                return response.json();
+              }),
+            reverseLookup(coordinate).catch(() => ({}))
+          ]);
+          const address = place.address || {};
+          const title = place.name || address.city || address.town || address.state
+            || address.country || "Selected location";
+          let capital = "";
+          if (address["ISO3166-2-lvl4"] && address["ISO3166-2-lvl4"].startsWith("US-")) {
+            capital = "";
+          }
+          const countryCode = address.country_code;
+          if (countryCode) {
+            try {
+              const countryResponse = await requestJson(
+                "https://restcountries.com/v3.1/alpha/" + encodeURIComponent(countryCode)
+                  + "?fields=capital"
+              );
+              if (countryResponse.ok) {
+                const country = await countryResponse.json();
+                if (country.capital && country.capital[0]) capital = country.capital[0];
+              }
+            } catch (_) { /* Keep the location details available if capitals are offline. */ }
+          }
+          const stateCapital = address.state
+            ? await lookupStateCapital(coordinate, address.state) : null;
+          const current = weather.current || {};
+          const weatherNames = {
+            0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+            45: "Fog", 48: "Depositing rime fog", 51: "Light drizzle",
+            53: "Drizzle", 55: "Heavy drizzle", 61: "Light rain", 63: "Rain",
+            65: "Heavy rain", 71: "Light snow", 73: "Snow", 75: "Heavy snow",
+            80: "Rain showers", 81: "Rain showers", 82: "Heavy rain showers",
+            95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Thunderstorm with hail"
+          };
+          const lines = [
+            "<div class='popup-title'>" + escapeHtml(title) + "</div>",
+            escapeHtml(address.state || address.country || "Location"),
+            "Conditions: " + escapeHtml(weatherNames[current.weather_code] || "Current conditions"),
+            "Temperature: " + (current.temperature_2m ?? "—") + " °C",
+            "Feels like: " + (current.apparent_temperature ?? "—") + " °C",
+            "Wind: " + (current.wind_speed_10m ?? "—") + " km/h",
+            "Humidity: " + (current.relative_humidity_2m ?? "—") + "%"
+          ];
+          if (address.state) {
+            lines.push("State capital: " + escapeHtml(stateCapital || "unavailable"));
+          }
+          if (capital) lines.push("Country capital: " + escapeHtml(capital));
+          if (activePopup === popup) popup.setHTML(lines.join("<br>"));
+        } catch (error) {
+          if (activePopup === popup) {
+            popup.setHTML("<div class='popup-title'>Location information</div>"
+              + escapeHtml(error.message || "Weather data is temporarily unavailable."));
+          }
+        }
+      }
+
+      function reverseLookup(coordinate, zoom = 10) {
+        const task = reverseQueue.then(async () => {
+          const wait = Math.max(0, 1100 - (Date.now() - lastReverseRequest));
+          if (wait) await new Promise(resolve => setTimeout(resolve, wait));
+          lastReverseRequest = Date.now();
+          const response = await requestJson(
+            "https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=" + zoom
+            + (zoom === 5 ? "&extratags=1" : "")
+            + "&lat=" + coordinate[1] + "&lon=" + coordinate[0]
+          );
+          return response.ok ? response.json() : {};
+        });
+        reverseQueue = task.catch(() => {});
+        return task;
+      }
+
+      async function lookupStateCapital(coordinate, stateName) {
+        try {
+          const admin = await reverseLookup(coordinate, 5);
+          if (!admin.address || admin.address.state !== stateName) return null;
+          const stateId = admin.extratags && admin.extratags.wikidata;
+          if (!/^Q\d+$/.test(stateId || "")) return null;
+          const query = "https://www.wikidata.org/w/api.php?action=wbgetentities"
+            + "&ids=" + encodeURIComponent(stateId)
+            + "&props=claims&format=json&origin=*";
+          const stateResponse = await requestJson(query);
+          if (!stateResponse.ok) return null;
+          const stateData = await stateResponse.json();
+          const capitalId = stateData.entities?.[stateId]?.claims?.P36?.[0]
+            ?.mainsnak?.datavalue?.value?.id;
+          if (!capitalId) return null;
+          const labelQuery = "https://www.wikidata.org/w/api.php?action=wbgetentities"
+            + "&ids=" + encodeURIComponent(capitalId)
+            + "&props=labels&languages=en&format=json&origin=*";
+          const labelResponse = await requestJson(labelQuery);
+          if (!labelResponse.ok) return null;
+          const labelData = await labelResponse.json();
+          return labelData.entities?.[capitalId]?.labels?.en?.value || null;
+        } catch (error) {
+          console.warn("State capital lookup unavailable:", error);
+          return null;
+        }
+      }
+
+      function beginPicking() {
+        picking = true;
+        picks = [];
+        byId("route-pick").classList.add("active");
+        setStatus("Select the origin and destination on the globe.");
+      }
+
+      function resizeMap() {
+        if (!map) return;
+        requestAnimationFrame(() => map.resize());
+      }
+
+      function setDisplayMode(mode) {
+        document.body.className = mode;
+        if (!map) return;
+        if (mode === "compact") {
+          if (displayMode === "maximized" || displayMode === null) {
+            expandedCamera = {
+              center: map.getCenter(),
+              zoom: map.getZoom(),
+              bearing: map.getBearing(),
+              pitch: map.getPitch()
+            };
+          }
+          displayMode = "compact";
+          map.setMinZoom(0.15);
+          map.jumpTo({
+            center: expandedCamera.center,
+            zoom: Math.min(expandedCamera.zoom, 0.15),
+            bearing: 0,
+            pitch: 0
+          });
+        } else {
+          map.setMinZoom(0.8);
+          if (displayMode === "compact" && expandedCamera !== null) {
+            map.jumpTo(expandedCamera);
+          }
+          displayMode = "maximized";
+        }
+        resizeMap();
+      }
+
+      function addPickedPlace(coordinate) {
+        picks.push(coordinate);
+        if (picks.length === 1) {
+          byId("origin").value = coordinate[1].toFixed(4) + ", " + coordinate[0].toFixed(4);
+          setStatus("Origin selected — now choose the destination.");
+        } else {
+          byId("destination").value = coordinate[1].toFixed(4) + ", " + coordinate[0].toFixed(4);
+          picking = false;
+          byId("route-pick").classList.remove("active");
+          findRoute(byId("origin").value, byId("destination").value);
+        }
+      }
+
+      byId("route-toggle").addEventListener("click", () => routePanel.classList.toggle("open"));
+      byId("route-search").addEventListener("click", () => findRoute());
+      byId("route-pick").addEventListener("click", beginPicking);
+      byId("route-clear").addEventListener("click", () => {
+        route = null; picks = []; picking = false; resultBox.textContent = "";
+        byId("origin").value = ""; byId("destination").value = "";
+        byId("route-pick").classList.remove("active");
+        drawRoute();
+      });
+      byId("zoom-in").addEventListener("click", () => map && map.zoomIn());
+      byId("zoom-out").addEventListener("click", () => map && map.zoomOut());
+      document.querySelectorAll(".mode").forEach(button =>
+        button.addEventListener("click", () => setMode(button.dataset.mode)));
+      document.addEventListener("pointerdown", event => {
+        if (activePopup && !event.target.closest(".maplibregl-popup")
+            && !event.target.closest("#map")) {
+          activePopup.remove();
+          activePopup = null;
+        }
+      });
+
+      if (!window.maplibregl) {
+        byId("fallback").style.display = "grid";
+        setStatus("Map library unavailable. Check the bundled Earth files.");
+        return;
+      }
+      try {
+        map = new maplibregl.Map({
+          container: "map", style: osmStyle("street"),
+          center: [0, 18], zoom: 1.1, minZoom: 0.8, maxZoom: 17,
+          attributionControl: false, renderWorldCopies: false,
+          canvasContextAttributes: { antialias: false }
+        });
+        map.addControl(new maplibregl.NavigationControl({ showCompass: true }), "bottom-right");
+        map.on("load", () => {
+          if (map.setProjection) map.setProjection({ type: "globe" });
+          setStatus("Interactive globe ready. Click a place for weather and location details.");
+        });
+        map.on("style.load", drawRoute);
+        map.on("error", event => {
+          const message = event.error && event.error.message || "Unknown map error";
+          if (/webgl|context/i.test(message)) {
+            byId("fallback").style.display = "grid";
+            setStatus("WebGL is unavailable; showing the CPU-safe globe fallback.");
+          } else if (event.sourceId === "base" || event.sourceId === "dem") {
+            setStatus("Map tiles could not be fetched. Check the internet connection and retry.");
+            console.error("Earth map tile request failed:", message);
+          }
+        });
+        map.on("click", event => {
+          if (bridge) bridge.maximize();
+          if (picking) addPickedPlace([event.lngLat.lng, event.lngLat.lat]);
+          else showPlace([event.lngLat.lng, event.lngLat.lat]);
+        });
+      } catch (error) {
+        byId("fallback").style.display = "grid";
+        setStatus("Could not start the interactive map: " + (error.message || "WebGL unavailable"));
+      }
+
+      window.auraEarth = {
+        findRoute, setMode, resize: resizeMap, setDisplayMode,
+        maximize: () => bridge && bridge.maximize()
+      };
+      window.addEventListener("resize", resizeMap);
+    })();
+  </script>
+</body>
+</html>

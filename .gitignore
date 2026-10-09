@@ -73,7 +73,6 @@ memory/*.db
 
 # ── Downloaded assets and local backups ───────────────────────────────────────
 models/
->>>>>>> 3862f794595f0ef6994e6212b248a7cd70663a34
 bugs_backup.txt
 
 # ── Python build noise ────────────────────────────────────────────────────────

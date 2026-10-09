@@ -51,6 +51,13 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
+try:
+    from earth.earth_widget import EarthWidget
+    HAVE_EARTH = True
+except Exception as _e:  # noqa: BLE001 - never fatal
+    EarthWidget = None
+    HAVE_EARTH = False
+    print(f"[Earth] unavailable ({_e}) — the Earth's-eye widget will stay off.")
 from core.vosk_models import DEFAULT_VOSK_MODEL, VOSK_MODEL_OPTIONS
 
 def _base_dir() -> Path:
@@ -1615,6 +1622,9 @@ class _DragHeader(QWidget):
             base = p.mapFromGlobal(gp) if p is not None else gp
             t.move_clamped(base - self._off)
             t.user_moved = True
+            on_move = getattr(t, "on_move", None)
+            if callable(on_move):
+                on_move()
             ev.accept()
         else:
             super().mouseMoveEvent(ev)
@@ -4999,6 +5009,7 @@ class MainWindow(QMainWindow):
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
     _room_frame_sig = pyqtSignal(bytes)      # always-on room-watch preview frame
     _room_lost_sig  = pyqtSignal()           # room-watch camera missing / unplugged
+    _earth_command_sig = pyqtSignal(str, str, str)
     _face_cam_sig   = pyqtSignal(bool)       # first camera check: suitable camera present?
     _face_ready_sig = pyqtSignal(bool)       # face engine loaded (True) / unavailable (False)
     _face_evt_sig   = pyqtSignal(str, int, str)  # (kind, n, message) from the face worker
@@ -5180,12 +5191,24 @@ class MainWindow(QMainWindow):
         self._room_lock    = threading.Lock()
         self._room_quit    = threading.Event()
         self._room_thread  = None
+        self._earth_command_sig.connect(self._handle_earth_command)
         self._room_box = _RoomWatchBox(self.centralWidget())
         self._room_box.on_close = self._room_close
+        self._room_box.on_move = self._position_earth_box
+        if EarthWidget is not None:
+            self._earth_box = EarthWidget(self.centralWidget())
+            self._earth_box.on_close = self._earth_close
+            self._earth_box.show()
+            self._position_earth_box()
+        else:
+            self._earth_box = None
         self._room_frame_sig.connect(self._on_room_frame)
         self._room_lost_sig.connect(self._on_room_lost)
         sc_room = QShortcut(QKeySequence("F8"), self)
         sc_room.activated.connect(self._toggle_room_watch)
+        if EarthWidget is not None:
+            sc_earth = QShortcut(QKeySequence("F10"), self)
+            sc_earth.activated.connect(self._toggle_earth_widget)
 
         # Face unlock state. The gate holds the assistant back until the lock
         # (if one is active on this setup) has let the user in.
@@ -5479,11 +5502,17 @@ class MainWindow(QMainWindow):
             self._position_room_box()
             self._room_box.show()
             self._room_box.raise_()
+            if self._earth_box is not None and self._earth_box.isVisible():
+                self._position_earth_box()
         elif changed:
             self._position_room_box()
+            if self._earth_box is not None and self._earth_box.isVisible():
+                self._position_earth_box()
 
     def _on_room_lost(self) -> None:
         self._room_box.hide()
+        if self._earth_box is not None and self._earth_box.isVisible():
+            self._position_earth_box()
         if self._face_mode in ("prep", "lock", "enroll", "reenroll"):
             self._face_fail_open("camera lost")
 
@@ -5493,6 +5522,8 @@ class MainWindow(QMainWindow):
         self._room_live = False
         self._room_halt(0.0)
         self._room_box.hide()
+        if self._earth_box is not None and self._earth_box.isVisible():
+            self._position_earth_box()
         if self._cam_relay:
             self.stop_camera_stream()
 
@@ -5802,6 +5833,56 @@ class MainWindow(QMainWindow):
             # Top-right corner, just below the mic / stop / settings buttons
             # (the header is 54 px tall).
             b.move(max(0, cw.width() - b.width() - 16), 54 + 10)
+
+    def _earth_close(self) -> None:
+        b = getattr(self, "_earth_box", None)
+        if b is not None:
+            b.hide()
+
+    def _toggle_earth_widget(self) -> None:
+        b = getattr(self, "_earth_box", None)
+        if b is None:
+            return
+        if b.isVisible():
+            b.hide()
+        else:
+            b.show()
+            if b._maximized:
+                b.sync_parent_geometry()
+            else:
+                self._position_earth_box()
+            b.raise_()
+
+    def request_earth_command(self, command: str, origin: str = "",
+                              destination: str = "") -> None:
+        self._earth_command_sig.emit(command, origin, destination)
+
+    def _handle_earth_command(self, command: str, origin: str,
+                              destination: str) -> None:
+        b = getattr(self, "_earth_box", None)
+        if b is None:
+            self.write_log("SYS: Earth widget is unavailable.")
+            return
+        b.handle_command(command, origin, destination)
+        if command != "hide" and not b._maximized:
+            self._position_earth_box()
+        b.raise_()
+
+    def _position_earth_box(self) -> None:
+        b = getattr(self, "_earth_box", None)
+        cw = self.centralWidget()
+        if b is None or cw is None:
+            return
+        if b._maximized:
+            b.sync_parent_geometry()
+            return
+        if b.user_moved:
+            b.move_clamped(b.pos())
+        else:
+            room = getattr(self, "_room_box", None)
+            room_x = cw.width() - b.width() - 16 if room is None or not room.isVisible() else room.x()
+            room_y = 54 + 10 if room is None or not room.isVisible() else room.y() + room.height() + 8
+            b.move(max(0, room_x), max(0, room_y))
 
     def changeEvent(self, e):
         super().changeEvent(e)
@@ -6451,6 +6532,8 @@ class MainWindow(QMainWindow):
         # Room-watch box — top-right, below the header buttons
         if hasattr(self, '_room_box') and self._room_box.isVisible():
             self._position_room_box()
+        if hasattr(self, '_earth_box') and self._earth_box is not None and self._earth_box.isVisible():
+            self._position_earth_box()
         # Clipboard panel — bottom-center
         if hasattr(self, '_clipboard_panel') and self._clipboard_panel.isVisible():
             self._position_clipboard_panel()
@@ -6716,6 +6799,15 @@ class MainWindow(QMainWindow):
         fs_btn.setStyleSheet(_BTN_STYLE_DIM)
         fs_btn.clicked.connect(self._toggle_fullscreen)
         lay.addWidget(fs_btn)
+
+        if EarthWidget is not None:
+            earth_btn = QPushButton("◉  GOD'S EYE  [F10]")
+            earth_btn.setFixedHeight(26)
+            earth_btn.setFont(QFont("Courier New", 7))
+            earth_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            earth_btn.setStyleSheet(_BTN_STYLE_DIM)
+            earth_btn.clicked.connect(self._toggle_earth_widget)
+            lay.addWidget(earth_btn)
 
         sc_btn = QPushButton("⊞  CREATE DESKTOP SHORTCUT")
         sc_btn.setFixedHeight(26)
@@ -7997,6 +8089,14 @@ class _RootShim:
 
 class AuraUI:
     def __init__(self, face_path: str, size=None):
+        flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+        for flag in (
+            "--enable-webgl", "--enable-unsafe-swiftshader",
+            "--use-gl=angle", "--use-angle=swiftshader",
+        ):
+            if flag not in flags:
+                flags.append(flag)
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags)
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
@@ -8072,6 +8172,11 @@ class AuraUI:
     def hide_confirm(self) -> None:
         """Thread-safe: take the gate down."""
         self._win._confirm_hide_sig.emit()
+
+    def request_earth_command(self, command: str, origin: str = "",
+                              destination: str = "") -> None:
+        """Thread-safe Earth controls for action handlers running off the UI thread."""
+        self._win.request_earth_command(command, origin, destination)
 
     @property
     def get_plugins(self):
