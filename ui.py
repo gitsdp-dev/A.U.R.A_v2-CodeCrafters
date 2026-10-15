@@ -3838,6 +3838,7 @@ class PluginSettingsOverlay(QWidget):
     """
 
     _test_done = pyqtSignal(str, bool, str)   # namespace, ok, message
+    _action_progress = pyqtSignal(str, str)
     _OW = 460
 
     def __init__(self, sections: list[dict], parent=None):
@@ -3854,7 +3855,9 @@ class PluginSettingsOverlay(QWidget):
         self._widgets: dict[tuple, object] = {}    # (namespace, key) -> input widget
         self._types:   dict[tuple, str]    = {}     # (namespace, key) -> field type
         self._status_labels: dict[str, QLabel] = {} # namespace -> status QLabel
+        self._action_buttons: dict[str, list[QPushButton]] = {}
         self._test_done.connect(self._on_test_done)
+        self._action_progress.connect(self._on_action_progress)
 
         self._fs = (f"QLineEdit {{ background: {C.PANEL2}; color: {C.TEXT}; "
                     f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}"
@@ -3983,20 +3986,31 @@ class PluginSettingsOverlay(QWidget):
             form.addWidget(w)
 
         # optional test/connect action button + status line
+        actions = sec.get("actions")
+        if not isinstance(actions, list):
+            actions = []
         action = sec.get("action")
         if isinstance(action, dict) and callable(action.get("run")):
+            actions = [*actions, action]
+        if actions:
             form.addSpacing(2)
-            ab = QPushButton(str(action.get("label") or "TEST"))
-            ab.setFixedHeight(30)
-            ab.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-            ab.setCursor(Qt.CursorShape.PointingHandCursor)
-            ab.setStyleSheet(f"""
-                QPushButton {{ background: #1f0e00; color: {C.PRI};
-                    border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}
-                QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}
-            """)
-            ab.clicked.connect(lambda _=False, n=ns: self._run_action(n))
-            form.addWidget(ab)
+            for index, item in enumerate(actions):
+                if not isinstance(item, dict) or not callable(item.get("run")):
+                    continue
+                ab = QPushButton(str(item.get("label") or "ACTION"))
+                ab.setFixedHeight(30)
+                ab.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+                ab.setCursor(Qt.CursorShape.PointingHandCursor)
+                ab.setStyleSheet(f"""
+                    QPushButton {{ background: #1f0e00; color: {C.PRI};
+                        border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}
+                    QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}
+                """)
+                ab.clicked.connect(
+                    lambda _=False, n=ns, i=index: self._run_action(n, i)
+                )
+                form.addWidget(ab)
+                self._action_buttons.setdefault(ns, []).append(ab)
 
         status = self._lbl("", 8, color=C.TEXT_DIM)
         self._status_labels[ns] = status
@@ -4032,37 +4046,69 @@ class PluginSettingsOverlay(QWidget):
         return out
 
     def _save_ns(self, ns: str):
-        from memory.config_manager import save_plugin_config
-        save_plugin_config(ns, self._gather(ns))
+        values = self._gather(ns)
+        sec = next((s for s in self._sections
+                    if (s.get("namespace") or s.get("plugin")) == ns), None)
+        save_fn = (sec or {}).get("save")
+        if callable(save_fn):
+            save_fn(values)
+        else:
+            from memory.config_manager import save_plugin_config
+            save_plugin_config(ns, values)
 
     def _save_all(self):
         for sec in self._sections:
             ns = sec.get("namespace") or sec.get("plugin")
             if ns:
-                self._save_ns(ns)
                 lbl = self._status_labels.get(ns)
-                if lbl:
-                    lbl.setText("Saved ✓")
-                    lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+                try:
+                    self._save_ns(ns)
+                    if lbl:
+                        lbl.setText("Saved ✓")
+                        lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+                except Exception as e:
+                    if lbl:
+                        lbl.setText(f"Could not save settings: {e}")
+                        lbl.setStyleSheet("color: #ff6b6b; background: transparent;")
 
-    def _run_action(self, ns: str):
+    def _run_action(self, ns: str, action_index: int = 0):
         sec = next((s for s in self._sections
                     if (s.get("namespace") or s.get("plugin")) == ns), None)
         if not sec:
             return
-        run_fn = (sec.get("action") or {}).get("run")
+        actions = sec.get("actions")
+        if not isinstance(actions, list):
+            actions = []
+        legacy_action = sec.get("action")
+        if isinstance(legacy_action, dict) and callable(legacy_action.get("run")):
+            actions = [*actions, legacy_action]
+        action = actions[action_index] if 0 <= action_index < len(actions) else None
+        run_fn = (action or {}).get("run")
         if not callable(run_fn):
             return
-        self._save_ns(ns)                 # persist what the user typed before testing
-        values = self._gather(ns)
+        try:
+            self._save_ns(ns)
+            values = self._gather(ns)
+        except Exception as e:
+            self._on_test_done(ns, False, f"Could not save settings: {e}")
+            return
         lbl = self._status_labels.get(ns)
         if lbl:
-            lbl.setText("Testing…")
+            lbl.setText("Working…")
             lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        for button in self._action_buttons.get(ns, []):
+            button.setEnabled(False)
 
         def worker():
             try:
-                res = run_fn(values)
+                import inspect
+                if "progress" in inspect.signature(run_fn).parameters:
+                    res = run_fn(
+                        values,
+                        progress=lambda message: self._action_progress.emit(ns, str(message)),
+                    )
+                else:
+                    res = run_fn(values)
                 if isinstance(res, tuple) and len(res) == 2:
                     ok, msg = bool(res[0]), str(res[1])
                 else:
@@ -4074,12 +4120,20 @@ class PluginSettingsOverlay(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_test_done(self, ns: str, ok: bool, msg: str):
+        for button in self._action_buttons.get(ns, []):
+            button.setEnabled(True)
         lbl = self._status_labels.get(ns)
         if not lbl:
             return
         lbl.setText(msg)
         color = C.PRI if ok else "#ff6b6b"
         lbl.setStyleSheet(f"color: {color}; background: transparent;")
+
+    def _on_action_progress(self, ns: str, message: str):
+        lbl = self._status_labels.get(ns)
+        if lbl:
+            lbl.setText(message)
+            lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
 
 
 class ClipboardPanel(QWidget):
