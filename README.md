@@ -581,6 +581,51 @@ Local AI mode currently has several differences from Gemini Live:
 - Gemini remains available for screen and camera understanding.
 - Local tool calls are dispatched through A.U.R.A's existing tool executor and confirmation system.
 
+# Notifications
+
+A.U.R.A. can collect application notifications published through its local
+notification bus and, where permitted, desktop notifications. New items appear
+as in-window toasts below the draggable weather widget; notification history
+can be opened by saying **"AURA, show and read all notifications"** (or "show
+me all notifications", "read my notifications", or "any new notifications").
+Use **"stop"** or **"skip"** to interrupt an active local readout. Notifications
+can also be enabled or disabled in the notification-center panel.
+
+Notification text is stored in `memory/notifications.json`, scored and spoken
+locally. It is not sent to Gemini or another online service. OTP and
+verification-code text is withheld from speech by default; set
+`read_sensitive_notifications` to `true` in `config/api_keys.json` to allow it.
+The remaining settings in that file are `notifications_enabled`,
+`toast_timeout_seconds` (4.0-5.0 seconds), `max_visible_toasts`,
+`max_stored_notifications`, `app_priority_overrides`, and `blocked_apps`.
+Blocked apps are not captured or displayed.
+
+On Windows, A.U.R.A. first requests permission through WinRT
+`UserNotificationListener`. Unpackaged Python applications are commonly denied
+that permission; A.U.R.A. then attempts a read-only poll of the Windows
+notification database. On Linux, notification capture uses the D-Bus
+notification monitor and may be denied by the session bus policy. macOS system
+notification capture is not currently supported and may require Full Disk
+Access. Application notifications remain available on every platform.
+
+Plugins can publish local notifications without depending on the UI:
+
+```python
+from core.notifications.bus import notify
+
+notify("My plugin", "Task finished", "Your export is ready.", priority=60)
+```
+
+### Manual notification checks
+
+- Trigger a Windows desktop notification and check that its in-window toast is
+  aligned below the weather widget and fades after about 4.5 seconds.
+- Hover over a toast to pause/reset its timer; verify **Close** and **Maximize**.
+- Publish a notification with the plugin `notify()` helper and confirm it
+  appears in the toast stack.
+- Say **"AURA, show and read all notifications"** and check priority ordering.
+- Say **"stop"** during readout and confirm the local voice stops.
+
 ---
 
 # Testing

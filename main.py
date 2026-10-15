@@ -73,8 +73,10 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_input_device, get_output_device,
-    get_local_llm_config,
+    get_local_llm_config, get_notifications_config,
 )
+from core.notifications.intent import match_notification_intent
+from core.notifications.priority import LOW, priority_level, sort_notifications
 # Model ladder + quota fallback (core/gemini.py). Guarded so the assistant still
 # starts on the fixed LIVE_MODEL below if that module is not in this project.
 try:
@@ -606,6 +608,9 @@ class AuraLive:
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
+        self.ui.on_notification_read = self.read_notifications
+        self.ui.on_notification_stop = self.stop_notification_readout
+        self.ui.on_notification_skip = self.skip_notification
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
         self.ui.on_brain_change  = self._on_brain_change
@@ -617,6 +622,11 @@ class AuraLive:
         self._local_tts_init_task: asyncio.Task | None = None
         self._local_tts_failed = False
         self._gemini_local_voice_override = False
+        self._notification_stop = threading.Event()
+        self._notification_skip = threading.Event()
+        self._notification_read_lock = threading.Lock()
+        self._notification_thread: threading.Thread | None = None
+        self._notification_tts_engine = None
         self._gemini_mic_audio_confirmed = False
         self._local_turn_task: asyncio.Task | None = None
         self._local_turn_active = threading.Event()
@@ -890,6 +900,13 @@ class AuraLive:
     ):
         if self._local_brain is None:
             self.ui.write_log("SYS: Local brain is not ready.")
+            return
+        notification_intent = match_notification_intent(text)
+        if notification_intent and (
+            notification_intent not in {"stop", "skip"}
+            or self._notification_read_active()
+        ):
+            self.ui.handle_notification_command(notification_intent)
             return
         if not hasattr(self, "_local_turn_lock"):
             self._local_turn_lock = asyncio.Lock()
@@ -1209,6 +1226,10 @@ class AuraLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
+        intent = match_notification_intent(text)
+        if intent and (intent not in {"stop", "skip"} or self._notification_read_active()):
+            self.ui.handle_notification_command(intent)
+            return
         if not self._loop:
             return
         if self._local_mode_active and self._local_brain is not None:
@@ -1290,6 +1311,7 @@ class AuraLive:
 
     def interrupt(self) -> None:
         """Stop AURA mid-speech: drain queued audio and open mic immediately."""
+        self.stop_notification_readout()
         self._interrupted = True
         if self._local_turn_task and self._loop:
             self._loop.call_soon_threadsafe(self._local_turn_task.cancel)
@@ -1311,6 +1333,151 @@ class AuraLive:
         if self._turn_done_event:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
+
+    def _notification_read_active(self) -> bool:
+        thread = self._notification_thread
+        return thread is not None and thread.is_alive()
+
+    def read_notifications(self) -> None:
+        """Read unread history through a local Kokoro engine on a worker thread."""
+        with self._notification_read_lock:
+            if self._notification_read_active():
+                return
+            self._notification_stop.clear()
+            self._notification_skip.clear()
+            self._notification_thread = threading.Thread(
+                target=self._notification_read_worker,
+                daemon=True,
+                name="aura-notification-readout",
+            )
+            self._notification_thread.start()
+
+    def stop_notification_readout(self) -> None:
+        active = self._notification_read_active()
+        self._notification_stop.set()
+        self._notification_skip.clear()
+        if active:
+            threading.Thread(
+                target=self._stop_notification_playback,
+                daemon=True,
+                name="aura-stop-notification-audio",
+            ).start()
+        self.ui.set_notification_reading(None)
+
+    def skip_notification(self) -> None:
+        if not self._notification_read_active():
+            return
+        self._notification_skip.set()
+        threading.Thread(
+            target=self._stop_notification_playback,
+            daemon=True,
+            name="aura-skip-notification-audio",
+        ).start()
+
+    @staticmethod
+    def _stop_notification_playback() -> None:
+        try:
+            sd.stop()
+        except Exception as exc:
+            print(f"[Notifications] Could not stop speech playback: {exc}")
+
+    def _make_notification_tts(self):
+        """Create an offline Kokoro engine regardless of cloud TTS preferences."""
+        config = get_local_llm_config()
+        voice = config.get("tts_voice") or "bm_george"
+        if not re.fullmatch(
+            r"(?:af|am|bf|bm|jf|jm|zf|zm|ef|em|ff|hf|hm|if|im|pf|pm)_[a-z]+",
+            voice,
+            re.IGNORECASE,
+        ):
+            voice = "bm_george"
+        model_dir = Path(__file__).resolve().parent / "models"
+        quantized = model_dir / "kokoro-v1.0.int8.onnx"
+        model = quantized if quantized.is_file() else model_dir / "kokoro-v1.0.onnx"
+        voices = model_dir / "voices-v1.0.bin"
+        if model.is_file() and voices.is_file():
+            from core.tts import KokoroONNXTTSEngine
+            return KokoroONNXTTSEngine(
+                voice=voice,
+                lang="en-gb" if voice.lower().startswith("b") else "en-us",
+                model_path=str(model),
+                voices_path=str(voices),
+            )
+        from core.tts import KokoroTTSEngine
+        return KokoroTTSEngine(voice=voice)
+
+    @staticmethod
+    def _notification_speech(notification, config: dict, full: bool = False) -> str:
+        label = priority_level(notification.priority).title()
+        content = f"{notification.title}. {notification.body}".strip()
+        sensitive_allowed = config.get("read_sensitive_notifications", False)
+        code_terms = re.search(
+            r"\b(?:otp|verification(?: code)?|security(?: code)?|"
+            r"one[- ]time password|passcode|code)\b",
+            content,
+            re.IGNORECASE,
+        )
+        if not sensitive_allowed and code_terms and re.search(r"\d{3,}", content):
+            content = f"You have a verification code from {notification.app_name}."
+        elif not full and len(content) > 180:
+            content = content[:177].rsplit(" ", 1)[0] + "…"
+        return f"{label} priority, from {notification.app_name}: {content}"
+
+    def _speak_notification_text(self, engine, text: str) -> bool:
+        from core.tts import _play_np
+        output_device = audio_devices.resolve(get_output_device(), "output")
+
+        for samples in engine.audio_chunks(text):
+            if self._notification_stop.is_set() or self._notification_skip.is_set():
+                return False
+            _play_np(samples, 24_000, device=output_device)
+            if self._notification_stop.is_set() or self._notification_skip.is_set():
+                return False
+        return not self._notification_stop.is_set()
+
+    def _notification_read_worker(self) -> None:
+        try:
+            config = get_notifications_config()
+            store = self.ui.notification_store
+            items = sort_notifications(store.list(unread_only=True))
+            if not items:
+                self._notification_tts_engine = self._make_notification_tts()
+                self._speak_notification_text(
+                    self._notification_tts_engine, "You have no new notifications."
+                )
+                return
+            self._notification_tts_engine = self._make_notification_tts()
+            low_items = []
+            for notification in items:
+                if self._notification_stop.is_set():
+                    break
+                if notification.priority < 40:
+                    low_items.append(notification)
+                    continue
+                self.ui.set_notification_reading(notification.id)
+                sentence = self._notification_speech(
+                    notification, config, full=notification.priority >= 70
+                )
+                self._notification_skip.clear()
+                if self._speak_notification_text(self._notification_tts_engine, sentence):
+                    store.mark_read(notification.id)
+                    self.ui.mark_notification_read(notification.id)
+            if low_items and not self._notification_stop.is_set():
+                current = low_items[0]
+                self.ui.set_notification_reading(current.id)
+                sentence = self._notification_speech(current, config)
+                if len(low_items) > 1:
+                    sentence += f", and {len(low_items) - 1} other low-priority notifications."
+                self._notification_skip.clear()
+                if self._speak_notification_text(self._notification_tts_engine, sentence):
+                    for notification in low_items:
+                        store.mark_read(notification.id)
+                        self.ui.mark_notification_read(notification.id)
+        except Exception as exc:
+            self.ui.write_log(f"SYS: Local notification readout failed: {exc}")
+        finally:
+            self._notification_tts_engine = None
+            self.ui.set_notification_reading(None)
 
     def speak(self, text: str):
         if self._local_mode_active and self._local_brain is not None and self._loop:
@@ -1924,6 +2091,12 @@ class AuraLive:
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
+                                notification_intent = match_notification_intent(full_in)
+                                if (notification_intent in {"stop", "skip"}
+                                        and self._notification_read_active()):
+                                    self.ui.handle_notification_command(
+                                        notification_intent
+                                    )
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
