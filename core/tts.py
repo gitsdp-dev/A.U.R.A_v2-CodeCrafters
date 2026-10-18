@@ -79,11 +79,11 @@ def _compress_silence(
     return np.concatenate(out) if out else arr
 
 
-def _play_np(samples, sample_rate: int, device=None) -> None:
+def _play_np(samples, sample_rate: int) -> None:
     """Play float32 mono (or stereo) audio via sounddevice.
     Accepts numpy arrays or PyTorch tensors.
     """
-    sd.play(_to_numpy(samples), sample_rate, device=device)
+    sd.play(_to_numpy(samples), sample_rate)
     sd.wait()
 
 
