@@ -24,8 +24,8 @@ else:
 os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
 
 from PyQt6.QtCore import (
-    QEasingCurve, QEvent, QMimeData, QObject, QPoint, QPointF, QRectF, QSize, QSizeF, Qt, QThread,
-    QTimer, QUrl, pyqtSignal,
+    QEasingCurve, QEvent, QMimeData, QObject, QPoint, QPointF, QPropertyAnimation,
+    QRectF, QSize, QSizeF, Qt, QThread, QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QCursor, QDragEnterEvent, QDropEvent, QFont,
@@ -46,8 +46,9 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
 
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
+    QScrollArea, QSizePolicy, QSplitter,
     QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
@@ -59,6 +60,12 @@ except Exception as _e:  # noqa: BLE001 - never fatal
     HAVE_EARTH = False
     print(f"[Earth] unavailable ({_e}) — the Earth's-eye widget will stay off.")
 from core.vosk_models import DEFAULT_VOSK_MODEL, VOSK_MODEL_OPTIONS
+from core.notifications.center import NotificationCenter
+from core.notifications.models import Notification
+from core.notifications.priority import priority_level, sort_notifications
+from memory.config_manager import get_notifications_config, save_notifications_config
+from memory.config_manager import get_system_controls_config
+from core.system_controls import create_system_controls_manager
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -436,11 +443,8 @@ def _nvml_gpu_windows() -> float:
                     continue
 
         if _nvml_lib is None:
-            import pynvml  # type: ignore
-            pynvml.nvmlInit()
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            _nvml_ok = True
-            return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+            _nvml_ok = False
+            return -1.0
 
         dev = ctypes.c_void_p()
         _nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
@@ -555,15 +559,6 @@ class _SysMetrics:
             self.tmp = tmp
 
     def _get_gpu(self) -> float:
-        # pynvml — subprocess-free, works on all platforms if installed
-        try:
-            import pynvml  # type: ignore
-            pynvml.nvmlInit()
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
-        except Exception:
-            pass
-
         # Windows: nvml.dll via ctypes (already cached in _nvml_gpu_windows)
         if _OS == "Windows":
             v = _nvml_gpu_windows()
@@ -3838,6 +3833,7 @@ class PluginSettingsOverlay(QWidget):
     """
 
     _test_done = pyqtSignal(str, bool, str)   # namespace, ok, message
+    _action_progress = pyqtSignal(str, str)
     _OW = 460
 
     def __init__(self, sections: list[dict], parent=None):
@@ -3854,7 +3850,9 @@ class PluginSettingsOverlay(QWidget):
         self._widgets: dict[tuple, object] = {}    # (namespace, key) -> input widget
         self._types:   dict[tuple, str]    = {}     # (namespace, key) -> field type
         self._status_labels: dict[str, QLabel] = {} # namespace -> status QLabel
+        self._action_buttons: dict[str, list[QPushButton]] = {}
         self._test_done.connect(self._on_test_done)
+        self._action_progress.connect(self._on_action_progress)
 
         self._fs = (f"QLineEdit {{ background: {C.PANEL2}; color: {C.TEXT}; "
                     f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}"
@@ -3983,20 +3981,31 @@ class PluginSettingsOverlay(QWidget):
             form.addWidget(w)
 
         # optional test/connect action button + status line
+        actions = sec.get("actions")
+        if not isinstance(actions, list):
+            actions = []
         action = sec.get("action")
         if isinstance(action, dict) and callable(action.get("run")):
+            actions = [*actions, action]
+        if actions:
             form.addSpacing(2)
-            ab = QPushButton(str(action.get("label") or "TEST"))
-            ab.setFixedHeight(30)
-            ab.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-            ab.setCursor(Qt.CursorShape.PointingHandCursor)
-            ab.setStyleSheet(f"""
-                QPushButton {{ background: #1f0e00; color: {C.PRI};
-                    border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}
-                QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}
-            """)
-            ab.clicked.connect(lambda _=False, n=ns: self._run_action(n))
-            form.addWidget(ab)
+            for index, item in enumerate(actions):
+                if not isinstance(item, dict) or not callable(item.get("run")):
+                    continue
+                ab = QPushButton(str(item.get("label") or "ACTION"))
+                ab.setFixedHeight(30)
+                ab.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+                ab.setCursor(Qt.CursorShape.PointingHandCursor)
+                ab.setStyleSheet(f"""
+                    QPushButton {{ background: #1f0e00; color: {C.PRI};
+                        border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}
+                    QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}
+                """)
+                ab.clicked.connect(
+                    lambda _=False, n=ns, i=index: self._run_action(n, i)
+                )
+                form.addWidget(ab)
+                self._action_buttons.setdefault(ns, []).append(ab)
 
         status = self._lbl("", 8, color=C.TEXT_DIM)
         self._status_labels[ns] = status
@@ -4032,37 +4041,69 @@ class PluginSettingsOverlay(QWidget):
         return out
 
     def _save_ns(self, ns: str):
-        from memory.config_manager import save_plugin_config
-        save_plugin_config(ns, self._gather(ns))
+        values = self._gather(ns)
+        sec = next((s for s in self._sections
+                    if (s.get("namespace") or s.get("plugin")) == ns), None)
+        save_fn = (sec or {}).get("save")
+        if callable(save_fn):
+            save_fn(values)
+        else:
+            from memory.config_manager import save_plugin_config
+            save_plugin_config(ns, values)
 
     def _save_all(self):
         for sec in self._sections:
             ns = sec.get("namespace") or sec.get("plugin")
             if ns:
-                self._save_ns(ns)
                 lbl = self._status_labels.get(ns)
-                if lbl:
-                    lbl.setText("Saved ✓")
-                    lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+                try:
+                    self._save_ns(ns)
+                    if lbl:
+                        lbl.setText("Saved ✓")
+                        lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+                except Exception as e:
+                    if lbl:
+                        lbl.setText(f"Could not save settings: {e}")
+                        lbl.setStyleSheet("color: #ff6b6b; background: transparent;")
 
-    def _run_action(self, ns: str):
+    def _run_action(self, ns: str, action_index: int = 0):
         sec = next((s for s in self._sections
                     if (s.get("namespace") or s.get("plugin")) == ns), None)
         if not sec:
             return
-        run_fn = (sec.get("action") or {}).get("run")
+        actions = sec.get("actions")
+        if not isinstance(actions, list):
+            actions = []
+        legacy_action = sec.get("action")
+        if isinstance(legacy_action, dict) and callable(legacy_action.get("run")):
+            actions = [*actions, legacy_action]
+        action = actions[action_index] if 0 <= action_index < len(actions) else None
+        run_fn = (action or {}).get("run")
         if not callable(run_fn):
             return
-        self._save_ns(ns)                 # persist what the user typed before testing
-        values = self._gather(ns)
+        try:
+            self._save_ns(ns)
+            values = self._gather(ns)
+        except Exception as e:
+            self._on_test_done(ns, False, f"Could not save settings: {e}")
+            return
         lbl = self._status_labels.get(ns)
         if lbl:
-            lbl.setText("Testing…")
+            lbl.setText("Working…")
             lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        for button in self._action_buttons.get(ns, []):
+            button.setEnabled(False)
 
         def worker():
             try:
-                res = run_fn(values)
+                import inspect
+                if "progress" in inspect.signature(run_fn).parameters:
+                    res = run_fn(
+                        values,
+                        progress=lambda message: self._action_progress.emit(ns, str(message)),
+                    )
+                else:
+                    res = run_fn(values)
                 if isinstance(res, tuple) and len(res) == 2:
                     ok, msg = bool(res[0]), str(res[1])
                 else:
@@ -4074,12 +4115,20 @@ class PluginSettingsOverlay(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_test_done(self, ns: str, ok: bool, msg: str):
+        for button in self._action_buttons.get(ns, []):
+            button.setEnabled(True)
         lbl = self._status_labels.get(ns)
         if not lbl:
             return
         lbl.setText(msg)
         color = C.PRI if ok else "#ff6b6b"
         lbl.setStyleSheet(f"color: {color}; background: transparent;")
+
+    def _on_action_progress(self, ns: str, message: str):
+        lbl = self._status_labels.get(ns)
+        if lbl:
+            lbl.setText(message)
+            lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
 
 
 class ClipboardPanel(QWidget):
@@ -4253,6 +4302,7 @@ class WeatherWidget(_HudOverlay):
         self.setFixedWidth(self._W)
         self.user_moved = False         # True once the user has dragged it
         self.on_close   = None          # optional callable
+        self.on_move    = None          # optional geometry observer
         self._loc       = None          # cached {lat, lon, city, country}
         self._busy      = False
 
@@ -4341,6 +4391,8 @@ class WeatherWidget(_HudOverlay):
         x = max(0, min(pt.x(), max(0, p.width()  - self.width())))
         y = max(0, min(pt.y(), max(0, p.height() - self.height())))
         self.move(x, y)
+        if callable(self.on_move):
+            self.on_move()
 
     def reposition(self) -> None:
         """After a window resize: stay put if dragged (but clamped), else top-left."""
@@ -4418,6 +4470,460 @@ class WeatherWidget(_HudOverlay):
                 self._status_lbl.setStyleSheet(f"color: {C.RED}; background: transparent;")
         except Exception as e:
             print(f"[Weather] Display error: {e}")
+
+
+class NotificationToast(QFrame):
+    """Focusable-safe, self-dismissing in-window notification toast."""
+
+    def __init__(self, notification: Notification, timeout_seconds: float,
+                 on_close, on_maximize, parent=None):
+        super().__init__(parent)
+        self.notification = notification
+        self.timeout_seconds = timeout_seconds
+        self.on_close = on_close
+        self.on_maximize = on_maximize
+        self._hovered = False
+        self._fading = False
+        self.setFixedWidth(244)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        accent = _notification_color(notification.priority)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {C.DARK};
+                border: 1px solid {C.BORDER_B};
+                border-left: 3px solid {accent};
+                border-radius: 6px;
+            }}
+            QLabel {{ color: {C.TEXT}; background: transparent; border: none; }}
+            QPushButton {{
+                color: {C.TEXT_DIM}; background: transparent; border: none;
+                padding: 1px 4px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; }}
+        """)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(9, 6, 7, 7)
+        outer.setSpacing(3)
+        header = QHBoxLayout()
+        app = QLabel(f"{notification.app_name}  ·  {priority_level(notification.priority)}")
+        app.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        header.addWidget(app, stretch=1)
+        self._button("□", "Maximize notification", self._maximize, header)
+        self._button("×", "Dismiss toast", self._dismiss, header)
+        outer.addLayout(header)
+        title = QLabel(notification.title or "(No title)")
+        title.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        title.setWordWrap(True)
+        title.setMaximumHeight(34)
+        outer.addWidget(title)
+        body = QLabel(notification.body)
+        body.setFont(QFont("Courier New", 8))
+        body.setWordWrap(True)
+        body.setMaximumHeight(32)
+        outer.addWidget(body)
+        footer = QLabel(notification.timestamp.astimezone().strftime("%H:%M"))
+        footer.setFont(QFont("Courier New", 7))
+        footer.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        outer.addWidget(footer)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._fade_out)
+        self._timer.start(int(timeout_seconds * 1000))
+        self._opacity = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._opacity)
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.timeout.connect(self._resume_if_outside)
+        self._watch_hover(self)
+        self.adjustSize()
+
+    def _button(self, text: str, tip: str, slot, layout) -> None:
+        button = QPushButton(text)
+        button.setToolTip(tip)
+        button.setFixedSize(20, 18)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.clicked.connect(slot)
+        layout.addWidget(button)
+        self._watch_hover(button)
+
+    def _watch_hover(self, widget) -> None:
+        widget.installEventFilter(self)
+        for child in widget.findChildren(QWidget):
+            child.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Enter:
+            self._hovered = True
+            self._timer.stop()
+            self._hover_timer.stop()
+        elif event.type() == QEvent.Type.Leave:
+            self._hover_timer.start(80)
+        return super().eventFilter(watched, event)
+
+    def _resume_if_outside(self) -> None:
+        hovered = QApplication.widgetAt(QCursor.pos())
+        if hovered is self or (hovered is not None and self.isAncestorOf(hovered)):
+            return
+        self._hovered = False
+        if not self._fading:
+            self._timer.start(int(self.timeout_seconds * 1000))
+
+    def _maximize(self) -> None:
+        self._timer.stop()
+        self.on_maximize(self.notification)
+
+    def _dismiss(self) -> None:
+        self._timer.stop()
+        self.on_close(self.notification.id)
+
+    def restore(self) -> None:
+        self._fading = False
+        self._opacity.setOpacity(1.0)
+        self._timer.start(int(self.timeout_seconds * 1000))
+        self.show()
+
+    def _fade_out(self) -> None:
+        self._fading = True
+        animation = QPropertyAnimation(self._opacity, b"opacity", self)
+        animation.setDuration(220)
+        animation.setStartValue(1.0)
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.finished.connect(lambda: self.on_close(self.notification.id))
+        animation.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+
+def _notification_color(priority: int) -> str:
+    if priority >= 90:
+        return C.RED
+    if priority >= 70:
+        return "#ffb347"
+    if priority >= 40:
+        return C.PRI
+    return C.TEXT_DIM
+
+
+class NotificationDetailCard(QFrame):
+    """Expanded floating view of one notification."""
+
+    def __init__(self, notification: Notification, on_close, on_minimize, parent=None):
+        super().__init__(parent)
+        self.notification = notification
+        self.setFixedSize(430, 300)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        accent = _notification_color(notification.priority)
+        self.setStyleSheet(f"""
+            QFrame {{ background: {C.DARK}; border: 1px solid {accent}; border-radius: 7px; }}
+            QLabel {{ color: {C.TEXT}; background: transparent; border: none; }}
+            QPushButton {{ color: {C.TEXT_DIM}; background: transparent; border: none; }}
+            QPushButton:hover {{ color: {C.PRI}; }}
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(13, 10, 13, 12)
+        header = QHBoxLayout()
+        label = QLabel("NOTIFICATION DETAILS")
+        label.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        label.setStyleSheet(f"color: {accent}; background: transparent;")
+        header.addWidget(label)
+        header.addStretch()
+        minimize = QPushButton("−")
+        minimize.setToolTip("Minimize notification")
+        minimize.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        minimize.clicked.connect(on_minimize)
+        close = QPushButton("×")
+        close.setToolTip("Close notification")
+        close.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close.clicked.connect(on_close)
+        header.addWidget(minimize)
+        header.addWidget(close)
+        layout.addLayout(header)
+        for label_text, value in (
+            ("APP", notification.app_name),
+            ("SOURCE", notification.source.title()),
+            ("TITLE", notification.title or "(No title)"),
+            ("TIME", notification.timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S")),
+            ("PRIORITY", priority_level(notification.priority)),
+        ):
+            label = QLabel(f"{label_text}  {value}")
+            label.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            label.setWordWrap(True)
+            layout.addWidget(label)
+        body = QLabel(notification.body or "(No body)")
+        body.setFont(QFont("Courier New", 9))
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(body, stretch=1)
+
+
+class NotificationToastManager:
+    """Queue toasts and align them with the weather overlay."""
+
+    def __init__(self, parent, weather, timeout_seconds: float, max_visible: int):
+        self.parent = parent
+        self.weather = weather
+        self.timeout_seconds = timeout_seconds
+        self.max_visible = max_visible
+        self._queue: list[Notification] = []
+        self._visible: dict[str, NotificationToast] = {}
+        self._details: dict[str, NotificationDetailCard] = {}
+        self.on_dismiss = None
+
+    def enqueue(self, notification: Notification) -> None:
+        if notification.id in self._visible or notification.id in self._details:
+            return
+        if len(self._visible) >= self.max_visible:
+            self._queue.append(notification)
+            return
+        toast = NotificationToast(
+            notification, self.timeout_seconds,
+            self.dismiss, self.maximize, self.parent,
+        )
+        toast.move(
+            self.weather.x(),
+            self.weather.y() + self.weather.height() + 8,
+        )
+        self._visible = {notification.id: toast, **self._visible}
+        toast.show()
+        self.reposition()
+
+    def dismiss(self, notification_id: str) -> None:
+        toast = self._visible.pop(notification_id, None)
+        if toast is not None:
+            toast._timer.stop()
+            toast.hide()
+            toast.deleteLater()
+        card = self._details.pop(notification_id, None)
+        if card is not None:
+            card.hide()
+            card.deleteLater()
+        callback = self.on_dismiss
+        if callable(callback):
+            callback(notification_id)
+        self._show_queued()
+        self.reposition()
+
+    def maximize(self, notification: Notification) -> None:
+        toast = self._visible.get(notification.id)
+        if notification.id in self._details:
+            return
+        if toast is not None:
+            toast.hide()
+        card = NotificationDetailCard(
+            notification,
+            lambda: self.dismiss(notification.id),
+            lambda: self.minimize(notification.id),
+            self.parent,
+        )
+        self._details[notification.id] = card
+        self._position_detail(card)
+        card.show()
+        card.raise_()
+
+    def minimize(self, notification_id: str) -> None:
+        card = self._details.pop(notification_id, None)
+        toast = self._visible.get(notification_id)
+        if card is not None:
+            card.hide()
+            card.deleteLater()
+        if toast is not None:
+            toast.restore()
+        self.reposition()
+
+    def reposition(self) -> None:
+        x = self.weather.x()
+        y = self.weather.y() + self.weather.height() + 8
+        for notification_id, toast in self._visible.items():
+            if notification_id in self._details:
+                continue
+            target = QPoint(x, y)
+            if self.parent.isVisible() and toast.pos() != target:
+                previous = getattr(toast, "_position_animation", None)
+                if previous is not None:
+                    previous.stop()
+                animation = QPropertyAnimation(toast, b"pos", toast)
+                animation.setDuration(160)
+                animation.setStartValue(toast.pos())
+                animation.setEndValue(target)
+                animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+                toast._position_animation = animation
+                animation.finished.connect(
+                    lambda widget=toast: setattr(widget, "_position_animation", None)
+                )
+                animation.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+            else:
+                toast.move(target)
+            y += toast.height() + 7
+        for card in self._details.values():
+            self._position_detail(card)
+
+    def _position_detail(self, card: NotificationDetailCard) -> None:
+        x = min(max(0, self.weather.x()), max(0, self.parent.width() - card.width()))
+        y = self.weather.y() + self.weather.height() + 8
+        if y + card.height() > self.parent.height():
+            y = max(0, self.parent.height() - card.height() - 8)
+        card.move(x, y)
+
+    def _show_queued(self) -> None:
+        while self._queue and len(self._visible) < self.max_visible:
+            item = self._queue.pop(0)
+            self.enqueue(item)
+
+    def clear(self) -> None:
+        self._queue.clear()
+        for notification_id in set(self._visible) | set(self._details):
+            self.dismiss(notification_id)
+
+
+class _NotificationRow(QFrame):
+    def __init__(self, notification: Notification, on_close, on_maximize, parent=None):
+        super().__init__(parent)
+        self.notification = notification
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet(f"""
+            QFrame {{ background: {C.DARK}; border: 1px solid {C.BORDER}; border-radius: 5px; }}
+            QLabel {{ color: {C.TEXT}; background: transparent; border: none; }}
+            QPushButton {{ color: {C.TEXT_DIM}; background: transparent; border: none; }}
+            QPushButton:hover {{ color: {C.PRI}; }}
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        header = QHBoxLayout()
+        source = "SYSTEM" if notification.source == "system" else "APP"
+        badge = QLabel(f"{source}  ·  {notification.app_name}")
+        badge.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        header.addWidget(badge, stretch=1)
+        self._button("□", "Maximize", lambda: on_maximize(notification), header)
+        self._button("×", "Hide from this panel", lambda: on_close(self), header)
+        layout.addLayout(header)
+        title = QLabel(notification.title or "(No title)")
+        title.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        footer = QLabel(
+            f"{notification.timestamp.astimezone().strftime('%Y-%m-%d %H:%M')}  ·  "
+            f"{priority_level(notification.priority)}  ·  "
+            f"{'UNREAD' if not notification.read else 'READ'}"
+        )
+        footer.setFont(QFont("Courier New", 7))
+        footer.setStyleSheet(f"color: {_notification_color(notification.priority)}; "
+                             "background: transparent; border: none;")
+        layout.addWidget(footer)
+
+    @staticmethod
+    def _button(text: str, tip: str, slot, layout) -> None:
+        button = QPushButton(text)
+        button.setToolTip(tip)
+        button.setFixedSize(22, 18)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.clicked.connect(slot)
+        layout.addWidget(button)
+
+    def set_reading(self, active: bool) -> None:
+        color = _notification_color(self.notification.priority) if active else C.BORDER
+        self.setStyleSheet(f"""
+            QFrame {{ background: {C.DARK}; border: 1px solid {color}; border-radius: 5px; }}
+            QLabel {{ color: {C.TEXT}; background: transparent; border: none; }}
+            QPushButton {{ color: {C.TEXT_DIM}; background: transparent; border: none; }}
+        """)
+
+
+class NotificationListPanel(QFrame):
+    """Scrollable notification history with local enable/disable control."""
+
+    close_requested = pyqtSignal()
+
+    def __init__(self, center: NotificationCenter, on_toggle, on_maximize,
+                 on_clear=None, parent=None):
+        super().__init__(parent)
+        self.center = center
+        self.on_toggle = on_toggle
+        self.on_maximize = on_maximize
+        self.on_clear = on_clear
+        self._rows: dict[str, _NotificationRow] = {}
+        self.setObjectName("NotificationListPanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            QFrame#NotificationListPanel {{
+                background: {C.DARK}; border: 1px solid {C.BORDER_B}; border-radius: 7px;
+            }}
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 10)
+        header = QHBoxLayout()
+        title = QLabel("NOTIFICATION CENTER")
+        title.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        header.addWidget(title)
+        header.addStretch()
+        self.enabled = QCheckBox("Enabled")
+        self.enabled.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.enabled.setChecked(bool(center.config.get("notifications_enabled", True)))
+        self.enabled.toggled.connect(self.on_toggle)
+        header.addWidget(self.enabled)
+        layout.addLayout(header)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        layout.addWidget(self.scroll, stretch=1)
+        buttons = QHBoxLayout()
+        clear = QPushButton("CLEAR ALL")
+        clear.clicked.connect(self._clear)
+        close = QPushButton("CLOSE PANEL")
+        close.clicked.connect(self._close)
+        for button in (clear, close):
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; "
+                                 f"border: 1px solid {C.BORDER}; padding: 5px;")
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        self.refresh()
+
+    def refresh(self) -> None:
+        old = self.scroll.takeWidget()
+        if old is not None:
+            old.deleteLater()
+        self._rows.clear()
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        rows_layout = QVBoxLayout(content)
+        rows_layout.setContentsMargins(2, 2, 2, 2)
+        rows_layout.setSpacing(6)
+        items = sort_notifications(self.center.store.list())
+        for notification in items:
+            row = _NotificationRow(
+                notification,
+                lambda item: item.hide(),
+                self.on_maximize,
+                content,
+            )
+            rows_layout.addWidget(row)
+            self._rows[notification.id] = row
+        if not items:
+            empty = QLabel("No notifications yet.")
+            empty.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+            rows_layout.addWidget(empty)
+        rows_layout.addStretch()
+        self.scroll.setWidget(content)
+
+    def set_reading(self, notification_id: str | None) -> None:
+        for current_id, row in self._rows.items():
+            row.set_reading(current_id == notification_id)
+
+    def _clear(self) -> None:
+        self.center.store.clear()
+        if callable(self.on_clear):
+            self.on_clear()
+        self.refresh()
+
+    def _close(self) -> None:
+        self.hide()
+        self.close_requested.emit()
 
 
 class RemoteKeyOverlay(QWidget):
@@ -4990,6 +5496,34 @@ class MiniOrbWidget(QWidget):
         p.end()
 
 
+class SystemControlsIconButton(QPushButton):
+    """Small theme-aware line icon for the local system settings panel."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(30, 28)
+        self.setToolTip("System Controls")
+        self.setAccessibleName("Open System Controls")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet("QPushButton { background: transparent; border: none; }")
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor(C.PRI if self.underMouse() else C.TEXT_DIM)
+        pen = QPen(color, 1.5)
+        painter.setPen(pen)
+        painter.drawLine(7, 7, 23, 7)
+        painter.drawLine(7, 14, 23, 14)
+        painter.drawLine(7, 21, 23, 21)
+        painter.setBrush(QBrush(QColor(C.BG)))
+        painter.drawEllipse(QPointF(12, 7), 2.1, 2.1)
+        painter.drawEllipse(QPointF(19, 14), 2.1, 2.1)
+        painter.drawEllipse(QPointF(11, 21), 2.1, 2.1)
+        painter.end()
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -5013,10 +5547,25 @@ class MainWindow(QMainWindow):
     _face_cam_sig   = pyqtSignal(bool)       # first camera check: suitable camera present?
     _face_ready_sig = pyqtSignal(bool)       # face engine loaded (True) / unavailable (False)
     _face_evt_sig   = pyqtSignal(str, int, str)  # (kind, n, message) from the face worker
+    _notification_sig = pyqtSignal(object)
+    _notification_unavailable_sig = pyqtSignal(str)
+    _notification_reading_sig = pyqtSignal(str)
+    _notification_read_sig = pyqtSignal(str)
+    _notification_command_sig = pyqtSignal(str)
+    _system_panel_sig = pyqtSignal(str)
+    _system_state_sig = pyqtSignal(str, object)
 
     def __init__(self, face_path: str):
         super().__init__()
         self._face_path = face_path
+        self._system_controls_config = get_system_controls_config()
+        self.system_controls_manager = create_system_controls_manager(
+            self._system_controls_config
+        )
+        self._system_panel = None
+        self._system_state_unsubscribe = self.system_controls_manager.subscribe(
+            lambda control_id, state: self._system_state_sig.emit(control_id, state)
+        )
 
         # Load customization from config
         _cfg = _read_full_config()
@@ -5041,6 +5590,10 @@ class MainWindow(QMainWindow):
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop AURA mid-speech
+        self.on_notification_read = None
+        self.on_notification_stop = None
+        self.on_notification_skip = None
+        self.on_system_control_action = None
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self.on_brain_change   = None   # callable: () -> None — apply brain/provider settings
@@ -5241,6 +5794,38 @@ class MainWindow(QMainWindow):
         # Weather pop-up: draggable + closable, spawns top-left. F9 toggles it.
         self._weather_widget = WeatherWidget(self.centralWidget())
         self._weather_widget.open_widget()
+        self._notification_center = NotificationCenter()
+        self._notification_toasts = NotificationToastManager(
+            self.centralWidget(),
+            self._weather_widget,
+            get_notifications_config()["toast_timeout_seconds"],
+            get_notifications_config()["max_visible_toasts"],
+        )
+        self._notification_panel = NotificationListPanel(
+            self._notification_center,
+            self._toggle_notifications,
+            self._notification_toasts.maximize,
+            self._clear_notifications,
+            self.centralWidget(),
+        )
+        self._notification_panel.hide()
+        self._notification_panel.close_requested.connect(self._notification_panel_closed)
+        self._notification_warning_shown = False
+        self._notification_sig.connect(self._on_notification)
+        self._notification_unavailable_sig.connect(self._on_notification_unavailable)
+        self._notification_reading_sig.connect(self._set_notification_reading)
+        self._notification_read_sig.connect(self._mark_notification_read)
+        self._notification_command_sig.connect(self._run_notification_command)
+        self._system_panel_sig.connect(self._run_system_panel_command)
+        self._system_state_sig.connect(self._on_system_state_changed)
+        self._notification_center.subscribe(self._notification_sig.emit)
+        self._notification_center.listener.on_unavailable(
+            self._notification_unavailable_sig.emit
+        )
+        self._notification_toasts.on_dismiss = lambda _notification_id: None
+        self._weather_widget.on_move = self._notification_toasts.reposition
+        if get_notifications_config()["notifications_enabled"]:
+            self._notification_center.start()
         sc_weather = QShortcut(QKeySequence("F9"), self)
         sc_weather.activated.connect(self._toggle_weather_widget)
 
@@ -5822,6 +6407,127 @@ class MainWindow(QMainWindow):
         else:
             w.open_widget()
 
+    def _position_notification_panel(self) -> None:
+        panel = getattr(self, "_notification_panel", None)
+        weather = getattr(self, "_weather_widget", None)
+        cw = self.centralWidget()
+        if panel is None or weather is None or cw is None:
+            return
+        width = min(470, max(360, cw.width() - 24))
+        height = min(470, max(300, cw.height() - 24))
+        x = min(max(0, weather.x()), max(0, cw.width() - width))
+        y = weather.y() + weather.height() + 8
+        if y + height > cw.height():
+            y = max(0, cw.height() - height - 8)
+        panel.setGeometry(x, y, width, height)
+
+    def show_notifications_panel(self, read_aloud: bool = False) -> None:
+        """Show stored notification history and optionally begin local readout."""
+        if not get_notifications_config()["notifications_enabled"]:
+            self.write_log("SYS: Notifications are turned off.")
+            return
+        self._notification_panel.enabled.blockSignals(True)
+        self._notification_panel.enabled.setChecked(True)
+        self._notification_panel.enabled.blockSignals(False)
+        self._notification_panel.refresh()
+        self._position_notification_panel()
+        self._notification_panel.show()
+        self._notification_panel.raise_()
+        if read_aloud and callable(self.on_notification_read):
+            self.on_notification_read()
+
+    def handle_notification_command(self, action: str) -> str:
+        """Queue a local notification command on the Qt UI thread."""
+        self._notification_command_sig.emit(str(action or ""))
+        return "The local notification request was handled."
+
+    def _run_notification_command(self, action: str) -> None:
+        """Run notification UI operations after dispatch to the Qt thread."""
+        from core.notifications.intent import match_notification_intent
+
+        command = str(action or "").strip().casefold()
+        intent = match_notification_intent(command) or command
+        if intent in {"show_read", "read", "show"}:
+            self.show_notifications_panel(read_aloud=intent != "show")
+            return
+        if intent == "stop":
+            if callable(self.on_notification_stop):
+                self.on_notification_stop()
+            return
+        if intent == "skip":
+            if callable(self.on_notification_skip):
+                self.on_notification_skip()
+            return
+        if intent == "clear":
+            self._notification_center.store.clear()
+            self._clear_notifications()
+            self._notification_panel.refresh()
+            return
+        if intent in {"enable", "disable"}:
+            self._toggle_notifications(intent == "enable")
+            return
+        self.show_notifications_panel(read_aloud=False)
+
+    def _toggle_notifications(self, enabled: bool) -> None:
+        settings = save_notifications_config({"notifications_enabled": bool(enabled)})
+        self._notification_center.update_config(settings)
+        self._notification_toasts.timeout_seconds = settings["toast_timeout_seconds"]
+        self._notification_toasts.max_visible = settings["max_visible_toasts"]
+        if enabled:
+            self._notification_center.listener.start()
+        else:
+            self._notification_center.listener.stop()
+            self._clear_notifications()
+        self._notification_panel.refresh()
+
+    def _on_notification(self, notification: Notification) -> None:
+        if not self.isVisible() or self.isMinimized() or self._face_mode in _FACE_COVER:
+            return
+        self._notification_toasts.enqueue(notification)
+        if self._notification_panel.isVisible():
+            self._notification_panel.refresh()
+
+    def _on_notification_unavailable(self, reason: str) -> None:
+        if self._notification_warning_shown or not get_notifications_config()[
+            "notifications_enabled"
+        ]:
+            return
+        self._notification_warning_shown = True
+        self.write_log(f"SYS: {reason}")
+        self._notification_toasts.enqueue(Notification(
+            source="system",
+            app_name="A.U.R.A.",
+            title="System notification access unavailable",
+            body="App notifications still work.",
+            priority=30,
+            category="system",
+        ))
+
+    def set_notification_reading(self, notification_id: str | None) -> None:
+        self._notification_reading_sig.emit(notification_id or "")
+
+    def mark_notification_read(self, notification_id: str) -> None:
+        self._notification_read_sig.emit(notification_id)
+
+    def _set_notification_reading(self, notification_id: str) -> None:
+        self._notification_panel.set_reading(notification_id or None)
+
+    def _mark_notification_read(self, notification_id: str) -> None:
+        self._notification_center.store.mark_read(notification_id)
+        if self._notification_panel.isVisible():
+            current = notification_id
+            self._notification_panel.refresh()
+            self._notification_panel.set_reading(current)
+
+    def _notification_panel_closed(self) -> None:
+        if callable(self.on_notification_stop):
+            self.on_notification_stop()
+
+    def _clear_notifications(self) -> None:
+        if callable(self.on_notification_stop):
+            self.on_notification_stop()
+        self._notification_toasts.clear()
+
     def _position_room_box(self) -> None:
         b = getattr(self, "_room_box", None)
         cw = self.centralWidget()
@@ -5896,6 +6602,21 @@ class MainWindow(QMainWindow):
                     mini.hide_mini()
 
     def closeEvent(self, e):
+        try:
+            if callable(self.on_notification_stop):
+                self.on_notification_stop()
+            self._notification_toasts.clear()
+            self._notification_center.stop()
+        except Exception as exc:
+            print(f"[Notifications] Shutdown failed: {exc}")
+        try:
+            if self._system_panel is not None:
+                self._system_panel.close()
+            if self._system_state_unsubscribe:
+                self._system_state_unsubscribe()
+            self.system_controls_manager.close()
+        except Exception as exc:
+            print(f"[SystemControls] Shutdown failed: {exc}")
         try:
             self._mini_orb.hide_mini()
         except Exception:
@@ -6540,6 +7261,10 @@ class MainWindow(QMainWindow):
         # Weather widget — top-left by default, clamped inside if dragged
         if hasattr(self, '_weather_widget') and self._weather_widget.isVisible():
             self._weather_widget.reposition()
+        if hasattr(self, '_notification_toasts'):
+            self._notification_toasts.reposition()
+        if hasattr(self, '_notification_panel') and self._notification_panel.isVisible():
+            self._position_notification_panel()
         # Quick drawer — reposition if open
         if hasattr(self, '_quick_drawer') and self._quick_drawer.isVisible():
             self._position_quick_drawer()
@@ -6625,6 +7350,10 @@ class MainWindow(QMainWindow):
         self._interrupt_btn.clicked.connect(self._do_interrupt)
         lay.addWidget(self._interrupt_btn)
 
+        self._system_controls_btn = SystemControlsIconButton()
+        self._system_controls_btn.clicked.connect(lambda: self.show_system_controls())
+        lay.addWidget(self._system_controls_btn)
+
         # ── settings button (unchanged, just moved to the far right) ────────
         self._drawer_btn = QPushButton("⚙")
         self._drawer_btn.setFixedSize(26, 26)
@@ -6643,6 +7372,40 @@ class MainWindow(QMainWindow):
         self._drawer_btn.clicked.connect(self._toggle_drawer)
         lay.addWidget(self._drawer_btn)
         return w
+
+    def show_system_controls(self, page: str = "main") -> None:
+        self._system_panel_sig.emit(f"open:{page or 'main'}")
+
+    def close_system_controls(self) -> None:
+        self._system_panel_sig.emit("close")
+
+    def _run_system_panel_command(self, command: str) -> None:
+        if command == "close":
+            if self._system_panel is not None:
+                self._system_panel.close()
+            return
+        if not self._system_controls_config["system_controls_enabled"]:
+            self.write_log("SYS: System Controls are disabled in configuration.")
+            return
+        page = command.partition(":")[2] or "main"
+        if self._system_panel is None:
+            from dashboard.system_panel import SystemControlsPanel
+
+            self._system_panel = SystemControlsPanel(
+                self.system_controls_manager,
+                current_palette(),
+                self._system_controls_config["system_controls_refresh_seconds"],
+                self,
+            )
+        self._system_panel._show_page(page)
+        anchor = self._system_controls_btn.mapToGlobal(
+            QPoint(0, self._system_controls_btn.height())
+        )
+        self._system_panel.show_at(anchor)
+
+    def _on_system_state_changed(self, control_id: str, state) -> None:
+        if self._system_panel is not None:
+            self._system_panel.update_control_state(control_id, state)
 
     def _tick_clock(self):
         self._clock_lbl.setText(time.strftime("%H:%M:%S"))
@@ -8100,6 +8863,7 @@ class AuraUI:
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
+        self.on_system_control_action = None
         self._win.show()
         self.root = _RootShim(self._app)
 
@@ -8215,6 +8979,42 @@ class AuraUI:
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
+
+    @property
+    def notification_store(self):
+        """Thread-safe notification history used by the background readout."""
+        return self._win._notification_center.store
+
+    @property
+    def system_controls_manager(self):
+        """Shared UI-independent control manager for voice and panel operations."""
+        return self._win.system_controls_manager
+
+    def show_system_controls(self, page: str = "main") -> None:
+        """Open the local controls panel through the Qt thread bridge."""
+        self._win.show_system_controls(page)
+
+    def close_system_controls(self) -> None:
+        """Close the local controls panel through the Qt thread bridge."""
+        self._win.close_system_controls()
+
+    def handle_system_control_action(self, parameters: dict) -> str:
+        """Delegate Gemini system actions to the live voice/controller owner."""
+        if not callable(self.on_system_control_action):
+            return "System controls are unavailable."
+        return self.on_system_control_action(parameters)
+
+    def handle_notification_command(self, action: str) -> str:
+        """Queue a notification command for the Qt thread."""
+        return self._win.handle_notification_command(action)
+
+    def set_notification_reading(self, notification_id: str | None) -> None:
+        """Highlight the currently spoken item through the Qt signal bridge."""
+        self._win.set_notification_reading(notification_id)
+
+    def mark_notification_read(self, notification_id: str) -> None:
+        """Mark an item read through the Qt signal bridge."""
+        self._win.mark_notification_read(notification_id)
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
