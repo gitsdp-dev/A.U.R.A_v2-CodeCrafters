@@ -581,6 +581,144 @@ Local AI mode currently has several differences from Gemini Live:
 - Gemini remains available for screen and camera understanding.
 - Local tool calls are dispatched through A.U.R.A's existing tool executor and confirmation system.
 
+# Notifications
+
+A.U.R.A. can collect application notifications published through its local
+notification bus and, where permitted, desktop notifications. New items appear
+as in-window toasts below the draggable weather widget; notification history
+can be opened by saying **"AURA, show and read all notifications"** (or "show
+me all notifications", "read my notifications", or "any new notifications").
+Use **"stop"** or **"skip"** to interrupt an active local readout. Notifications
+can also be enabled or disabled in the notification-center panel.
+
+Notification text is stored in `memory/notifications.json`, scored and spoken
+locally. It is not sent to Gemini or another online service. OTP and
+verification-code text is withheld from speech by default; set
+`read_sensitive_notifications` to `true` in `config/api_keys.json` to allow it.
+The remaining settings in that file are `notifications_enabled`,
+`toast_timeout_seconds` (4.0-5.0 seconds), `max_visible_toasts`,
+`max_stored_notifications`, `app_priority_overrides`, and `blocked_apps`.
+Blocked apps are not captured or displayed.
+
+On Windows, A.U.R.A. first requests permission through WinRT
+`UserNotificationListener`. Unpackaged Python applications are commonly denied
+that permission; A.U.R.A. then attempts a read-only poll of the Windows
+notification database. On Linux, notification capture uses the D-Bus
+notification monitor and may be denied by the session bus policy. macOS system
+notification capture is not currently supported and may require Full Disk
+Access. Application notifications remain available on every platform.
+
+Plugins can publish local notifications without depending on the UI:
+
+```python
+from core.notifications.bus import notify
+
+notify("My plugin", "Task finished", "Your export is ready.", priority=60)
+```
+
+### Manual notification checks
+
+- Trigger a Windows desktop notification and check that its in-window toast is
+  aligned below the weather widget and fades after about 4.5 seconds.
+- Hover over a toast to pause/reset its timer; verify **Close** and **Maximize**.
+- Publish a notification with the plugin `notify()` helper and confirm it
+  appears in the toast stack.
+- Say **"AURA, show and read all notifications"** and check priority ordering.
+- Say **"stop"** during readout and confirm the local voice stops.
+
+---
+
+# System Controls
+
+The **System Controls** toolbar icon opens a local panel for volume and mute,
+brightness, Wi-Fi, airplane-mode radio handling, energy saver, Live Captions,
+Night light, accessibility features, and audio output devices. The UI shares
+A.U.R.A.'s existing palette and uses worker threads for operating-system calls.
+Every applied state is read back before A.U.R.A. reports success. Windows is
+the primary supported platform; other platforms show unavailable controls
+instead of pretending a change succeeded.
+
+Voice commands include:
+
+- "Open system settings", "open quick settings", "show system controls", and
+  "close system settings".
+- "Set volume to 50 percent", "volume 30", "mute", "unmute", and "increase
+  volume by 10".
+- "Set brightness to 50 percent", "brightness to minimum", and
+  "increase/decrease brightness".
+- "Turn Wi-Fi on/off", "list Wi-Fi networks", "connect to `<network>`",
+  "disconnect Wi-Fi", and "which Wi-Fi am I connected to".
+- "Turn airplane mode on/off", "turn energy saver on/off", and
+  "turn live captions on/off".
+- "Turn night light on/off", "set night light strength to 60 percent", and
+  accessibility requests such as "enable narrator", "enable sticky keys",
+  "enable high contrast", "enable mono audio", and "set text size to 150
+  percent".
+- "Switch audio output to `<device>`", "which speaker is being used", "what is
+  the volume", and "is night light on".
+
+Wi-Fi radio-off and airplane-mode-on requests require confirmation unless the
+command includes "confirm" or "force"; the panel always asks before making
+those changes. Wi-Fi passwords are entered only in the masked panel prompt,
+are not logged or saved by A.U.R.A., and Windows stores the resulting profile.
+System Controls does not require a paid service or cloud API. A.U.R.A.'s
+optional Gemini and other third-party AI integrations remain subject to their
+providers' terms and pricing; the Local AI configuration can be used without a
+Gemini key.
+Voice requests to change a system setting open A.U.R.A.'s System Controls
+panel and use the same verified controls as its tiles and sliders. If Windows
+denies an operation that can be retried with elevated permissions, A.U.R.A.
+starts elevated and requests UAC approval at launch when needed. The desktop
+shortcut and `python main.py` use the same startup check. If approval is
+cancelled, the application exits without running.
+
+Windows-specific notes:
+
+- Wi-Fi state is read from the Windows Radio API or the hardware/software
+  radio status reported by `netsh`. Radio toggling first tries the Windows
+  Radio API, then the named WLAN adapter; if Windows denies that operation,
+  the adapter command can be retried after per-operation UAC approval.
+- Airplane mode is approximated by saving and changing radio states because
+  Windows does not expose a public airplane-mode switch. The previous states
+  are held for the current app session.
+- Energy saver is configured through the current power plan's DC threshold.
+  It is unavailable on desktops without a battery; actual behavior depends on
+  the Windows build and power-plan policy.
+- Night light reads and updates Windows' native per-user CloudStore settings,
+  including its enabled state and intensity. Its registry format is
+  undocumented and may vary by Windows build; A.U.R.A. reports unsupported or
+  malformed formats instead of applying a display-only gamma-ramp imitation.
+- Output-device switching uses Windows' undocumented `IPolicyConfig` COM
+  interface. If that interface is unavailable or blocked, the switch is
+  reported as failed.
+- Brightness uses the installed display controller when available and falls
+  back to Windows WMI for displays exposing the native brightness interface.
+  Some desktops and external monitors do not expose adjustable brightness.
+  Volume uses the Windows master audio endpoint.
+- macOS and Linux controls are currently unavailable; the panel disables them
+  with a platform-support message.
+
+### Manual System Controls checklist
+
+- Toggle Wi-Fi, airplane mode, energy saver, Live Captions, and Night light;
+  compare each tile with the OS read-back. Confirm Wi-Fi-off and airplane-mode
+  confirmations can be accepted or cancelled.
+- Scan Wi-Fi networks; connect to a saved network and a new secured network;
+  verify the SSID, disconnect, and forget a saved profile. Ensure passwords
+  never appear in logs, notifications, or spoken responses.
+- Toggle every accessibility control and text size; verify the matching
+  Windows setting and try the More Settings links.
+- Switch the default audio output, change volume/mute and brightness, and
+  confirm displayed percentages match the OS afterwards.
+- Test every voice example above, including numeric words, status questions,
+  panel open/close, explicit confirmation, and verified spoken responses.
+- Check the top-right close button on the main panel and each submenu, Escape
+  behavior, keyboard focus, and panel placement within screen bounds near the
+  toolbar without covering weather or notifications.
+- Test denied/admin-only access, unsupported monitors, desktops without a
+  battery, missing Live Captions, and non-Windows platforms; verify each
+  failure remains visible and is never reported as success.
+
 ---
 
 # Testing

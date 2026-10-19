@@ -73,8 +73,11 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_input_device, get_output_device,
-    get_local_llm_config,
+    get_local_llm_config, get_notifications_config, get_system_controls_config,
 )
+from core.notifications.intent import match_notification_intent
+from core.system_controls.intent import match_system_control_intent
+from core.notifications.priority import LOW, priority_level, sort_notifications
 # Model ladder + quota fallback (core/gemini.py). Guarded so the assistant still
 # starts on the fixed LIVE_MODEL below if that module is not in this project.
 try:
@@ -604,8 +607,12 @@ class AuraLive:
         self.ui.on_push_to_talk   = self.set_push_to_talk
         self.ui.ptt_hold          = self._on_ptt
         self.ui.on_text_command   = self._on_text_command
+        self.ui.on_system_control_action = self.handle_system_control_action
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
+        self.ui.on_notification_read = self.read_notifications
+        self.ui.on_notification_stop = self.stop_notification_readout
+        self.ui.on_notification_skip = self.skip_notification
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
         self.ui.on_brain_change  = self._on_brain_change
@@ -617,12 +624,19 @@ class AuraLive:
         self._local_tts_init_task: asyncio.Task | None = None
         self._local_tts_failed = False
         self._gemini_local_voice_override = False
+        self._notification_stop = threading.Event()
+        self._notification_skip = threading.Event()
+        self._notification_read_lock = threading.Lock()
+        self._notification_thread: threading.Thread | None = None
+        self._notification_tts_engine = None
         self._gemini_mic_audio_confirmed = False
         self._local_turn_task: asyncio.Task | None = None
         self._local_turn_active = threading.Event()
         self._local_turn_started_at = 0.0
         self._local_first_audio_pending = False
         self._local_tts_timing_reported = False
+        self._pending_system_change = None
+        self._system_change_lock = threading.RLock()
 
         # ── Session resumption ─────────────────────────────────────────
         # The server issues a resumption handle every few seconds and reissues
@@ -890,6 +904,22 @@ class AuraLive:
     ):
         if self._local_brain is None:
             self.ui.write_log("SYS: Local brain is not ready.")
+            return
+        notification_intent = match_notification_intent(text)
+        if notification_intent and (
+            notification_intent not in {"stop", "skip"}
+            or self._notification_read_active()
+        ):
+            self.ui.handle_notification_command(notification_intent)
+            return
+        system_intent = match_system_control_intent(text)
+        if system_intent:
+            threading.Thread(
+                target=self._dispatch_system_intent,
+                args=(system_intent, text),
+                name="aura-system-voice",
+                daemon=True,
+            ).start()
             return
         if not hasattr(self, "_local_turn_lock"):
             self._local_turn_lock = asyncio.Lock()
@@ -1209,6 +1239,19 @@ class AuraLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
+        system_intent = match_system_control_intent(text)
+        if system_intent:
+            threading.Thread(
+                target=self._dispatch_system_intent,
+                args=(system_intent, text),
+                name="aura-system-voice",
+                daemon=True,
+            ).start()
+            return
+        intent = match_notification_intent(text)
+        if intent and (intent not in {"stop", "skip"} or self._notification_read_active()):
+            self.ui.handle_notification_command(intent)
+            return
         if not self._loop:
             return
         if self._local_mode_active and self._local_brain is not None:
@@ -1225,6 +1268,209 @@ class AuraLive:
             ),
             self._loop
         )
+
+    def handle_system_control_action(self, parameters: dict) -> str:
+        """Entry point used by the discovered Gemini action."""
+        args = dict(parameters or {})
+        if args.get("confirmed") is True:
+            with self._system_change_lock:
+                pending = self._pending_system_change
+                self._pending_system_change = None
+            if pending:
+                return self._dispatch_system_intent(
+                    pending[0], pending[1] + " confirm"
+                )
+        operation = str(args.get("operation") or "status").strip().casefold()
+        intent = {"operation": operation}
+        for key in (
+            "control_id", "page", "value", "confirmed", "device", "network",
+        ):
+            if key in args:
+                intent[key] = args[key]
+        if operation == "set":
+            intent["value"] = args.get(
+                "percentage", args.get("enabled", args.get("value"))
+            )
+        elif operation == "adjust":
+            intent["delta"] = args.get("delta", 10)
+        return self._dispatch_system_intent(intent, str(args.get("confirm_text") or ""))
+
+    def _dispatch_system_intent(self, intent: dict, source_text: str = "") -> str:
+        """Execute a parsed local request and confirm only verified OS state."""
+        operation = str(intent.get("operation") or "").casefold()
+        manager = self.ui.system_controls_manager
+        if operation == "open_panel":
+            self.ui.show_system_controls(str(intent.get("page") or "main"))
+            return "System Controls opened."
+        if operation == "close_panel":
+            self.ui.close_system_controls()
+            return "System Controls closed."
+        if not get_system_controls_config()["system_controls_enabled"]:
+            return "System Controls are disabled in configuration."
+        if operation == "confirm":
+            with self._system_change_lock:
+                pending = self._pending_system_change
+                self._pending_system_change = None
+            if not pending:
+                return "There is no system setting waiting for confirmation."
+            if not intent.get("confirmed"):
+                self._speak_system_confirmation("Cancelled. The setting was not changed.")
+                return "Cancelled."
+            return self._dispatch_system_intent(pending[0], pending[1] + " confirm")
+
+        control_id = str(intent.get("control_id") or "")
+        if control_id == "night_light_strength":
+            try:
+                current = manager.call("night_light", "get_state")
+                existing = current.value if current.available and isinstance(current.value, dict) else {}
+                intent["value"] = {
+                    "enabled": bool(existing.get("enabled", False)),
+                    "strength": min(100, max(0, int(intent.get("value", 50)))),
+                }
+                control_id = "night_light"
+            except Exception as exc:
+                result = str(exc)
+                self._speak_system_confirmation(result)
+                return result
+        if operation in {"wifi_scan", "wifi_connect", "wifi_disconnect", "wifi_forget"}:
+            try:
+                if operation == "wifi_scan":
+                    networks = manager.call("wifi", "scan_networks")
+                    names = [item.get("ssid", "") for item in networks if item.get("ssid")]
+                    result = "Available Wi-Fi networks: " + (", ".join(names[:12]) or "none found.")
+                elif operation == "wifi_connect":
+                    network = str(intent.get("network") or "")
+                    manager.call("wifi", "connect", network, None)
+                    state = manager.call("wifi", "get_state")
+                    result = (
+                        f"Connected to {state.value.get('ssid')}."
+                        if state.available and state.value.get("ssid", "").casefold() == network.casefold()
+                        else f"Wi-Fi did not verify a connection to {network}."
+                    )
+                elif operation == "wifi_disconnect":
+                    manager.call("wifi", "disconnect")
+                    state = manager.call("wifi", "get_state")
+                    result = "Wi-Fi disconnected." if state.available and not state.value.get("ssid") else "Wi-Fi disconnection could not be verified."
+                else:
+                    manager.call("wifi", "forget", str(intent.get("network") or ""))
+                    result = "Saved Wi-Fi profile removed."
+            except Exception as exc:
+                result = str(exc)
+            self._speak_system_confirmation(result)
+            return result
+
+        if operation == "output_switch":
+            control_id = "output_devices"
+            value = intent.get("device")
+            operation = "set"
+        if operation == "status":
+            if not control_id:
+                return "Choose a system setting to check."
+            try:
+                state = manager.call(control_id, "get_state")
+                result = self._describe_system_state(control_id, state)
+            except Exception as exc:
+                result = str(exc)
+            self._speak_system_confirmation(result)
+            return result
+
+        if operation == "adjust":
+            try:
+                current = manager.call(control_id, "get_state")
+                if not current.available or not isinstance(current.value, (int, float)):
+                    raise OSError(current.error or f"{control_id} is unavailable.")
+                maximum = 225 if control_id == "text_size" else 100
+                value = min(maximum, max(100 if control_id == "text_size" else 0,
+                                         int(current.value) + int(intent.get("delta", 0))))
+                intent["value"] = value
+                operation = "set"
+            except Exception as exc:
+                result = str(exc)
+                self._speak_system_confirmation(result)
+                return result
+
+        if operation != "set" or not control_id:
+            return "That system-controls request is not supported."
+        value = intent.get("value")
+        if isinstance(value, str):
+            lowered = value.strip().casefold()
+            if lowered in {"true", "on", "enabled", "yes"}:
+                value = True
+            elif lowered in {"false", "off", "disabled", "no"}:
+                value = False
+            elif lowered.endswith("%"):
+                value = lowered[:-1].strip()
+            try:
+                if isinstance(value, str):
+                    value = int(value)
+            except ValueError:
+                pass
+
+        confirmed = bool(intent.get("confirmed")) or any(
+            word in source_text.casefold().split() for word in ("confirm", "force")
+        )
+        dangerous = (control_id == "wifi" and value is False) or (
+            control_id == "airplane_mode" and value is True
+        )
+        if (
+            dangerous and get_system_controls_config()["confirm_network_disruption"]
+            and not confirmed
+        ):
+            with self._system_change_lock:
+                self._pending_system_change = (dict(intent), source_text)
+            result = "This will disconnect the internet. Do you want to continue? Say yes or no."
+            self._speak_system_confirmation(result)
+            return result
+
+        try:
+            self.ui.show_system_controls("main")
+            outcome = manager.set_state(control_id, value)
+            if outcome.success:
+                result = self._describe_system_state(control_id, outcome.new_state)
+            else:
+                result = outcome.error or outcome.new_state.error or f"{control_id} did not change."
+        except Exception as exc:
+            result = str(exc)
+        self._speak_system_confirmation(result)
+        return result
+
+    @staticmethod
+    def _describe_system_state(control_id: str, state) -> str:
+        if not state.available:
+            return state.error or f"{control_id.replace('_', ' ').title()} is unavailable."
+        label = control_id.replace("_", " ").title()
+        value = state.value
+        if control_id == "wifi" and isinstance(value, dict):
+            return (
+                f"Wi-Fi is {'on' if value.get('enabled') else 'off'}"
+                + (f", connected to {value['ssid']}." if value.get("ssid") else ".")
+            )
+        if control_id == "night_light" and isinstance(value, dict):
+            state = "on" if value.get("enabled") else "off"
+            return (
+                f"Windows Night light is {state}; intensity is "
+                f"{int(value.get('strength', 0))} percent."
+            )
+        if control_id == "output_devices" and isinstance(value, list):
+            selected = next((item.get("name") for item in value if item.get("default")), None)
+            return f"The current audio output is {selected}." if selected else "No default audio output was found."
+        if isinstance(value, bool):
+            return f"{label} is {'on' if value else 'off'}."
+        if isinstance(value, (int, float)):
+            suffix = " percent" if control_id in {"volume", "brightness", "text_size"} else ""
+            return f"{label} is {int(value)}{suffix}."
+        return f"{label}: {value}."
+
+    def _speak_system_confirmation(self, text: str) -> None:
+        """Speak a local setting result with the app's offline Kokoro engine."""
+        def worker():
+            try:
+                engine = self._make_notification_tts()
+                self._speak_notification_text(engine, str(text)[:240])
+            except Exception as exc:
+                self.ui.write_log(f"SYS: Offline system-control speech unavailable: {exc}")
+
+        threading.Thread(target=worker, name="aura-system-tts", daemon=True).start()
 
     def _tail_active(self) -> bool:
         """True while the speakers may still be finishing our last sentence."""
@@ -1290,6 +1536,7 @@ class AuraLive:
 
     def interrupt(self) -> None:
         """Stop AURA mid-speech: drain queued audio and open mic immediately."""
+        self.stop_notification_readout()
         self._interrupted = True
         if self._local_turn_task and self._loop:
             self._loop.call_soon_threadsafe(self._local_turn_task.cancel)
@@ -1311,6 +1558,151 @@ class AuraLive:
         if self._turn_done_event:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
+
+    def _notification_read_active(self) -> bool:
+        thread = self._notification_thread
+        return thread is not None and thread.is_alive()
+
+    def read_notifications(self) -> None:
+        """Read unread history through a local Kokoro engine on a worker thread."""
+        with self._notification_read_lock:
+            if self._notification_read_active():
+                return
+            self._notification_stop.clear()
+            self._notification_skip.clear()
+            self._notification_thread = threading.Thread(
+                target=self._notification_read_worker,
+                daemon=True,
+                name="aura-notification-readout",
+            )
+            self._notification_thread.start()
+
+    def stop_notification_readout(self) -> None:
+        active = self._notification_read_active()
+        self._notification_stop.set()
+        self._notification_skip.clear()
+        if active:
+            threading.Thread(
+                target=self._stop_notification_playback,
+                daemon=True,
+                name="aura-stop-notification-audio",
+            ).start()
+        self.ui.set_notification_reading(None)
+
+    def skip_notification(self) -> None:
+        if not self._notification_read_active():
+            return
+        self._notification_skip.set()
+        threading.Thread(
+            target=self._stop_notification_playback,
+            daemon=True,
+            name="aura-skip-notification-audio",
+        ).start()
+
+    @staticmethod
+    def _stop_notification_playback() -> None:
+        try:
+            sd.stop()
+        except Exception as exc:
+            print(f"[Notifications] Could not stop speech playback: {exc}")
+
+    def _make_notification_tts(self):
+        """Create an offline Kokoro engine regardless of cloud TTS preferences."""
+        config = get_local_llm_config()
+        voice = config.get("tts_voice") or "bm_george"
+        if not re.fullmatch(
+            r"(?:af|am|bf|bm|jf|jm|zf|zm|ef|em|ff|hf|hm|if|im|pf|pm)_[a-z]+",
+            voice,
+            re.IGNORECASE,
+        ):
+            voice = "bm_george"
+        model_dir = Path(__file__).resolve().parent / "models"
+        quantized = model_dir / "kokoro-v1.0.int8.onnx"
+        model = quantized if quantized.is_file() else model_dir / "kokoro-v1.0.onnx"
+        voices = model_dir / "voices-v1.0.bin"
+        if model.is_file() and voices.is_file():
+            from core.tts import KokoroONNXTTSEngine
+            return KokoroONNXTTSEngine(
+                voice=voice,
+                lang="en-gb" if voice.lower().startswith("b") else "en-us",
+                model_path=str(model),
+                voices_path=str(voices),
+            )
+        from core.tts import KokoroTTSEngine
+        return KokoroTTSEngine(voice=voice)
+
+    @staticmethod
+    def _notification_speech(notification, config: dict, full: bool = False) -> str:
+        label = priority_level(notification.priority).title()
+        content = f"{notification.title}. {notification.body}".strip()
+        sensitive_allowed = config.get("read_sensitive_notifications", False)
+        code_terms = re.search(
+            r"\b(?:otp|verification(?: code)?|security(?: code)?|"
+            r"one[- ]time password|passcode|code)\b",
+            content,
+            re.IGNORECASE,
+        )
+        if not sensitive_allowed and code_terms and re.search(r"\d{3,}", content):
+            content = f"You have a verification code from {notification.app_name}."
+        elif not full and len(content) > 180:
+            content = content[:177].rsplit(" ", 1)[0] + "…"
+        return f"{label} priority, from {notification.app_name}: {content}"
+
+    def _speak_notification_text(self, engine, text: str) -> bool:
+        from core.tts import _play_np
+        output_device = audio_devices.resolve(get_output_device(), "output")
+
+        for samples in engine.audio_chunks(text):
+            if self._notification_stop.is_set() or self._notification_skip.is_set():
+                return False
+            _play_np(samples, 24_000, device=output_device)
+            if self._notification_stop.is_set() or self._notification_skip.is_set():
+                return False
+        return not self._notification_stop.is_set()
+
+    def _notification_read_worker(self) -> None:
+        try:
+            config = get_notifications_config()
+            store = self.ui.notification_store
+            items = sort_notifications(store.list(unread_only=True))
+            if not items:
+                self._notification_tts_engine = self._make_notification_tts()
+                self._speak_notification_text(
+                    self._notification_tts_engine, "You have no new notifications."
+                )
+                return
+            self._notification_tts_engine = self._make_notification_tts()
+            low_items = []
+            for notification in items:
+                if self._notification_stop.is_set():
+                    break
+                if notification.priority < 40:
+                    low_items.append(notification)
+                    continue
+                self.ui.set_notification_reading(notification.id)
+                sentence = self._notification_speech(
+                    notification, config, full=notification.priority >= 70
+                )
+                self._notification_skip.clear()
+                if self._speak_notification_text(self._notification_tts_engine, sentence):
+                    store.mark_read(notification.id)
+                    self.ui.mark_notification_read(notification.id)
+            if low_items and not self._notification_stop.is_set():
+                current = low_items[0]
+                self.ui.set_notification_reading(current.id)
+                sentence = self._notification_speech(current, config)
+                if len(low_items) > 1:
+                    sentence += f", and {len(low_items) - 1} other low-priority notifications."
+                self._notification_skip.clear()
+                if self._speak_notification_text(self._notification_tts_engine, sentence):
+                    for notification in low_items:
+                        store.mark_read(notification.id)
+                        self.ui.mark_notification_read(notification.id)
+        except Exception as exc:
+            self.ui.write_log(f"SYS: Local notification readout failed: {exc}")
+        finally:
+            self._notification_tts_engine = None
+            self.ui.set_notification_reading(None)
 
     def speak(self, text: str):
         if self._local_mode_active and self._local_brain is not None and self._loop:
@@ -1924,6 +2316,24 @@ class AuraLive:
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
+                                notification_intent = match_notification_intent(full_in)
+                                if (notification_intent in {"stop", "skip"}
+                                        and self._notification_read_active()):
+                                    self.ui.handle_notification_command(
+                                        notification_intent
+                                    )
+                                confirmation_intent = match_system_control_intent(full_in)
+                                if (
+                                    confirmation_intent
+                                    and confirmation_intent.get("operation") == "confirm"
+                                    and self._pending_system_change is not None
+                                ):
+                                    threading.Thread(
+                                        target=self._dispatch_system_intent,
+                                        args=(confirmation_intent, full_in),
+                                        name="aura-system-confirmation",
+                                        daemon=True,
+                                    ).start()
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
@@ -2765,4 +3175,7 @@ def main():
     ui.root.mainloop()
 
 if __name__ == "__main__":
+    from core.startup import ensure_windows_administrator
+
+    ensure_windows_administrator()
     main()
