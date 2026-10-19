@@ -808,7 +808,7 @@ https://github.com/gitsdp-dev
 
 ### Instagram
 
-https://instagram.com/codecrafters_org_2011sdp
+https://instagram.com/codecrafters._org
 
 ---
 
