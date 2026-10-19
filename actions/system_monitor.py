@@ -1,4 +1,7 @@
-"""System Monitor — background metric checks with voice alert support."""
+"""
+System Monitor — background metric checks with voice alert support.
+Zero subprocess calls on all platforms — uses ctypes/pynvml/psutil/wmi only.
+"""
 import ctypes
 import platform
 import time
@@ -67,6 +70,15 @@ def _nvml_gpu() -> float:
 
 
 def _get_gpu_usage() -> float:
+    # pynvml — subprocess-free, works everywhere if installed
+    try:
+        import pynvml  # type: ignore
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+    except Exception:
+        pass
+
     return _nvml_gpu()
 
 

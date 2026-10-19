@@ -114,17 +114,13 @@ class PluginRegistry:
             if ns in seen:
                 continue
             seen.add(ns)
-            load_fn = rec.settings.get("load")
-            values = load_fn() if callable(load_fn) else get_plugin_config(ns)
             out.append({
                 "plugin":    rec.name,
                 "namespace": ns,
                 "title":     rec.settings.get("title") or rec.name,
                 "fields":    rec.settings.get("fields", []),
-                "values":    values,
+                "values":    get_plugin_config(ns),
                 "action":    rec.settings.get("action"),   # optional test/connect button
-                "actions":   rec.settings.get("actions", []),
-                "save":      rec.settings.get("save"),
             })
         return out
 

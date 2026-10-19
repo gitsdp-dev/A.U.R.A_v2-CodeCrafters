@@ -12,6 +12,7 @@
 # package, no OpenGL and no GPU. WebEngine is used only by the embedded Earth
 # map; its local page assets are bundled under earth/web.
 PyQt6>=6.6,<7
+PyQt6-WebChannel>=6.6,<7
 PyQt6-WebEngine>=6.6,<7
 sounddevice>=0.4,<1
 numpy>=1.24,<3
@@ -76,15 +77,10 @@ pycaw;      sys_platform == "win32"
 win10toast; sys_platform == "win32"
 pywin32;    sys_platform == "win32"
 wmi;        sys_platform == "win32"
-winsdk;     sys_platform == "win32"
-screen-brightness-control; sys_platform == "win32"
 # pywinauto drives the Windows accessibility tree. Three plugins read it:
 # screen_agent (to aim without a model call), the WhatsApp pair, and
 # game_updater (Steam's install dialog).
 pywinauto;  sys_platform == "win32"
-
-# ── Linux-only notification monitoring ───────────────────────────────────────
-dbus-next;  sys_platform == "linux"
 
 # ── Documents, media & hardware readouts ──────────────────────────────────────
 # Also try/except-guarded at the point of use. They are declared because a
@@ -95,7 +91,7 @@ ddgs>=9,<10                  # web_search — the maintained successor to
 pdfplumber                   # file_processor — PDF text and tables
 PyPDF2                       # file_processor — PDF fallback reader
 python-docx                  # file_processor — .docx reading
-# NVIDIA GPU metrics use the driver's NVML library directly through ctypes.
+pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
 
 # ── Optional: heavy extras, install only if you want the feature ──────────────
 # Left out on purpose — together they are several hundred megabytes, which is a

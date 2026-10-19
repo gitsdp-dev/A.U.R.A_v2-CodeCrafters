@@ -182,13 +182,12 @@ def _run_async(coro):
 
 
 async def _get_notifications():
-    from core.notifications.listener import _get_current_user_notification_listener
     from winsdk.windows.ui.notifications.management import (
         UserNotificationListener, UserNotificationListenerAccessStatus,
     )
     from winsdk.windows.ui.notifications import NotificationKinds
 
-    listener = _get_current_user_notification_listener(UserNotificationListener)
+    listener = UserNotificationListener.current
     status = await listener.request_access_async()
     status_name = str(getattr(status, "name", status)).upper()
 

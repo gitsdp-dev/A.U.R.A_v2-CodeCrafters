@@ -1,58 +1,44 @@
-# A.U.R.A local state and private assets
-# Keep source, tests, examples, and documentation trackable.
 
-# ── Credentials, tokens, and private keys ────────────────────────────────────
+# ── A.U.R.A v2 — local state and private assets that must not be committed ────
+# Keep source, tests, and other program features trackable; ignore credentials,
+# personal data, downloaded models, and machine-specific runtime files.
+
+# ── Secrets. Committing any of these publishes them. ──────────────────────────
+# API keys, biometric data, certificates/private keys, and linked sessions.
 **/api_keys.json
 **/api_key.json
 **/secrets.json
-**/secret*.json
-**/*token*.json
-**/*client_secret*.json
-**/*credentials*.json
-**/*credential*.json
-.env
-.env.*
-!.env.example
-!.env.*.example
-*.pem
-*.key
-*.ppk
-*.p12
-*.pfx
-*.p8
-*.jks
-id_rsa
-id_rsa.*
-id_ed25519
-id_ed25519.*
-
-# ── Personal identity, biometrics, and linked accounts ───────────────────────
+config/whatsapp_web/
 **/face_unlock.json
 **/face_unlock/
 **/face_data/
 **/face_id/
 **/face_embeddings/
 **/certs/
-config/certs/
-config/whatsapp_web/
-config/tg_avatars/
-config/tg_chats.json
-config/tg_chat_log.json
-config/mail_watch.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+# Google OAuth tokens and client secrets.
+**/token*.json
+**/client_secret*.json
+**/*credentials*.json
+.env
+.env.*
+!.env.example
+!.env.*.example
 
-# ── Personal assistant data and local backups ────────────────────────────────
+# ── Personal data the assistant accumulates about you ─────────────────────────
+# Memory stores may contain names, preferences, relationships, and session data.
 memory/*.json
 memory/*.db*
 memory/*.sqlite*
 memory/*.jsonl
 .aura-task.json
 workspace/
-bugs_backup.txt
-*.bak
-*.backup
-*.old
 
-# ── Downloaded models, user media, and generated output ──────────────────────
+# ── Downloaded assets and local backups ───────────────────────────────────────
 models/
 voice_models/
 tts_models/
@@ -60,12 +46,36 @@ stt_models/
 voice_samples/
 voiceprints/
 recordings/
-downloads/
-screenshots/
-logs/
-*.log
 
-# ── Python build noise ───────────────────────────────────────────────────────
+# ── A.U.R.A v2 (Local Ai Integration) — what never belongs in the repository ──────────────────────────
+# Everything listed here is created by the app on first run. A fresh clone with
+# none of it present boots straight to the setup screen, which is the intended
+# first experience — so nothing here needs to be committed, and some of it must
+# never be.
+
+# ── Secrets. Committing any of these publishes them. ──────────────────────────
+# API keys, biometric data, certificates/private keys, and linked sessions.
+config/api_keys.json
+config/face_unlock.json
+config/face_unlock/
+config/certs/
+config/whatsapp_web/
+# Google OAuth tokens and client secrets.
+**/token*.json
+**/client_secret*.json
+*credentials*.json
+.env
+.env.*
+
+# ── Personal data the assistant accumulates about you ─────────────────────────
+memory/long_term.json
+memory/*.db
+
+# ── Downloaded assets and local backups ───────────────────────────────────────
+models/
+bugs_backup.txt
+
+# ── Python build noise ────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -75,16 +85,22 @@ dist/
 *.egg-info/
 .eggs/
 
-# ── Virtual environments ─────────────────────────────────────────────────────
+# ── Virtual environments ──────────────────────────────────────────────────────
 .venv/
 venv/
 env/
 ENV/
 
-# ── Editors and operating systems ────────────────────────────────────────────
+# ── Editors and operating systems ─────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ── Runtime output ────────────────────────────────────────────────────────────
+*.log
+logs/
+downloads/
+screenshots/
