@@ -858,24 +858,24 @@ class UpdateDialog(_ThemedDialog):
 class UpToDateDialog(_ThemedDialog):
     """Friendly confirmation shown when the installed version is the latest."""
 
-    def __init__(self, version_str: str, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent, 400, "A.U.R.A  ·  UPDATER")
+    def __init__(self, version_str: str = "", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent, 440, "A.U.R.A  ·  UPDATER")
         t, lay = self.t, self.content
         lay.setContentsMargins(28, 4, 28, 24)
 
         lay.addWidget(_IconBadge("ok", t.ok, 64), 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addSpacing(16)
-        title = _label("You're all caught up", 21, t.text, QFont.Weight.DemiBold)
+        title = _label("No Latest Updates remaining Till now", 20, t.text, QFont.Weight.DemiBold, wrap=True)
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(title)
-        lay.addSpacing(6)
-        msg = _label(f"A.U.R.A {version_str} is the newest version.\nNothing to install right now.",
+        lay.addSpacing(8)
+        msg = _label("You are Up To Date. Feel Free to Continue",
                      13, t.med, wrap=True)
         msg.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(msg)
         lay.addSpacing(22)
 
-        ok = self._btn("Great", "primary", 140)
+        ok = self._btn("Continue", "primary", 140)
         ok.setDefault(True)
         ok.clicked.connect(self.accept)
         row = QHBoxLayout()
@@ -1010,7 +1010,12 @@ class UpdaterController(QObject):
         local_str = str(local_ver) if local_ver is not None \
             else "Unknown / modified (based on v2.0.0+)"
 
-        needs_update = not code_matches
+        version_matches = (
+            local_ver is not None
+            and latest_ver is not None
+            and local_ver >= latest_ver
+        )
+        needs_update = not (version_matches or code_matches)
 
         if not needs_update:
             clear_updater_badge()

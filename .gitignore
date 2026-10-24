@@ -4,16 +4,27 @@
 # ── Credentials, tokens, and private keys ────────────────────────────────────
 **/api_keys.json
 **/api_key.json
+**/*api-key*
+**/*api_key*
+**/*apikey*
 **/secrets.json
 **/secret*.json
+**/*secret*
 **/*token*.json
 **/*client_secret*.json
 **/*credentials*.json
 **/*credential*.json
+**/*auth*.json
+**/*oauth*.json
 .env
 .env.*
 !.env.example
 !.env.*.example
+*.env
+*.secret
+*.secrets
+*.token
+*.credentials
 *.pem
 *.key
 *.ppk
@@ -25,6 +36,7 @@ id_rsa
 id_rsa.*
 id_ed25519
 id_ed25519.*
+*.pub
 
 # ── Personal identity, biometrics, and linked accounts ───────────────────────
 **/face_unlock.json
@@ -39,18 +51,39 @@ config/tg_avatars/
 config/tg_chats.json
 config/tg_chat_log.json
 config/mail_watch.json
+**/cookies.json
+**/session.json
+**/sessions.json
+**/browser_data/
+**/user_data/
+**/personal/
+**/private/
+**/*personal*
+**/*private*
+**/*contacts*
+**/*address*
 
 # ── Personal assistant data and local backups ────────────────────────────────
 memory/*.json
+memory/backups/
+memory/*.corrupt-*
 memory/*.db*
 memory/*.sqlite*
 memory/*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
 .aura-task.json
 workspace/
 bugs_backup.txt
 *.bak
 *.backup
 *.old
+*.tmp
+*.temp
+*.swp
+*.swo
 
 # ── Downloaded models, user media, and generated output ──────────────────────
 models/
@@ -64,6 +97,19 @@ downloads/
 screenshots/
 logs/
 *.log
+*.wav
+*.mp3
+*.mp4
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.pdf
 
 # ── Python build noise ───────────────────────────────────────────────────────
 __pycache__/
