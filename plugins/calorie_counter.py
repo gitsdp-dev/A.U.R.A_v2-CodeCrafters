@@ -19,7 +19,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from core.camera import open_camera
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -68,7 +67,18 @@ def _config() -> dict:
 def _open_camera():
     index = int(_config().get("camera_index", 0))
     indices = tuple(dict.fromkeys((index, 0, 1, 2, 3, 4, 5)))
-    return open_camera(cv2, indices, warmup=6)
+    for camera_index in indices:
+        cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        for _ in range(6):
+            cap.read()
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            return cap
+        cap.release()
+    return None
 
 
 # ── scan-bar rendering ───────────────────────────────────────────────────────

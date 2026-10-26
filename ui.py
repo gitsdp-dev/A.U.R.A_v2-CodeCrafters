@@ -5952,7 +5952,6 @@ class MainWindow(QMainWindow):
     def _cam_loop(self) -> None:
         try:
             import cv2
-            from core.camera import open_camera
             # Reuse camera index detected by screen_processor (cached in api_keys.json)
             cam_idx = 0
             try:
@@ -5962,15 +5961,24 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             indices = tuple(dict.fromkeys((cam_idx, 0, 1, 2, 3, 4, 5)))
-            cap = open_camera(cv2, indices, warmup=5)
-            if cap is None:
-                return
-            while not self._cam_stop.wait(0.033) and cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
-                    self._cam_frame_sig.emit(buf.tobytes())
-            cap.release()
+            cap = None
+            for camera_index in indices:
+                candidate = cv2.VideoCapture(camera_index)
+                if candidate.isOpened():
+                    for _ in range(5):
+                        candidate.read()
+                    cap = candidate
+                    break
+                candidate.release()
+            if cap is not None:
+                try:
+                    while not self._cam_stop.wait(0.033) and cap.isOpened():
+                        ret, frame = cap.read()
+                        if ret and frame is not None:
+                            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                            self._cam_frame_sig.emit(buf.tobytes())
+                finally:
+                    cap.release()
         except Exception as e:
             print(f"[Camera] Stream error: {e}")
         finally:
@@ -6026,8 +6034,6 @@ class MainWindow(QMainWindow):
 
     def _room_open(self, cv2):
         """Open the setup camera (configured index first, then 0). None if absent."""
-        from core.camera import open_camera
-
         idxs = []
         try:
             idxs.append(int(_read_full_config().get("camera_index", 0)))
@@ -6036,7 +6042,29 @@ class MainWindow(QMainWindow):
         for i in range(6):
             if i not in idxs:
                 idxs.append(i)
-        return open_camera(cv2, tuple(idxs), warmup=0)
+        if _OS == "Windows":
+            backends = tuple(
+                backend for backend in (
+                    getattr(cv2, "CAP_DSHOW", None),
+                    getattr(cv2, "CAP_MSMF", None),
+                    getattr(cv2, "CAP_ANY", None),
+                ) if backend is not None
+            )
+        elif _OS == "Darwin":
+            backends = (getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY), cv2.CAP_ANY)
+        else:
+            backends = (getattr(cv2, "CAP_V4L2", cv2.CAP_ANY), cv2.CAP_ANY)
+        for camera_index in idxs:
+            for backend in backends:
+                cap = cv2.VideoCapture(camera_index, backend)
+                if not cap.isOpened():
+                    cap.release()
+                    continue
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    return cap
+                cap.release()
+        return None
 
     def _room_loop(self, quit_ev: threading.Event) -> None:
         try:

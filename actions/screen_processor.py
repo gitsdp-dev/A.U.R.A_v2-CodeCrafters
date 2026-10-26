@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from core.camera import open_camera
 
 try:
     import cv2
@@ -104,9 +103,12 @@ def _probe_camera(index: int, warmup: int = 5) -> bool:
 
     if not _CV2:
         return False
-    cap = open_camera(cv2, (index,), warmup)
-    if cap is None:
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        cap.release()
         return False
+    for _ in range(warmup):
+        cap.read()
     ret, frame = cap.read()
     cap.release()
     if not ret or frame is None:
@@ -141,9 +143,13 @@ def _capture_camera() -> tuple[bytes, str]:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 
     index   = _get_camera_index()
-    cap = open_camera(cv2, (index,), warmup=10)
-    if cap is None:
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        cap.release()
         raise RuntimeError(f"Camera index {index} could not be opened.")
+
+    for _ in range(10):
+        cap.read()
 
     ret, frame = cap.read()
     cap.release()

@@ -167,7 +167,20 @@ def _open_input_stream(callback, device=None):
         try:
             extra_settings = None
             if platform.system() == "Windows" and hasattr(sd, "WasapiSettings"):
-                extra_settings = sd.WasapiSettings()
+                # Host-specific settings cannot be passed to a different
+                # PortAudio backend. The device picker commonly selects
+                # DirectSound, while WasapiSettings is only valid for WASAPI.
+                host_api = ""
+                try:
+                    device_info = sd.query_devices(device, "input")
+                    host_apis = sd.query_hostapis()
+                    host_index = int(device_info.get("hostapi", -1))
+                    if 0 <= host_index < len(host_apis):
+                        host_api = str(host_apis[host_index].get("name", "")).lower()
+                except Exception:
+                    pass
+                if "wasapi" in host_api:
+                    extra_settings = sd.WasapiSettings()
             kwargs = {
                 "samplerate": rate,
                 "channels": CHANNELS,
@@ -190,6 +203,17 @@ _LEVEL_FLOOR = 60.0
 _LEVEL_FULL  = 2600.0
 _LOCAL_VOICE_FLOOR = 18.0
 _LOCAL_VOICE_NOISE_RATIO = 2.2
+
+
+def _is_gemini_quota_error(error: BaseException) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in (
+        "exceeded your current quota",
+        "resource_exhausted",
+        "quota exceeded",
+        "rate limit",
+        "429",
+    ))
 
 
 def _pcm_level(samples) -> float:
@@ -2434,7 +2458,10 @@ class AuraLive:
         except Exception as e:
             print(f"[AURA] ❌ Mic: {e}")
             self.ui.write_log(f"SYS: Microphone unavailable — {e}")
-            self._reconnect_event.set()
+            self.ui.write_log(
+                "SYS: Gemini is still connected, but voice input is unavailable. "
+                "Check the selected microphone in Audio Settings."
+            )
 
     async def _flush_pending_vision(self) -> bool:
         """Send a captured frame immediately after its tool response.
@@ -3344,6 +3371,24 @@ class AuraLive:
                         await asyncio.sleep(1)
                     print("[AURA] New API key saved — reconnecting...")
                     _conn_backoff = 3
+                    continue
+
+                # Quota exhaustion is not transient. Retrying the same key
+                # every few seconds only creates a reconnect storm and cannot
+                # restore the session until the key or billing plan changes.
+                if _is_gemini_quota_error(e):
+                    message = (
+                        "ERR: Gemini API quota exhausted — change the API key "
+                        "or billing plan before reconnecting."
+                    )
+                    self.ui.write_log(message)
+                    print(f"[AURA] {message}")
+                    self.ui.set_state("SLEEPING")
+                    self.ui.prompt_reconfig()
+                    while not self.ui._win._ready:
+                        await asyncio.sleep(1)
+                    print("[AURA] API key changed — reconnecting...")
+                    self._conn_backoff = 3
                     continue
 
                 # Network / timeout errors — log clearly and back off
