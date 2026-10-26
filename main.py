@@ -55,8 +55,6 @@ from memory.memory_manager import (
     save_session_summary, pop_last_session,
     search_memory, set_trim_notifier,
 )
-from memory.service import MemoryService
-from memory.models import MemoryCategory, MemorySource
 
 # The file-backed tools (open_app, web_search, browser_control, …) are no longer
 # imported or declared here — they self-describe via a TOOL dict in their own
@@ -76,7 +74,6 @@ from memory.config_manager     import (
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_input_device, get_output_device,
     get_local_llm_config, get_notifications_config, get_system_controls_config,
-    get_memory_config,
 )
 from core.notifications.intent import match_notification_intent
 from core.system_controls.intent import match_system_control_intent
@@ -504,59 +501,6 @@ TOOL_DECLARATIONS = [
             "required": [],
         },
     },
-            {
-                "name": "memory_save",
-                "description": "Save or update a categorized long-term memory. Use voice as the source.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "category": {"type": "STRING", "description": "protocol, reminder, lifestyle, or instruction"},
-                        "title": {"type": "STRING", "description": "Name or label"},
-                        "description": {"type": "STRING", "description": "Exact task, fact, reminder, or rule"},
-                        "priority": {"type": "STRING", "description": "critical, high, normal, or low"},
-                    },
-                    "required": ["category", "title", "description"],
-                },
-            },
-            {
-                "name": "memory_update",
-                "description": "Update an existing memory by its title.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "title": {"type": "STRING"}, "category": {"type": "STRING"},
-                        "description": {"type": "STRING"}, "priority": {"type": "STRING"},
-                    },
-                    "required": ["title"],
-                },
-            },
-            {
-                "name": "memory_delete",
-                "description": "Delete a memory by title only after the user has confirmed.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {"title": {"type": "STRING"}, "category": {"type": "STRING"},
-                                   "confirmed": {"type": "BOOLEAN"}},
-                    "required": ["title"],
-                },
-            },
-            {
-                "name": "memory_list",
-                "description": "List a concise summary of stored memories.",
-                "parameters": {"type": "OBJECT", "properties": {"category": {"type": "STRING"}}},
-            },
-            {
-                "name": "memory_recall",
-                "description": "Recall the most relevant stored memories for a query.",
-                "parameters": {"type": "OBJECT", "properties": {"query": {"type": "STRING"}},
-                               "required": ["query"]},
-            },
-            {
-                "name": "run_protocol",
-                "description": "Run a named protocol through the normal assistant action pipeline.",
-                "parameters": {"type": "OBJECT", "properties": {"title": {"type": "STRING"}},
-                               "required": ["title"]},
-            },
     {
         "name": "undo",
         "description": (
@@ -624,7 +568,6 @@ def _keep_context_of(exc: BaseException) -> bool:
 class AuraLive:
     def __init__(self, ui: AuraUI):
         self.ui             = ui
-        self._memory_service = MemoryService()
         self._asst_name     = "AURA"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
@@ -1795,9 +1738,7 @@ class AuraLive:
             _user_name = ""
 
         memory     = load_memory()
-        mem_str    = self._memory_service.context("", get_memory_config()["context_char_budget"])
-        if not mem_str:
-            mem_str = format_memory_for_prompt(memory)
+        mem_str    = format_memory_for_prompt(memory)
         sys_prompt = _load_system_prompt()
 
         now      = datetime.now()
@@ -1958,13 +1899,8 @@ class AuraLive:
             key      = args.get("key", "")
             value    = args.get("value", "")
             if key and value:
-                # Keep the original public tool name, but route writes through
-                # the schema-backed service so legacy callers cannot overwrite
-                # the migrated store with the old category/key JSON shape.
-                mapped_category = "lifestyle"
-                self._memory_service.save(
-                    mapped_category, key, value, "normal", MemorySource.AUTO
-                )
+                update_memory({category: {key: {"value": value}}})
+                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
@@ -1976,68 +1912,7 @@ class AuraLive:
         result = "Done."
 
         try:
-            if name == "memory_save":
-                entry = await asyncio.to_thread(
-                    self._memory_service.save, args.get("category", "lifestyle"),
-                    args.get("title", ""), args.get("description", ""),
-                    args.get("priority", "normal"), MemorySource.VOICE,
-                )
-                result = f"Memory saved successfully ({entry.category.value})."
-
-            elif name == "memory_update":
-                changes = {key: value for key, value in (
-                    ("description", args.get("description")),
-                    ("priority", args.get("priority")),
-                ) if value is not None}
-                entry = await asyncio.to_thread(
-                    self._memory_service.update_by_title, args.get("title", ""),
-                    args.get("category"), **changes,
-                )
-                result = f"Memory '{entry.title}' updated."
-
-            elif name == "memory_delete":
-                title = args.get("title", "")
-                candidates = self._memory_service.recall(title, 3)
-                protected = any(e.title.casefold() == title.casefold() and
-                                (e.pinned or e.priority.value == "critical" or
-                                 e.category.value == "protocol") for e in candidates)
-                if protected and not bool(args.get("confirmed", False)):
-                    result = "Confirmation is required before deleting this protected memory."
-                else:
-                    deleted = await asyncio.to_thread(
-                        self._memory_service.delete_by_title, title, args.get("category")
-                    )
-                    result = "Memory deleted." if deleted else "Memory was not found."
-
-            elif name == "memory_list":
-                category = args.get("category")
-                entries = self._memory_service.store.list(
-                    category=MemoryCategory(category.casefold()) if category else None,
-                    include_disabled=False,
-                )
-                result = ("No memories are stored." if not entries else
-                          "Stored memories: " + "; ".join(e.title for e in entries[:10]))
-
-            elif name == "memory_recall":
-                entries = self._memory_service.recall(args.get("query", ""), 8)
-                result = ("No matching memories found." if not entries else
-                          "\n".join(f"{e.title}: {e.description}" for e in entries))
-
-            elif name == "run_protocol":
-                entry = self._memory_service.trigger(args.get("title", ""))
-                if entry is None or entry.category.value != "protocol":
-                    result = "No unambiguous protocol matched that title."
-                else:
-                    result = await loop.run_in_executor(
-                        None, lambda: self._action_registry.run(
-                            "computer_control",
-                            {"command": entry.description},
-                            {"player": self.ui, "speak": self.speak,
-                             "response": None, "session_memory": None},
-                        )
-                    )
-
-            elif name == "recall_memory":
+            if name == "recall_memory":
                 # Local file search: no network, no second model. Kept out of
                 # the executor deliberately — it is a dictionary scan over a few
                 # hundred short strings, and a thread hop would cost more than

@@ -4243,63 +4243,12 @@ _WEATHER_URL = (
 )
 
 
-_WEATHER_SSL_CTXS: list | None = None
-
-
-def _weather_ssl_contexts() -> list:
-    """Verified TLS contexts to try, in order.
-
-    A stale OS certificate store (common on older Windows installs) makes
-    modern sites fail with "certificate has expired", so the bundled
-    ``certifi`` CA list is tried alongside the system store. Verification is
-    never disabled unless AURA_WEATHER_INSECURE_SSL=1 is set explicitly.
-    """
-    global _WEATHER_SSL_CTXS
-    if _WEATHER_SSL_CTXS is not None:
-        return _WEATHER_SSL_CTXS
-    import ssl
-    ctxs: list = []
-    try:
-        import certifi
-        ctxs.append(ssl.create_default_context(cafile=certifi.where()))
-    except Exception as e:
-        print(f"[Weather] certifi unavailable ({e}); using system certificates only")
-    ctxs.append(ssl.create_default_context())   # system store (corporate CAs etc.)
-    if os.environ.get("AURA_WEATHER_INSECURE_SSL") == "1":
-        unverified = ssl.create_default_context()
-        unverified.check_hostname = False
-        unverified.verify_mode = ssl.CERT_NONE
-        ctxs.append(unverified)
-    _WEATHER_SSL_CTXS = ctxs
-    return ctxs
-
-
 def _weather_http_json(url: str, timeout: float = 8.0) -> dict:
-    import ssl
-    import urllib.error
     import urllib.request
     req = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0 (AURA weather widget)"})
-    ctxs = _weather_ssl_contexts()
-    last_err: Exception | None = None
-    data = None
-    for i, ctx in enumerate(list(ctxs)):
-        try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-                data = json.loads(r.read().decode("utf-8", "replace"))
-        except urllib.error.URLError as e:
-            if not isinstance(e.reason, ssl.SSLError):
-                raise                       # network down, DNS, HTTP error, ...
-            last_err = e                    # certificate problem: try next context
-            continue
-        except ssl.SSLError as e:
-            last_err = e
-            continue
-        if i:                               # remember the context that worked
-            ctxs.insert(0, ctxs.pop(i))
-        break
-    else:
-        raise last_err if last_err else RuntimeError("no TLS context available")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
     if not isinstance(data, dict):
         raise ValueError("unexpected response")
     return data
@@ -8714,22 +8663,12 @@ class MainWindow(QMainWindow):
 
     def _open_memory_panel(self):
         try:
-            from memory_ui import MemoryDialog
-            existing = getattr(self, "_memory_dialog", None)
-            if existing is not None and existing.isVisible():
-                existing.raise_()
-                existing.activateWindow()
-                return
-            ov = MemoryDialog(parent=self)
-            ov.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-            ov.finished.connect(lambda _code: None)
+            ov = MemoryOverlay(parent=self.centralWidget())
         except Exception as e:
             self._log.append_log(f"ERR: Memory panel unavailable — {e}")
             return
-        ov.show()
-        ov.raise_()
-        ov.activateWindow()
-        self._memory_dialog = ov
+        self._centre_overlay(ov)
+        self._memory_overlay = ov
 
     # ── Irreversible-action confirmation ─────────────────────────────────────
 

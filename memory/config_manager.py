@@ -427,39 +427,6 @@ def save_output_device(name: str) -> None:
     _patch_config(output_device=(name or "").strip())
 
 
-def get_memory_config() -> dict:
-    """Return bounded long-term-memory settings with safe defaults."""
-    raw = load_api_keys().get("memory", {})
-    if not isinstance(raw, dict):
-        raw = {}
-    try:
-        budget = min(20000, max(500, int(raw.get("context_char_budget", 3500))))
-    except (TypeError, ValueError):
-        budget = 3500
-    try:
-        reminders = min(20, max(1, int(raw.get("max_wakeup_reminders", 5))))
-    except (TypeError, ValueError):
-        reminders = 5
-    try:
-        backups = min(20, max(1, int(raw.get("backup_count", 5))))
-    except (TypeError, ValueError):
-        backups = 5
-    path = str(raw.get("file_path", "")).strip()
-    return {
-        "file_path": path,
-        "context_char_budget": budget,
-        "max_wakeup_reminders": reminders,
-        "backup_count": backups,
-    }
-
-
-def save_memory_config(settings: dict) -> None:
-    """Persist validated long-term-memory settings."""
-    current = get_memory_config()
-    current.update(settings)
-    _patch_config(memory=current)
-
-
 _NOTIFICATION_DEFAULTS = {
     "notifications_enabled": True,
     "toast_timeout_seconds": 4.5,

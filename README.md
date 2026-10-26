@@ -36,21 +36,6 @@ The AI configuration can be selected during setup or changed later through:
 
 Existing Gemini configuration files remain compatible with the newer configuration system.
 
-## Memory System
-
-A.U.R.A.'s long-term memory is stored locally and is organized into four categories:
-**Protocols** (named routines), **Important Memories / Reminders**, **Personal
-Lifestyle** facts, and **Important Instructions** (standing rules). You can create
-memories by voice, for example: “remember my partner’s name is Alex”, “from now
-on always use metric units”, “remind me to renew my passport”, or “create a
-protocol called focus mode”.
-
-Open **Settings → MEMORY** to search, filter, create, edit, export, or delete
-entries. Voice-created entries are marked `VOICE`. The store is migrated from
-older A.U.R.A. memory files automatically and backups are retained locally.
-Relevant entries are sent to the configured AI model as clearly delimited context;
-the original memory data remains on this device.
-
 ---
 
 # Features

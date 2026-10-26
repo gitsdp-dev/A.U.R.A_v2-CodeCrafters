@@ -269,17 +269,7 @@ def set_updater_badge(latest_tag: str) -> None:
 
 def has_updater_badge() -> bool:
     """Return True if a pending-update badge should be shown."""
-    state = read_updater_state()
-    if not state.get("badge"):
-        return False
-    pending_tag = state.get("pending_tag")
-    if pending_tag:
-        pending_ver = SemVer.parse(str(pending_tag))
-        local_ver = read_version_json()
-        if pending_ver and local_ver and local_ver >= pending_ver:
-            clear_updater_badge()
-            return False
-    return True
+    return bool(read_updater_state().get("badge"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
