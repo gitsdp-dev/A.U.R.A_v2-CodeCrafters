@@ -36,12 +36,12 @@ for _stream in ("stdout", "stderr"):
 
 import asyncio
 import queue as _queue
-import re
 import threading
 import time
 import json
 import sys
 import traceback
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -55,6 +55,8 @@ from memory.memory_manager import (
     save_session_summary, pop_last_session,
     search_memory, set_trim_notifier,
 )
+from memory.service import MemoryService
+from memory.models import MemoryCategory, MemorySource, utc_now
 
 # The file-backed tools (open_app, web_search, browser_control, …) are no longer
 # imported or declared here — they self-describe via a TOOL dict in their own
@@ -74,6 +76,7 @@ from memory.config_manager     import (
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_input_device, get_output_device,
     get_local_llm_config, get_notifications_config, get_system_controls_config,
+    get_memory_config,
 )
 from core.notifications.intent import match_notification_intent
 from core.system_controls.intent import match_system_control_intent
@@ -132,6 +135,53 @@ SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 GEMINI_INPUT_AUDIO_MIME = f"audio/pcm;rate={SEND_SAMPLE_RATE}"
+
+
+def _open_input_stream(callback, device=None):
+    """Open a microphone with Windows format conversion and rate fallback."""
+    import platform
+
+    rates = [SEND_SAMPLE_RATE]
+    try:
+        info = sd.query_devices(device, "input")
+        native_rate = int(float(info["default_samplerate"]))
+        if native_rate not in rates:
+            rates.append(native_rate)
+    except Exception:
+        pass
+
+    last_error = None
+    for rate in rates:
+        stream_callback = callback
+        if rate != SEND_SAMPLE_RATE:
+            def stream_callback(indata, _frames, time_info, status, _rate=rate):
+                samples = np.asarray(indata, dtype=np.float32)
+                source_len = samples.shape[0]
+                target_len = max(1, round(source_len * SEND_SAMPLE_RATE / _rate))
+                source_x = np.linspace(0.0, 1.0, source_len, endpoint=False)
+                target_x = np.linspace(0.0, 1.0, target_len, endpoint=False)
+                converted = np.interp(
+                    target_x, source_x, samples[:, 0]
+                ).astype(np.int16).reshape(-1, 1)
+                callback(converted, target_len, time_info, status)
+        try:
+            extra_settings = None
+            if platform.system() == "Windows" and hasattr(sd, "WasapiSettings"):
+                extra_settings = sd.WasapiSettings()
+            kwargs = {
+                "samplerate": rate,
+                "channels": CHANNELS,
+                "dtype": "int16",
+                "blocksize": round(CHUNK_SIZE * rate / SEND_SAMPLE_RATE),
+                "device": device,
+                "callback": stream_callback,
+            }
+            if extra_settings is not None:
+                kwargs["extra_settings"] = extra_settings
+            return sd.InputStream(**kwargs)
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"Could not open microphone at supported rates: {last_error}") from last_error
 
 # RMS below which 16-bit PCM is treated as room silence; above _LEVEL_FULL it
 # reads as a full-height waveform. Tuned so ordinary speech lands mid-range and
@@ -501,6 +551,63 @@ TOOL_DECLARATIONS = [
             "required": [],
         },
     },
+            {
+                "name": "memory_save",
+                "description": "Save or update a categorized long-term memory. Use voice as the source.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "category": {"type": "STRING", "description": "protocol, reminder, lifestyle, or instruction"},
+                        "title": {"type": "STRING", "description": "Name or label"},
+                        "description": {"type": "STRING", "description": "Exact task, fact, reminder, or rule"},
+                        "priority": {"type": "STRING", "description": "critical, high, normal, or low"},
+                    },
+                    "required": ["category", "title", "description"],
+                },
+            },
+            {
+                "name": "memory_update",
+                "description": "Update an existing memory by its title.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "title": {"type": "STRING"}, "category": {"type": "STRING"},
+                        "description": {"type": "STRING"}, "priority": {"type": "STRING"},
+                    },
+                    "required": ["title"],
+                },
+            },
+            {
+                "name": "memory_delete",
+                "description": "Delete a memory by title only after the user has confirmed.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {"title": {"type": "STRING"}, "category": {"type": "STRING"},
+                                   "confirmed": {"type": "BOOLEAN"}},
+                    "required": ["title"],
+                },
+            },
+            {
+                "name": "memory_list",
+                "description": "List a concise summary of stored memories.",
+                "parameters": {"type": "OBJECT", "properties": {"category": {"type": "STRING"}}},
+            },
+            {
+                "name": "memory_recall",
+                "description": "Recall the most relevant stored memories for a query.",
+                "parameters": {"type": "OBJECT", "properties": {"query": {"type": "STRING"}},
+                               "required": ["query"]},
+            },
+            {
+                "name": "run_protocol",
+                "description": (
+                    "Run one user-created protocol through the normal assistant action "
+                    "pipeline. The title must be the user's protocol name from Memory "
+                    "Manager; do not invent or hardcode a protocol name."
+                ),
+                "parameters": {"type": "OBJECT", "properties": {"title": {"type": "STRING"}},
+                               "required": ["title"]},
+            },
     {
         "name": "undo",
         "description": (
@@ -568,6 +675,7 @@ def _keep_context_of(exc: BaseException) -> bool:
 class AuraLive:
     def __init__(self, ui: AuraUI):
         self.ui             = ui
+        self._memory_service = MemoryService()
         self._asst_name     = "AURA"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
@@ -1026,10 +1134,7 @@ class AuraLive:
                 pass
 
         def open_mic(device):
-            return sd.InputStream(
-                samplerate=SEND_SAMPLE_RATE, channels=CHANNELS, dtype="int16",
-                blocksize=CHUNK_SIZE, device=device, callback=callback,
-            )
+            return _open_input_stream(callback, device)
 
         mic_name = get_input_device()
         mic_device = audio_devices.resolve(mic_name, "input")
@@ -1254,6 +1359,12 @@ class AuraLive:
             return
         if not self._loop:
             return
+        protocol = self._memory_service.resolve_protocol(text)
+        if protocol is not None:
+            asyncio.run_coroutine_threadsafe(
+                self._execute_protocol(protocol), self._loop
+            )
+            return
         if self._local_mode_active and self._local_brain is not None:
             asyncio.run_coroutine_threadsafe(
                 self._local_turn(text, log_user=False), self._loop
@@ -1268,6 +1379,80 @@ class AuraLive:
             ),
             self._loop
         )
+
+    async def _execute_protocol_task(self, task: str) -> str:
+        """Execute one protocol task through existing action or AI routing."""
+        normalized = " ".join(task.split()).strip()
+        open_match = re.match(
+            r"^(?:open|launch|start)\s+(?:the\s+)?(.+)$",
+            normalized,
+            re.IGNORECASE,
+        )
+        if open_match and self._action_registry.has("open_app"):
+            app_name = open_match.group(1).strip()
+            return await asyncio.to_thread(
+                self._action_registry.run,
+                "open_app",
+                {"app_name": app_name},
+                {"player": self.ui, "speak": self.speak,
+                 "response": None, "session_memory": None},
+            )
+
+        wait_match = re.match(
+            r"^wait\s+(\d+(?:\.\d+)?)\s*(?:seconds?|secs?)?$",
+            normalized,
+            re.IGNORECASE,
+        )
+        if wait_match and self._action_registry.has("computer_control"):
+            return await asyncio.to_thread(
+                self._action_registry.run,
+                "computer_control",
+                {"action": "wait", "seconds": float(wait_match.group(1))},
+                {"player": self.ui, "speak": self.speak,
+                 "response": None, "session_memory": None},
+            )
+
+        instruction = (
+            "Execute exactly this single protocol task now using the existing "
+            f"assistant tools and safety checks. Do not execute other protocol "
+            f"tasks and do not merely describe it: {normalized}"
+        )
+        if self._local_mode_active and self._local_brain is not None:
+            await self._local_turn(instruction, log_user=False, record_user=False)
+            return "Task sent to the local action pipeline."
+        if self.session is None:
+            return "No active assistant session is available for this task."
+        if self._turn_done_event:
+            self._turn_done_event.clear()
+        await self.session.send_client_content(
+            turns={"role": "user", "parts": [{"text": instruction}]},
+            turn_complete=True,
+        )
+        if self._turn_done_event:
+            try:
+                await asyncio.wait_for(self._turn_done_event.wait(), timeout=45.0)
+            except asyncio.TimeoutError:
+                return "Task timed out while waiting for the assistant action pipeline."
+        return "Task completed through the assistant action pipeline."
+
+    async def _execute_protocol(self, entry) -> str:
+        """Execute protocol tasks sequentially and stop safely on failure."""
+        tasks = self._memory_service.protocol_tasks(entry)
+        completed = 0
+        for index, task in enumerate(tasks, start=1):
+            result = str(await self._execute_protocol_task(task) or "")
+            failure = result.casefold().startswith(
+                ("failed", "could not", "no ", "unknown", "error")
+            )
+            if failure:
+                return f"Protocol stopped at task {index}/{len(tasks)}: {result}"
+            completed += 1
+        self._memory_service.store.update(
+            entry.id,
+            use_count=entry.use_count + 1,
+            last_used_at=utc_now(),
+        )
+        return f"Protocol '{entry.title}' completed {completed} task(s) in order."
 
     def handle_system_control_action(self, parameters: dict) -> str:
         """Entry point used by the discovered Gemini action."""
@@ -1738,7 +1923,9 @@ class AuraLive:
             _user_name = ""
 
         memory     = load_memory()
-        mem_str    = format_memory_for_prompt(memory)
+        mem_str    = self._memory_service.context("", get_memory_config()["context_char_budget"])
+        if not mem_str:
+            mem_str = format_memory_for_prompt(memory)
         sys_prompt = _load_system_prompt()
 
         now      = datetime.now()
@@ -1789,6 +1976,13 @@ class AuraLive:
         })
 
         parts = [time_ctx, identity_ctx]
+        protocol_catalog = self._memory_service.protocol_catalog()
+        if protocol_catalog:
+            parts.append(
+                "[AVAILABLE USER PROTOCOLS]\n"
+                f"{protocol_catalog}\n"
+                "When the user asks to start one, call run_protocol with its exact name."
+            )
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
@@ -1899,8 +2093,13 @@ class AuraLive:
             key      = args.get("key", "")
             value    = args.get("value", "")
             if key and value:
-                update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
+                # Keep the original public tool name, but route writes through
+                # the schema-backed service so legacy callers cannot overwrite
+                # the migrated store with the old category/key JSON shape.
+                mapped_category = "lifestyle"
+                self._memory_service.save(
+                    mapped_category, key, value, "normal", MemorySource.AUTO
+                )
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
@@ -1912,7 +2111,61 @@ class AuraLive:
         result = "Done."
 
         try:
-            if name == "recall_memory":
+            if name == "memory_save":
+                entry = await asyncio.to_thread(
+                    self._memory_service.save, args.get("category", "lifestyle"),
+                    args.get("title", ""), args.get("description", ""),
+                    args.get("priority", "normal"), MemorySource.VOICE,
+                )
+                result = f"Memory saved successfully ({entry.category.value})."
+
+            elif name == "memory_update":
+                changes = {key: value for key, value in (
+                    ("description", args.get("description")),
+                    ("priority", args.get("priority")),
+                ) if value is not None}
+                entry = await asyncio.to_thread(
+                    self._memory_service.update_by_title, args.get("title", ""),
+                    args.get("category"), **changes,
+                )
+                result = f"Memory '{entry.title}' updated."
+
+            elif name == "memory_delete":
+                title = args.get("title", "")
+                candidates = self._memory_service.recall(title, 3)
+                protected = any(e.title.casefold() == title.casefold() and
+                                (e.pinned or e.priority.value == "critical" or
+                                 e.category.value == "protocol") for e in candidates)
+                if protected and not bool(args.get("confirmed", False)):
+                    result = "Confirmation is required before deleting this protected memory."
+                else:
+                    deleted = await asyncio.to_thread(
+                        self._memory_service.delete_by_title, title, args.get("category")
+                    )
+                    result = "Memory deleted." if deleted else "Memory was not found."
+
+            elif name == "memory_list":
+                category = args.get("category")
+                entries = self._memory_service.store.list(
+                    category=MemoryCategory(category.casefold()) if category else None,
+                    include_disabled=False,
+                )
+                result = ("No memories are stored." if not entries else
+                          "Stored memories: " + "; ".join(e.title for e in entries[:10]))
+
+            elif name == "memory_recall":
+                entries = self._memory_service.recall(args.get("query", ""), 8)
+                result = ("No matching memories found." if not entries else
+                          "\n".join(f"{e.title}: {e.description}" for e in entries))
+
+            elif name == "run_protocol":
+                entry = self._memory_service.resolve_protocol(args.get("title", ""))
+                if entry is None:
+                    result = "No unambiguous protocol matched that title."
+                else:
+                    result = await self._execute_protocol(entry)
+
+            elif name == "recall_memory":
                 # Local file search: no network, no second model. Kept out of
                 # the executor deliberately — it is a dictionary scan over a few
                 # hundred short strings, and a thread hop would cost more than
@@ -2145,14 +2398,7 @@ class AuraLive:
 
         try:
             def _open_mic(dev):
-                return sd.InputStream(
-                    samplerate=SEND_SAMPLE_RATE,
-                    channels=CHANNELS,
-                    dtype="int16",
-                    blocksize=CHUNK_SIZE,
-                    device=dev,
-                    callback=callback,
-                )
+                return _open_input_stream(callback, dev)
 
             # Which microphone. resolve() returns None for "system default" and
             # for a saved device that is no longer present — so a headset
@@ -2187,7 +2433,8 @@ class AuraLive:
                     await asyncio.sleep(0.1)
         except Exception as e:
             print(f"[AURA] ❌ Mic: {e}")
-            raise
+            self.ui.write_log(f"SYS: Microphone unavailable — {e}")
+            self._reconnect_event.set()
 
     async def _flush_pending_vision(self) -> bool:
         """Send a captured frame immediately after its tool response.

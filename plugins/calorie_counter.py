@@ -19,6 +19,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from core.camera import open_camera
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -65,19 +66,9 @@ def _config() -> dict:
 
 
 def _open_camera():
-    import platform
-    try:
-        backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
-    except AttributeError:
-        backend = 0
-    cap = cv2.VideoCapture(int(_config().get("camera_index", 0)), backend)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        return None
-    for _ in range(6):  # warm-up frames
-        cap.read()
-    return cap
+    index = int(_config().get("camera_index", 0))
+    indices = tuple(dict.fromkeys((index, 0, 1, 2, 3, 4, 5)))
+    return open_camera(cv2, indices, warmup=6)
 
 
 # ── scan-bar rendering ───────────────────────────────────────────────────────

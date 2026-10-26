@@ -4243,12 +4243,63 @@ _WEATHER_URL = (
 )
 
 
+_WEATHER_SSL_CTXS: list | None = None
+
+
+def _weather_ssl_contexts() -> list:
+    """Verified TLS contexts to try, in order.
+
+    A stale OS certificate store (common on older Windows installs) makes
+    modern sites fail with "certificate has expired", so the bundled
+    ``certifi`` CA list is tried alongside the system store. Verification is
+    never disabled unless AURA_WEATHER_INSECURE_SSL=1 is set explicitly.
+    """
+    global _WEATHER_SSL_CTXS
+    if _WEATHER_SSL_CTXS is not None:
+        return _WEATHER_SSL_CTXS
+    import ssl
+    ctxs: list = []
+    try:
+        import certifi
+        ctxs.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception as e:
+        print(f"[Weather] certifi unavailable ({e}); using system certificates only")
+    ctxs.append(ssl.create_default_context())   # system store (corporate CAs etc.)
+    if os.environ.get("AURA_WEATHER_INSECURE_SSL") == "1":
+        unverified = ssl.create_default_context()
+        unverified.check_hostname = False
+        unverified.verify_mode = ssl.CERT_NONE
+        ctxs.append(unverified)
+    _WEATHER_SSL_CTXS = ctxs
+    return ctxs
+
+
 def _weather_http_json(url: str, timeout: float = 8.0) -> dict:
+    import ssl
+    import urllib.error
     import urllib.request
     req = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0 (AURA weather widget)"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
+    ctxs = _weather_ssl_contexts()
+    last_err: Exception | None = None
+    data = None
+    for i, ctx in enumerate(list(ctxs)):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.URLError as e:
+            if not isinstance(e.reason, ssl.SSLError):
+                raise                       # network down, DNS, HTTP error, ...
+            last_err = e                    # certificate problem: try next context
+            continue
+        except ssl.SSLError as e:
+            last_err = e
+            continue
+        if i:                               # remember the context that worked
+            ctxs.insert(0, ctxs.pop(i))
+        break
+    else:
+        raise last_err if last_err else RuntimeError("no TLS context available")
     if not isinstance(data, dict):
         raise ValueError("unexpected response")
     return data
@@ -5901,6 +5952,7 @@ class MainWindow(QMainWindow):
     def _cam_loop(self) -> None:
         try:
             import cv2
+            from core.camera import open_camera
             # Reuse camera index detected by screen_processor (cached in api_keys.json)
             cam_idx = 0
             try:
@@ -5909,18 +5961,10 @@ class MainWindow(QMainWindow):
                 cam_idx = int(cfg.get("camera_index", 0))
             except Exception:
                 pass
-            try:
-                backend = cv2.CAP_DSHOW if _OS == "Windows" else cv2.CAP_ANY
-            except AttributeError:
-                backend = 0
-            cap = cv2.VideoCapture(cam_idx, backend)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
+            indices = tuple(dict.fromkeys((cam_idx, 0, 1, 2, 3, 4, 5)))
+            cap = open_camera(cv2, indices, warmup=5)
+            if cap is None:
                 return
-            # warm-up frames
-            for _ in range(5):
-                cap.read()
             while not self._cam_stop.wait(0.033) and cap.isOpened():
                 ret, frame = cap.read()
                 if ret and frame is not None:
@@ -5982,34 +6026,17 @@ class MainWindow(QMainWindow):
 
     def _room_open(self, cv2):
         """Open the setup camera (configured index first, then 0). None if absent."""
+        from core.camera import open_camera
+
         idxs = []
         try:
             idxs.append(int(_read_full_config().get("camera_index", 0)))
         except Exception:
             pass
-        if 0 not in idxs:
-            idxs.append(0)
-        try:
-            backend = cv2.CAP_DSHOW if _OS == "Windows" else cv2.CAP_ANY
-        except AttributeError:
-            backend = 0
-        for i in idxs:
-            cap = None
-            try:
-                cap = cv2.VideoCapture(i, backend)
-                if cap is not None and cap.isOpened():
-                    ok, fr = cap.read()
-                    if ok and fr is not None:
-                        return cap
-                if cap is not None:
-                    cap.release()
-            except Exception:
-                try:
-                    if cap is not None:
-                        cap.release()
-                except Exception:
-                    pass
-        return None
+        for i in range(6):
+            if i not in idxs:
+                idxs.append(i)
+        return open_camera(cv2, tuple(idxs), warmup=0)
 
     def _room_loop(self, quit_ev: threading.Event) -> None:
         try:
@@ -6027,6 +6054,7 @@ class MainWindow(QMainWindow):
                 if cap is None:
                     cap = self._room_open(cv2)
                     if cap is None:
+                        print("[RoomWatch] No usable camera frame; retrying in 10 seconds.")
                         if not self._face_cam_reported:
                             self._face_cam_reported = True
                             self._face_cam_sig.emit(False)      # no camera → no face unlock
@@ -6142,6 +6170,10 @@ class MainWindow(QMainWindow):
             self._face_mode = "off"
             self._face_gate.set()
             return
+        if self._face_stored is None:
+            self._log.append_log(
+                "SYS: Face unlock is enabled but no valid enrolled face data was found."
+            )
         # Safety net: if the camera never answers, don't hold the assistant back.
         QTimer.singleShot(12000, self._face_timeout)
 
@@ -8663,12 +8695,22 @@ class MainWindow(QMainWindow):
 
     def _open_memory_panel(self):
         try:
-            ov = MemoryOverlay(parent=self.centralWidget())
+            from memory_ui import MemoryDialog
+            existing = getattr(self, "_memory_dialog", None)
+            if existing is not None and existing.isVisible():
+                existing.raise_()
+                existing.activateWindow()
+                return
+            ov = MemoryDialog(parent=self)
+            ov.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+            ov.finished.connect(lambda _code: None)
         except Exception as e:
             self._log.append_log(f"ERR: Memory panel unavailable — {e}")
             return
-        self._centre_overlay(ov)
-        self._memory_overlay = ov
+        ov.show()
+        ov.raise_()
+        ov.activateWindow()
+        self._memory_dialog = ov
 
     # ── Irreversible-action confirmation ─────────────────────────────────────
 

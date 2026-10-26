@@ -42,6 +42,8 @@ config/mail_watch.json
 
 # ── Personal assistant data and local backups ────────────────────────────────
 memory/*.json
+memory/backups/
+memory/*.corrupt-*
 memory/*.db*
 memory/*.sqlite*
 memory/*.jsonl
