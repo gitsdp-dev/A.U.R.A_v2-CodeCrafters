@@ -28,7 +28,6 @@ id_ed25519.*
 
 # ── Personal identity, biometrics, and linked accounts ───────────────────────
 **/face_unlock.json
-**/face_unlock/
 **/face_data/
 **/face_id/
 **/face_embeddings/
