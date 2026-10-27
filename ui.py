@@ -162,6 +162,10 @@ _FACE_MODEL_MIN_BYTES = 100_000
 _FACE_THRESH    = 0.38     # cosine similarity needed to count as "same person" (SFace default 0.363)
 _FACE_NEED      = 3        # consecutive matching checks required before unlocking
 _FACE_ENROLL_N  = 8        # face samples captured during enrolment
+# YuNet reports face width in a 640-pixel-wide working frame. These bounds
+# approximate a 1-3 m seating range for a typical 60-degree webcam.
+_FACE_MIN_WIDTH = 32       # farther than roughly 3 m: reject
+_FACE_MAX_WIDTH = 400       # nearer than roughly 20-30 cm: reject
 # Modes in which the lock/enrol overlay covers the window.
 _FACE_COVER = ("pending", "prep", "lock", "enroll", "reenroll", "unlocking")
 
@@ -288,7 +292,7 @@ class _FaceEngine:
             return False
 
     def analyse(self, frame):
-        """→ (face_count, unit descriptor of the largest face | None, its width in px)."""
+        """→ (face_count, unit descriptor, largest face width at 640 px)."""
         import cv2
         import numpy as np
         h, w = frame.shape[:2]
@@ -300,7 +304,7 @@ class _FaceEngine:
             _ret, faces = self._det.detect(frame)
             if faces is None or len(faces) == 0:
                 return 0, None, 0
-            good = [f for f in faces if float(f[14]) >= 0.8 and float(f[2]) >= 40.0]
+            good = [f for f in faces if float(f[14]) >= 0.8 and float(f[2]) >= 32.0]
             if not good:
                 return 0, None, 0
             best = max(good, key=lambda f: float(f[2]) * float(f[3]))
@@ -310,7 +314,7 @@ class _FaceEngine:
         nrm = float(np.linalg.norm(feat))
         if nrm <= 0.0:
             return 0, None, 0
-        return len(good), feat / nrm, int(best[2])
+        return len(good), feat / nrm, int(best[2] * 640 / w)
 
 
 class C:
@@ -5834,6 +5838,7 @@ class MainWindow(QMainWindow):
         self._face_samples      = []
         self._face_new          = []
         self._face_streak       = 0
+        self._face_verified     = False
         self._face_last         = 0.0
         self._face_last_sample  = 0.0
         self._face_prev_enabled = {}
@@ -6336,6 +6341,7 @@ class MainWindow(QMainWindow):
                     if msg:
                         self._face_overlay.set_status(msg, C.PRI)
             elif kind == "unlock":
+                self._face_verified = True
                 self._log.append_log("SYS: Face recognised — unlocked.")
                 self._face_unlock_ui("ACCESS GRANTED")
             elif kind == "enrolled":
@@ -6375,6 +6381,18 @@ class MainWindow(QMainWindow):
                 stored = self._face_stored
                 if stored is None or len(stored) == 0:
                     return
+                if n != 1:
+                    self._face_streak = 0
+                    emit("warn", 0, "ONLY ONE PERSON IN FRAME, PLEASE")
+                    return
+                if fw < _FACE_MIN_WIDTH:
+                    self._face_streak = 0
+                    emit("warn", 0, "MOVE CLOSER — FACE MUST BE WITHIN 3 METRES")
+                    return
+                if fw > _FACE_MAX_WIDTH:
+                    self._face_streak = 0
+                    emit("warn", 0, "MOVE BACK — FACE MUST BE AT LEAST 1 METRE AWAY")
+                    return
                 score = float(np.max(stored @ feat))
                 if score >= _FACE_THRESH:
                     self._face_streak += 1
@@ -6391,8 +6409,11 @@ class MainWindow(QMainWindow):
             if n > 1:
                 emit("warn", 0, "ONLY ONE PERSON IN FRAME, PLEASE")
                 return
-            if fw < 90:
-                emit("warn", 0, "MOVE A LITTLE CLOSER TO THE CAMERA")
+            if fw < _FACE_MIN_WIDTH:
+                emit("warn", 0, "MOVE CLOSER — FACE MUST BE WITHIN 3 METRES")
+                return
+            if fw > _FACE_MAX_WIDTH:
+                emit("warn", 0, "MOVE BACK — FACE MUST BE AT LEAST 1 METRE AWAY")
                 return
             if now - self._face_last_sample < 0.6:
                 return
@@ -8970,6 +8991,10 @@ class AuraUI:
     @property
     def muted(self) -> bool:
         return self._win._muted
+
+    @property
+    def face_unlock_verified(self) -> bool:
+        return bool(getattr(self._win, "_face_verified", False))
 
     @muted.setter
     def muted(self, v: bool):

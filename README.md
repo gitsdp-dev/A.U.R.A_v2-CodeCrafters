@@ -337,6 +337,23 @@ can require confirmation before execution.
 
 To extend the agent, tools can be added as typed and documented functions within the agent tool system.
 
+## Agent Mode, IDE Coding & Workflows
+
+The generalized agent can plan arbitrary multi-step tasks using registered browser, screen, files, web research, Python sandbox, and application-launch tools. Each step has bounded execution, deterministic checks, optional Gemini evidence verification, and a final evidence check. Ambiguous plans ask one clarification question instead of guessing.
+
+Phase 2 IDE coding is available through the `ide_agent` plugin. It detects an explicit or active project root, reads and searches files, applies atomic unified diffs with rollback, runs whitelisted tests, and shows large changes for confirmation. It never writes `.git`, secrets, or files outside the project root.
+
+Phase 3 workflows are available through the `workflows` plugin for YouTube Markdown notes and verified FFmpeg edits. Successful plans are stored in `memory/agent_plans.json`; recurring goals are persisted in `memory/agent_schedule.json`. Safe defaults are configured under `agent:` in `config.yaml`.
+
+Example requests:
+
+```text
+AURA, research three sources about battery recycling and write a linked report.
+AURA, add login validation to this project and run the tests.
+AURA, turn this YouTube video into timestamped Markdown notes.
+AURA, trim the video from 00:01:00 to 00:02:30 and verify the new file.
+```
+
 ---
 
 # Agent Tool Calling
@@ -394,10 +411,14 @@ A.U.R.A v2
 ├── actions/          # Desktop and system actions
 ├── config/           # Configuration and preferences
 ├── core/             # Core assistant and voice logic
+│   └── agent/         # Typed registry, planning, verification, safety, scheduling
 ├── dashboard/        # Dashboard components
 |-- earth/            # Earth View Assets
 ├── memory/           # Persistent memory system
 ├── plugins/          # Plugin architecture
+│   ├── ide_agent/     # IDE-independent coding tools and adapters
+│   ├── workflows/     # YouTube notes and FFmpeg workflows
+│   └── *_tool.py      # General browser, screen, files, research, sandbox tools
 ├── voices/           # Voice-related resources
 │
 ├── aura/             # Local AI and agent components
