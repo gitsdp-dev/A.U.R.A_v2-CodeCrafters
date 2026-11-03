@@ -5,11 +5,14 @@ import math
 import os
 import platform
 import random
+import re
 import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import psutil
 
@@ -25,10 +28,10 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
 
 from PyQt6.QtCore import (
     QEasingCurve, QEvent, QMimeData, QObject, QPoint, QPointF, QPropertyAnimation,
-    QRectF, QSize, QSizeF, Qt, QThread, QTimer, QUrl, pyqtSignal,
+    QRect, QRectF, QSize, QSizeF, Qt, QThread, QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QConicalGradient, QCursor, QDragEnterEvent, QDropEvent, QFont,
+    QBrush, QColor, QConicalGradient, QCursor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
@@ -44,6 +47,18 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
     QAudioOutput = QMediaPlayer = QGraphicsVideoItem = None
     HAVE_VIDEO = False
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
+
+# In-app browser (real Chromium via QtWebEngine). Imported here, before any
+# QApplication exists, as Qt requires. If the package is missing only the
+# browser feature is lost; the rest of the app starts normally.
+try:
+    from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    HAVE_WEB = True
+except Exception as _e:            # noqa: BLE001 - reported, never fatal
+    QWebEnginePage = QWebEngineProfile = QWebEngineSettings = QWebEngineView = None
+    HAVE_WEB = False
+    print(f"[Browser] in-app browser unavailable ({_e}) — pip install PyQt6-WebEngine")
 
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
@@ -162,6 +177,10 @@ _FACE_MODEL_MIN_BYTES = 100_000
 _FACE_THRESH    = 0.38     # cosine similarity needed to count as "same person" (SFace default 0.363)
 _FACE_NEED      = 3        # consecutive matching checks required before unlocking
 _FACE_ENROLL_N  = 8        # face samples captured during enrolment
+# YuNet reports face width in a 640-pixel-wide working frame. These bounds
+# approximate a 1-3 m seating range for a typical 60-degree webcam.
+_FACE_MIN_WIDTH = 32       # farther than roughly 3 m: reject
+_FACE_MAX_WIDTH = 400       # nearer than roughly 20-30 cm: reject
 # Modes in which the lock/enrol overlay covers the window.
 _FACE_COVER = ("pending", "prep", "lock", "enroll", "reenroll", "unlocking")
 
@@ -288,7 +307,7 @@ class _FaceEngine:
             return False
 
     def analyse(self, frame):
-        """→ (face_count, unit descriptor of the largest face | None, its width in px)."""
+        """→ (face_count, unit descriptor, largest face width at 640 px)."""
         import cv2
         import numpy as np
         h, w = frame.shape[:2]
@@ -300,7 +319,7 @@ class _FaceEngine:
             _ret, faces = self._det.detect(frame)
             if faces is None or len(faces) == 0:
                 return 0, None, 0
-            good = [f for f in faces if float(f[14]) >= 0.8 and float(f[2]) >= 40.0]
+            good = [f for f in faces if float(f[14]) >= 0.8 and float(f[2]) >= 32.0]
             if not good:
                 return 0, None, 0
             best = max(good, key=lambda f: float(f[2]) * float(f[3]))
@@ -310,7 +329,7 @@ class _FaceEngine:
         nrm = float(np.linalg.norm(feat))
         if nrm <= 0.0:
             return 0, None, 0
-        return len(good), feat / nrm, int(best[2])
+        return len(good), feat / nrm, int(best[2] * 640 / w)
 
 
 class C:
@@ -2967,6 +2986,7 @@ class CustomizeOverlay(QWidget):
 
     saved = pyqtSignal(str, str, str, str, bool)   # assistant_name, user_name, ui_color, voice, local_voice
     configure_local_ai = pyqtSignal()
+    open_permissions = pyqtSignal()
     _OW, _OH = 400, 660
 
     def __init__(self, assistant_name="AURA", user_name="",
@@ -3028,7 +3048,20 @@ class CustomizeOverlay(QWidget):
             QPushButton:hover {{ border-color: {C.PRI}; }}
         """)
         local_ai_btn.clicked.connect(self.configure_local_ai.emit)
-        lay.addWidget(local_ai_btn)
+        permissions_btn = QPushButton("PERMISSIONS")
+        permissions_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        permissions_btn.setFixedHeight(28)
+        permissions_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        permissions_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ border-color: {C.PRI}; }}
+        """)
+        permissions_btn.clicked.connect(self.open_permissions.emit)
+        settings_row = QHBoxLayout()
+        settings_row.addWidget(local_ai_btn, 1)
+        settings_row.addWidget(permissions_btn)
+        lay.addLayout(settings_row)
 
         # ── Assistant voice — Gemini prebuilt voices ─────────────────────────
         # Names are language-neutral proper nouns, so the row reads the same in
@@ -3332,6 +3365,89 @@ class CustomizeOverlay(QWidget):
         self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR,
                          self._sel_voice, self._jarvis_on)
         self.hide()
+
+
+class PermissionsOverlay(QWidget):
+    """Controls process-local file-read grants and the confirmation-gated access switch."""
+
+    def __init__(self, broker, parent=None):
+        super().__init__(parent)
+        self._broker = broker
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedWidth(420)
+        self.setStyleSheet(f"""
+            PermissionsOverlay {{
+                background: rgba(0, 6, 10, 245);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(8)
+        heading = QLabel("PERMISSIONS")
+        heading.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        heading.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        root.addWidget(heading)
+
+        self._enabled = QCheckBox("Enable file & system access (confirmation required)")
+        self._enabled.setChecked(bool(getattr(broker, "enabled", True)))
+        self._enabled.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        self._enabled.toggled.connect(self._set_enabled)
+        root.addWidget(self._enabled)
+
+        grants_label = QLabel("Active read-folder grants (this session only)")
+        grants_label.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        root.addWidget(grants_label)
+        self._grants = QComboBox()
+        self._grants.setStyleSheet(
+            f"QComboBox {{ background: {C.PANEL2}; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; padding: 4px; }}"
+        )
+        root.addWidget(self._grants)
+        row = QHBoxLayout()
+        revoke = QPushButton("REVOKE SELECTED")
+        revoke.clicked.connect(self._revoke_selected)
+        row.addWidget(revoke)
+        audit = QPushButton("OPEN AUDIT LOG")
+        audit.clicked.connect(self._open_audit)
+        row.addWidget(audit)
+        root.addLayout(row)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(self.hide)
+        root.addWidget(close)
+        for button in (revoke, audit, close):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {C.PRI};
+                    border: 1px solid {C.BORDER}; border-radius: 3px; padding: 6px; }}
+                QPushButton:hover {{ border-color: {C.PRI}; }}
+            """)
+        self._refresh_grants()
+        self.adjustSize()
+
+    def _set_enabled(self, enabled: bool):
+        self._broker.enabled = bool(enabled)
+
+    def _refresh_grants(self):
+        self._grants.clear()
+        for folder in self._broker.session_read_folders():
+            self._grants.addItem(folder, folder)
+        self._grants.setEnabled(self._grants.count() > 0)
+
+    def _revoke_selected(self):
+        folder = self._grants.currentData()
+        if folder:
+            self._broker.revoke_session_read(folder)
+            self._refresh_grants()
+
+    def _open_audit(self):
+        audit_path = self._broker.audit_path
+        if not audit_path.is_file():
+            QMessageBox.information(self, "Permission audit", "The audit log has no entries yet.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(audit_path))):
+            QMessageBox.warning(self, "Permission audit", "Windows could not open the audit log.")
 
 
 class PluginManagerOverlay(QWidget):
@@ -5583,6 +5699,1515 @@ class SystemControlsIconButton(QPushButton):
         painter.end()
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  In-app browser — "Run <website> in you"
+#
+#  A floating, draggable, resizable browser window (QtWebEngine = real
+#  Chromium) styled like the rest of the HUD. It opens from a typed or spoken
+#  command such as "Run YouTube in you" and never touches the PC's own browser.
+#  Everything lives in this file: the window, the command parser, the site
+#  resolver and the hooks into MainWindow / AuraUI.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Names that resolve straight to an address. Anything not listed is still
+# handled by _resolve_site(): full URLs, spoken domains ("github dot com"),
+# "<name>.com" guesses with a web-search fallback, or a plain web search.
+_BR_SITES: dict[str, str] = {
+    # Google
+    "google": "https://www.google.com", "gmail": "https://mail.google.com",
+    "google mail": "https://mail.google.com", "google drive": "https://drive.google.com",
+    "drive": "https://drive.google.com", "google maps": "https://www.google.com/maps",
+    "maps": "https://www.google.com/maps", "google docs": "https://docs.google.com",
+    "google sheets": "https://sheets.google.com", "google slides": "https://slides.google.com",
+    "google translate": "https://translate.google.com", "translate": "https://translate.google.com",
+    "google news": "https://news.google.com", "google photos": "https://photos.google.com",
+    "google calendar": "https://calendar.google.com", "calendar": "https://calendar.google.com",
+    "google meet": "https://meet.google.com", "google colab": "https://colab.research.google.com",
+    "colab": "https://colab.research.google.com", "gemini": "https://gemini.google.com",
+    "ai studio": "https://aistudio.google.com",
+    # Video / music
+    "youtube": "https://www.youtube.com", "you tube": "https://www.youtube.com",
+    "youtube music": "https://music.youtube.com", "spotify": "https://open.spotify.com",
+    "soundcloud": "https://soundcloud.com", "netflix": "https://www.netflix.com",
+    "prime video": "https://www.primevideo.com", "hotstar": "https://www.hotstar.com",
+    "twitch": "https://www.twitch.tv",
+    # AI
+    "chatgpt": "https://chatgpt.com", "chat gpt": "https://chatgpt.com",
+    "claude": "https://claude.ai", "perplexity": "https://www.perplexity.ai",
+    "hugging face": "https://huggingface.co", "huggingface": "https://huggingface.co",
+    # Dev / learning
+    "github": "https://github.com", "gitlab": "https://gitlab.com",
+    "stack overflow": "https://stackoverflow.com", "stackoverflow": "https://stackoverflow.com",
+    "hacker news": "https://news.ycombinator.com", "w3schools": "https://www.w3schools.com",
+    "w3 schools": "https://www.w3schools.com", "mdn": "https://developer.mozilla.org",
+    "codepen": "https://codepen.io", "kaggle": "https://www.kaggle.com",
+    "npm": "https://www.npmjs.com", "pypi": "https://pypi.org",
+    "geeksforgeeks": "https://www.geeksforgeeks.org", "geeks for geeks": "https://www.geeksforgeeks.org",
+    "figma": "https://www.figma.com", "canva": "https://www.canva.com",
+    "notion": "https://www.notion.so", "medium": "https://medium.com", "quora": "https://www.quora.com",
+    # Social / messaging
+    "facebook": "https://www.facebook.com", "instagram": "https://www.instagram.com",
+    "twitter": "https://x.com", "x": "https://x.com", "linkedin": "https://www.linkedin.com",
+    "reddit": "https://www.reddit.com", "pinterest": "https://www.pinterest.com",
+    "snapchat": "https://www.snapchat.com", "tiktok": "https://www.tiktok.com",
+    "threads": "https://www.threads.net", "discord": "https://discord.com/app",
+    "telegram": "https://web.telegram.org", "whatsapp": "https://web.whatsapp.com",
+    "whatsapp web": "https://web.whatsapp.com",
+    # Reference / shopping / search
+    "wikipedia": "https://www.wikipedia.org", "bing": "https://www.bing.com",
+    "duckduckgo": "https://duckduckgo.com", "duck duck go": "https://duckduckgo.com",
+    "amazon": "https://www.amazon.com", "flipkart": "https://www.flipkart.com",
+    "ebay": "https://www.ebay.com",
+}
+
+# "Search <q> on <site> in you" — sites with a search address of their own.
+_BR_SEARCH_URLS: dict[str, str] = {
+    "google": "https://www.google.com/search?q={q}",
+    "youtube": "https://www.youtube.com/results?search_query={q}",
+    "you tube": "https://www.youtube.com/results?search_query={q}",
+    "wikipedia": "https://en.wikipedia.org/w/index.php?search={q}",
+    "github": "https://github.com/search?q={q}",
+    "reddit": "https://www.reddit.com/search/?q={q}",
+    "stack overflow": "https://stackoverflow.com/search?q={q}",
+    "stackoverflow": "https://stackoverflow.com/search?q={q}",
+    "amazon": "https://www.amazon.com/s?k={q}",
+    "flipkart": "https://www.flipkart.com/search?q={q}",
+    "bing": "https://www.bing.com/search?q={q}",
+    "duckduckgo": "https://duckduckgo.com/?q={q}",
+    "maps": "https://www.google.com/maps/search/{q}",
+    "google maps": "https://www.google.com/maps/search/{q}",
+    "pinterest": "https://www.pinterest.com/search/pins/?q={q}",
+    "twitter": "https://x.com/search?q={q}", "x": "https://x.com/search?q={q}",
+}
+
+_BR_PRONOUNS = {"it", "this", "that", "them", "these", "those", "something", "anything",
+                "everything", "one", "there", "here", "stuff", "things"}
+
+# Sites whose video this embedded Chromium cannot decode: protected (DRM)
+# streaming, and sites that only serve H.264. The pip build of QtWebEngine ships
+# neither; the page below reports it if the user's build does.
+_BR_DRM_HOSTS = ("hotstar.com", "jiohotstar.com", "jiocinema.com", "netflix.com",
+                 "primevideo.com", "disneyplus.com", "sonyliv.com", "zee5.com",
+                 "hbomax.com", "max.com", "hulu.com", "peacocktv.com", "tv.apple.com",
+                 "music.apple.com", "open.spotify.com", "voot.com")
+_BR_H264_HOSTS = ("twitch.tv", "tiktok.com", "vimeo.com", "instagram.com",
+                  "facebook.com", "x.com", "twitter.com", "reddit.com")
+
+_BR_POLITE = (r"(?:(?:hey|ok|okay)\s+[\w']+[,\s]+)?"
+              r"(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?")
+_BR_OPEN_VERBS = (r"(?P<verb>run|open|launch|start|load|show|play|go\s+to|browse|visit|"
+                  r"bring\s+up|pull\s+up|take\s+me\s+to|navigate\s+to)")
+_BR_STRICT_VERBS = {"play", "show", "start"}   # only for a site we actually recognise
+_BR_SEARCH_VERBS = r"(?P<verb>search|find|look\s+up|lookup|google)"
+_BR_CLOSE_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:close|hide|exit|quit|shut(?:\s+down)?|dismiss)\s+"
+    r"(?:the\s+|your\s+|this\s+)?(?:in-?app\s+|aura\s+|web\s+)?"
+    r"(?:browser|web\s*window|web\s*page|website|web\s*site)(?:\s+window)?"
+    r"(?:\s+please)?\s*[.!?]*$", re.I)
+
+
+def _br_clean(s: str) -> str:
+    return " ".join((s or "").replace("\u2019", "'").split()).strip(" \t\r\n.,!?;:\"'")
+
+
+def _resolve_site(what: str) -> tuple[str, str, str]:
+    """Turn what the user said into (url, fallback_url, kind).
+
+    kind: "known" (alias table), "url" (address given), "guess" (<name>.com,
+    with a search as fallback if it does not load) or "search"."""
+    raw = _br_clean(what)
+    w = raw.lower()
+    w = re.sub(r"^(?:the\s+)+", "", w)
+    w = re.sub(r"\s+(?:website|web\s*site|web\s*app|webpage|web\s*page|site|page|app)$", "", w).strip()
+    if not w:
+        return "", "", ""
+    # spoken addresses: "github dot com slash gitsdp dev" → github.com/…
+    sp = re.sub(r"\s+dot\s+", ".", w)
+    sp = re.sub(r"\s+slash\s+", "/", sp)
+    sp = re.sub(r"\s+dash\s+", "-", sp)
+    if sp.startswith(("http://", "https://")):
+        return sp, "", "url"
+    if w in _BR_SITES:
+        return _BR_SITES[w], "", "known"
+    squeezed = sp.replace(" ", "")
+    if squeezed in _BR_SITES:
+        return _BR_SITES[squeezed], "", "known"
+    if re.fullmatch(r"(?:localhost|\d{1,3}(?:\.\d{1,3}){3})(?::\d{2,5})?(?:/\S*)?", squeezed):
+        return "http://" + squeezed, "", "url"
+    if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,24}(?::\d{2,5})?(?:/\S*)?", squeezed):
+        return "https://" + squeezed, "", "url"
+    search = _BR_SEARCH_URLS["google"].format(q=quote_plus(raw))
+    if re.fullmatch(r"[a-z0-9][a-z0-9 -]{1,38}", w) and len(w.split()) <= 3:
+        guess = re.sub(r"[^a-z0-9-]", "", w)
+        if guess:
+            return f"https://www.{guess}.com", search, "guess"
+    return search, "", "search"
+
+
+def _parse_browser_command(text: str, ai_name: str) -> tuple[str, str, str, str] | None:
+    """Recognise "<verb> <website> in you" and friends.
+
+    Returns (action, url, fallback_url, label) or None when the text is not a
+    browser command. The command must say where to run it (in you / in
+    yourself / inside <assistant name> / in your browser|window|screen / here)
+    — without that, the text goes to the assistant exactly as before."""
+    t = _br_clean(text)
+    if not t:
+        return None
+    if _BR_CLOSE_RE.match(t):
+        return ("close", "", "", "")
+
+    name = re.escape((ai_name or "aura").strip().lower()) or "aura"
+    where = (r"(?:\s+please)?\s+(?:in|inside|within|on|into|using)\s+(?:the\s+)?"
+             rf"(?:you(?:rself)?|{name}|your\s+(?:own\s+)?(?:browser|window|interface|screen|display)|"
+             r"here|in-?app)(?:\s+(?:window|browser|screen))?(?:\s+please)?$")
+    m = re.search(where, t, re.I)
+    if not m:
+        return None
+    body = t[:m.start()].strip()
+    if not body:
+        return None
+
+    # ── search ───────────────────────────────────────────────────────────
+    ms = re.match(rf"^{_BR_POLITE}{_BR_SEARCH_VERBS}\s+(?:for\s+)?(?P<q>.+)$", body, re.I)
+    if ms:
+        q = _br_clean(ms.group("q"))
+        site = "google"
+        mm = re.match(r"^(?P<q>.+?)\s+(?:on|in|at|from|using)\s+(?P<s>[a-z0-9 ]+)$", q, re.I)
+        if mm and _br_clean(mm.group("s")).lower() in _BR_SEARCH_URLS:
+            q, site = _br_clean(mm.group("q")), _br_clean(mm.group("s")).lower()
+        if not q or q.lower() in _BR_PRONOUNS:
+            return None
+        return ("search", _BR_SEARCH_URLS[site].format(q=quote_plus(q)), "", f"{q} ({site})")
+
+    # ── open / run ───────────────────────────────────────────────────────
+    mo = re.match(rf"^{_BR_POLITE}{_BR_OPEN_VERBS}\s+(?P<what>.+)$", body, re.I)
+    if not mo:
+        return None
+    verb = re.sub(r"\s+", " ", mo.group("verb").lower())
+    what = _br_clean(mo.group("what"))
+    if not what or what.lower() in _BR_PRONOUNS or len(what.split()) > 6:
+        return None
+    url, fallback, kind = _resolve_site(what)
+    if not url:
+        return None
+    if kind in ("guess", "search"):
+        if what.lower() in _BR_PRONOUNS or verb in _BR_STRICT_VERBS:
+            return None
+    return ("open", url, fallback, what)
+
+
+# ── keep the PC's own browser closed while an in-app command is being handled ──
+# A spoken command also reaches the voice model, which may try to open the page
+# in the normal browser as well. For a few seconds after an in-app command, web
+# addresses that would go to the PC's browser through Python are swallowed.
+_BR_GUARD_UNTIL = 0.0
+_BR_ON_SWALLOW = None            # optional callable(url) — set by MainWindow
+
+
+def _arm_browser_guard(seconds: float = 10.0) -> None:
+    global _BR_GUARD_UNTIL
+    _BR_GUARD_UNTIL = time.monotonic() + max(0.0, seconds)
+
+
+def _set_browser_swallow_cb(fn) -> None:
+    global _BR_ON_SWALLOW
+    _BR_ON_SWALLOW = fn
+
+
+def _install_browser_guard() -> None:
+    if getattr(webbrowser, "_aura_inapp_guard", False):
+        return
+
+    def _wrap(orig):
+        def guarded(url, *a, **k):
+            try:
+                if (time.monotonic() < _BR_GUARD_UNTIL
+                        and str(url).lower().startswith(("http://", "https://"))):
+                    cb = _BR_ON_SWALLOW
+                    if callable(cb):
+                        cb(str(url))
+                    return True
+            except Exception:
+                pass
+            return orig(url, *a, **k)
+        return guarded
+
+    for _n in ("open", "open_new", "open_new_tab"):
+        try:
+            setattr(webbrowser, _n, _wrap(getattr(webbrowser, _n)))
+        except Exception:
+            pass
+    webbrowser._aura_inapp_guard = True
+
+
+_BrPageBase = QWebEnginePage if HAVE_WEB else object
+
+
+class _BrowserPage(_BrPageBase):
+    """Web page. A pop-up (window.open with a size — e.g. "Sign in with Google")
+    gets its own small window, so the page that opened it can still hear back
+    from it. Ordinary new-tab links stay inside the one window."""
+
+    def createWindow(self, kind):
+        owner = getattr(self, "aura_owner", None)
+        try:
+            WT = QWebEnginePage.WebWindowType
+            popup_kinds = (WT.WebDialog, WT.WebBrowserWindow)
+        except Exception:
+            popup_kinds = ()
+        if owner is not None and kind in popup_kinds:
+            try:
+                return owner.make_popup_page()
+            except Exception as exc:
+                print(f"[Browser] pop-up failed: {exc}")
+        tmp = QWebEnginePage(self.profile(), self)
+
+        def _land(u: QUrl) -> None:
+            s = u.toString()
+            if not s or s == "about:blank":
+                return
+            self.setUrl(u)
+            QTimer.singleShot(0, tmp.deleteLater)
+
+        tmp.urlChanged.connect(_land)
+        return tmp
+
+    def javaScriptConsoleMessage(self, level, message, line, source):   # noqa: N802
+        return                                          # keep the console quiet
+
+
+class _BrowserHeader(QWidget):
+    """Title strip: drags the whole window, double-click maximises."""
+
+    def __init__(self, win: "AuraBrowserWindow"):
+        super().__init__(win._body)
+        self._win = win
+        self._off = None
+        self.setObjectName("BrowserHdr")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(30)
+
+    def _movable(self) -> bool:
+        return not (self._win.isFullScreen() or self._win.isMaximized())
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._movable():
+            h = self._win.windowHandle()
+            try:
+                if h is not None and h.startSystemMove():
+                    ev.accept()
+                    return
+            except Exception:
+                pass
+            self._off = ev.globalPosition().toPoint() - self._win.frameGeometry().topLeft()
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if (ev.buttons() & Qt.MouseButton.LeftButton) and self._off is not None and self._movable():
+            self._win.move(ev.globalPosition().toPoint() - self._off)
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        self._off = None
+        super().mouseReleaseEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._win.toggle_maximize()
+            ev.accept()
+            return
+        super().mouseDoubleClickEvent(ev)
+
+
+# ── Optional Windows engine: Microsoft Edge (WebView2) ───────────────────────
+#
+# QtWebEngine as shipped on PyPI cannot decode H.264 (Instagram reels, Twitch,
+# TikTok …) and has no DRM. Windows already carries Edge's engine, which can.
+# When `pythonnet` and the WebView2 assemblies are present, those sites open in
+# an Edge-powered view inside the same HUD window. Nothing here runs unless
+# _edge_available() says yes, and any start-up failure falls back to the
+# built-in browser. Needs:  pip install pythonnet pywebview   (pywebview only
+# supplies the WebView2 .dll files; it is never imported).
+_BR_PREFER_EDGE = False        # True: open EVERY site in the Edge engine when possible
+_EDGE_NS = None
+_EDGE_STATE: dict = {}
+
+
+def _br_hit(host: str, names) -> bool:
+    host = (host or "").lower()
+    return any(host == n or host.endswith("." + n) for n in names)
+
+
+def _edge_dll_dir():
+    """Folder holding Microsoft.Web.WebView2.*.dll — normally pywebview's lib/."""
+    cands = []
+    env = os.environ.get("AURA_WEBVIEW2_DIR")
+    if env:
+        cands.append(Path(env))
+    try:
+        import importlib.util as _iu
+        spec = _iu.find_spec("webview")
+        for loc in (spec.submodule_search_locations or []) if spec else []:
+            cands.append(Path(loc) / "lib")
+    except Exception:
+        pass
+    cands.append(BASE_DIR / "lib" / "webview2")
+    for d in cands:
+        if (d / "Microsoft.Web.WebView2.Core.dll").exists() and \
+           (d / "Microsoft.Web.WebView2.WinForms.dll").exists():
+            return d
+    return None
+
+
+def _edge_available() -> bool:
+    """Cheap check (nothing is loaded): Windows + pythonnet + the .dll files."""
+    if "ok" not in _EDGE_STATE:
+        ok = False
+        try:
+            import importlib.util as _iu
+            ok = (platform.system() == "Windows" and _iu.find_spec("clr") is not None
+                  and _edge_dll_dir() is not None)
+        except Exception:
+            ok = False
+        _EDGE_STATE["ok"] = ok
+    return bool(_EDGE_STATE["ok"])
+
+
+def _edge_runtime():
+    """Load .NET and the WebView2 assemblies once; raise a readable error if not."""
+    global _EDGE_NS
+    if _EDGE_NS is not None:
+        return _EDGE_NS
+    import types as _types
+    lib = _edge_dll_dir()
+    if lib is None:
+        raise RuntimeError("WebView2 files not found (pip install pythonnet pywebview)")
+    try:
+        import clr
+    except Exception:
+        os.environ["PYTHONNET_RUNTIME"] = "coreclr"      # same fallback pywebview uses
+        import clr
+    clr.AddReference("System.Windows.Forms")
+    clr.AddReference("System.Drawing")
+    clr.AddReference(str(lib / "Microsoft.Web.WebView2.Core.dll"))
+    clr.AddReference(str(lib / "Microsoft.Web.WebView2.WinForms.dll"))
+    mach = (platform.machine() or "").lower()
+    arch = "win-arm64" if "arm" in mach else ("win-x86" if mach in ("x86", "i386", "i686") else "win-x64")
+    native = lib / "runtimes" / arch / "native"
+    if native.is_dir():                                   # the engine's native loader
+        os.environ["PATH"] = str(native) + os.pathsep + os.environ.get("PATH", "")
+        try:
+            import ctypes
+            ctypes.WinDLL(str(native / "WebView2Loader.dll"))
+        except Exception:
+            pass
+    import System.Windows.Forms as WinForms
+    from System.Drawing import Color
+    from Microsoft.Web.WebView2.WinForms import CoreWebView2CreationProperties, WebView2
+    _EDGE_NS = _types.SimpleNamespace(WinForms=WinForms, Color=Color,
+                                      WebView2=WebView2, Props=CoreWebView2CreationProperties)
+    return _EDGE_NS
+
+
+def _win32():
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+    u.SetParent.restype = wintypes.HWND
+    u.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+    u.MoveWindow.restype = wintypes.BOOL
+    return u
+
+
+class _EdgeFsRequest:
+    """Stands in for QWebEngineFullScreenRequest."""
+
+    def __init__(self, on: bool):
+        self._on = bool(on)
+
+    def accept(self) -> None:
+        return
+
+    def toggleOn(self) -> bool:                           # noqa: N802
+        return self._on
+
+
+class _EdgePage(QObject):
+    """The few page-level calls AuraBrowserWindow makes, answered for Edge."""
+
+    recentlyAudibleChanged = pyqtSignal(bool)             # noqa: N815
+    fullScreenRequested = pyqtSignal(object)              # noqa: N815
+
+    def __init__(self, view: "_EdgeView"):
+        super().__init__(view)
+        self._view = view
+        self._muted = False
+
+    def isAudioMuted(self) -> bool:                       # noqa: N802
+        return self._muted
+
+    def setAudioMuted(self, on: bool) -> None:            # noqa: N802
+        self._muted = bool(on)
+        self._view._apply_mute()
+
+    def runJavaScript(self, *_a, **_k):                   # noqa: N802
+        return None
+
+    def settings(self):
+        return None
+
+
+class _EdgeView(QWidget):
+    """A WebView2 browser hosted in a native child window of this widget.
+
+    It offers the same small surface as QWebEngineView (back, forward, reload,
+    setUrl, url, signals …) so AuraBrowserWindow drives either one the same way.
+    WebView2 is a WinForms control; it is parented to this widget's window handle
+    and kept the size of the widget. Qt's own message loop drives it."""
+
+    loadStarted = pyqtSignal()
+    loadProgress = pyqtSignal(int)
+    loadFinished = pyqtSignal(bool)
+    urlChanged = pyqtSignal(QUrl)
+    titleChanged = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        self.setMinimumSize(200, 150)
+        self._page = _EdgePage(self)
+        self._started = False
+        self._core = None
+        self._wv = None
+        self._form = None
+        self._form_hwnd = 0
+        self._u32 = None
+        self._pending = ""
+        self._url = QUrl()
+        self._title = ""
+        self._zoom = 1.0
+        self._keep: list = []                              # keeps .NET event handlers alive
+
+    # -- QWebEngineView-like surface ---------------------------------------
+    def page(self):
+        return self._page
+
+    def history(self):
+        return self
+
+    def canGoBack(self) -> bool:                           # noqa: N802
+        try:
+            return bool(self._core is not None and self._core.CanGoBack)
+        except Exception:
+            return False
+
+    def canGoForward(self) -> bool:                        # noqa: N802
+        try:
+            return bool(self._core is not None and self._core.CanGoForward)
+        except Exception:
+            return False
+
+    def url(self) -> QUrl:
+        return self._url
+
+    def title(self) -> str:
+        return self._title
+
+    def setUrl(self, u: QUrl) -> None:                     # noqa: N802
+        self._navigate(u.toString())
+
+    def back(self) -> None:
+        self._call("GoBack")
+
+    def forward(self) -> None:
+        self._call("GoForward")
+
+    def reload(self) -> None:
+        self._call("Reload")
+
+    def stop(self) -> None:
+        self._call("Stop")
+
+    def zoomFactor(self) -> float:                         # noqa: N802
+        return self._zoom
+
+    def setZoomFactor(self, z: float) -> None:             # noqa: N802
+        self._zoom = float(z)
+        try:
+            if self._wv is not None:
+                self._wv.ZoomFactor = self._zoom
+        except Exception:
+            pass
+
+    # -- internals ----------------------------------------------------------
+    def _call(self, name: str) -> None:
+        try:
+            if self._core is not None:
+                getattr(self._core, name)()
+        except Exception as exc:
+            print(f"[Edge] {name} failed: {exc}")
+
+    def _navigate(self, url: str) -> None:
+        if not url:
+            return
+        if self._core is None:
+            self._pending = url                            # sent as soon as the engine is up
+            return
+        try:
+            self._core.Navigate(url)
+        except Exception as exc:
+            print(f"[Edge] navigate failed: {exc}")
+            self.loadFinished.emit(False)
+
+    def _apply_mute(self) -> None:
+        try:
+            if self._core is not None:
+                self._core.IsMuted = bool(self._page.isAudioMuted())
+        except Exception:
+            pass
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if not self._started:
+            self._started = True
+            QTimer.singleShot(0, self._start)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit()
+
+    def _fit(self) -> None:
+        if not self._form_hwnd or self._u32 is None:
+            return
+        try:
+            r = self.devicePixelRatioF()
+            self._u32.MoveWindow(self._form_hwnd, 0, 0,
+                                 max(1, int(self.width() * r)), max(1, int(self.height() * r)), True)
+        except Exception:
+            pass
+
+    def _start(self) -> None:
+        try:
+            rt = _edge_runtime()
+            WF = rt.WinForms
+            bg = QColor(C.DARK)
+            colour = rt.Color.FromArgb(255, bg.red(), bg.green(), bg.blue())
+
+            form = WF.Form()
+            form.FormBorderStyle = getattr(WF.FormBorderStyle, "None")
+            form.TopLevel = False
+            form.ShowInTaskbar = False
+            form.BackColor = colour
+
+            wv = rt.WebView2()
+            props = rt.Props()
+            data = CONFIG_DIR / "edge_profile"
+            data.mkdir(parents=True, exist_ok=True)
+            props.UserDataFolder = str(data)
+            props.AdditionalBrowserArguments = "--autoplay-policy=no-user-gesture-required"
+            wv.CreationProperties = props
+            wv.DefaultBackgroundColor = colour
+            wv.Dock = WF.DockStyle.Fill
+            form.Controls.Add(wv)
+            wv.CoreWebView2InitializationCompleted += self._on_init
+
+            self._u32 = _win32()
+            self._form, self._wv = form, wv
+            self._form_hwnd = int(form.Handle.ToInt64())
+            self._u32.SetParent(self._form_hwnd, int(self.winId()))
+            form.Show()
+            self._fit()
+            wv.EnsureCoreWebView2Async(None)
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+
+    def _on_init(self, sender, args) -> None:
+        try:
+            if not args.IsSuccess:
+                self.failed.emit(str(args.InitializationException) or "initialisation failed")
+                return
+            core = self._wv.CoreWebView2
+            self._core = core
+            try:
+                st = core.Settings
+                st.IsStatusBarEnabled = False
+                st.AreDevToolsEnabled = False
+            except Exception:
+                pass
+            core.NavigationStarting += self._on_nav_start
+            core.NavigationCompleted += self._on_nav_done
+            core.SourceChanged += self._on_source
+            core.DocumentTitleChanged += self._on_title
+            core.HistoryChanged += self._on_history
+            core.NewWindowRequested += self._on_new_window
+            core.ContainsFullScreenElementChanged += self._on_fullscreen
+            try:
+                core.IsDocumentPlayingAudioChanged += self._on_audio
+            except Exception:
+                pass
+            self._apply_mute()
+            if self._zoom != 1.0:
+                self.setZoomFactor(self._zoom)
+            if self._pending:
+                url, self._pending = self._pending, ""
+                self._navigate(url)
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+
+    # -- engine events (all arrive on the Qt thread) -------------------------
+    def _on_nav_start(self, sender, args) -> None:
+        self.loadStarted.emit()
+
+    def _on_nav_done(self, sender, args) -> None:
+        try:
+            ok = bool(args.IsSuccess)
+        except Exception:
+            ok = True
+        self.loadProgress.emit(100)
+        self.loadFinished.emit(ok)
+
+    def _on_source(self, sender, args) -> None:
+        try:
+            self._url = QUrl(str(self._core.Source))
+            self.urlChanged.emit(self._url)
+        except Exception:
+            pass
+
+    def _on_title(self, sender, args) -> None:
+        try:
+            self._title = str(self._core.DocumentTitle or "")
+            self.titleChanged.emit(self._title)
+        except Exception:
+            pass
+
+    def _on_history(self, sender, args) -> None:
+        self.urlChanged.emit(self._url)                    # refreshes back / forward state
+
+    def _on_new_window(self, sender, args) -> None:
+        """Links that want a new tab stay in this window; a real pop-up (it asks
+        for a size — "Sign in with Google" and the like) gets Edge's own pop-up
+        window, which keeps the connection back to the page that opened it."""
+        try:
+            feats = args.WindowFeatures
+            if feats is not None and bool(feats.HasSize):
+                return
+        except Exception:
+            pass
+        try:
+            args.set_Handled(True)
+            self._navigate(str(args.get_Uri()))
+        except Exception as exc:
+            print(f"[Edge] new-window handling failed: {exc}")
+
+    def _on_fullscreen(self, sender, args) -> None:
+        try:
+            self._page.fullScreenRequested.emit(_EdgeFsRequest(self._core.ContainsFullScreenElement))
+        except Exception:
+            pass
+
+    def _on_audio(self, sender, args) -> None:
+        try:
+            self._page.recentlyAudibleChanged.emit(bool(self._core.IsDocumentPlayingAudio))
+        except Exception:
+            pass
+
+    def dispose(self) -> None:
+        """App exit: release the engine."""
+        try:
+            if self._wv is not None:
+                self._wv.Dispose()
+            if self._form is not None:
+                self._form.Dispose()
+        except Exception:
+            pass
+        self._core = self._wv = self._form = None
+        self._form_hwnd = 0
+
+
+class _FramelessEdges:
+    """Mixin: resize a frameless top-level window from the invisible border
+    around its body (every edge and corner) using the system's own resize."""
+
+    _EDGE = 7
+
+    def _edges_at(self, p: QPoint):
+        e = self._EDGE + 2
+        edges = Qt.Edge(0)
+        if p.x() <= e:
+            edges |= Qt.Edge.LeftEdge
+        if p.x() >= self.width() - e:
+            edges |= Qt.Edge.RightEdge
+        if p.y() <= e:
+            edges |= Qt.Edge.TopEdge
+        if p.y() >= self.height() - e:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def _resizable(self) -> bool:
+        return not (self.isFullScreen() or self.isMaximized())
+
+    def mouseMoveEvent(self, ev):
+        if not self._resizable():
+            self.unsetCursor()
+            return super().mouseMoveEvent(ev)
+        ed = self._edges_at(ev.position().toPoint())
+        L, R = Qt.Edge.LeftEdge, Qt.Edge.RightEdge
+        T, B = Qt.Edge.TopEdge, Qt.Edge.BottomEdge
+        if (ed & L and ed & T) or (ed & R and ed & B):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif (ed & R and ed & T) or (ed & L and ed & B):
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif ed & L or ed & R:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif ed & T or ed & B:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(ev)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._resizable():
+            ed = self._edges_at(ev.position().toPoint())
+            h = self.windowHandle()
+            if ed and h is not None:
+                try:
+                    if h.startSystemResize(ed):
+                        ev.accept()
+                        return
+                except Exception:
+                    pass
+        super().mousePressEvent(ev)
+
+    def leaveEvent(self, ev):
+        self.unsetCursor()
+        super().leaveEvent(ev)
+
+
+def _browser_stylesheet() -> str:
+    """Built from the live palette; retheme_all_widgets() swaps the colours in
+    these sheets when the accent changes, like every other panel."""
+    return f"""
+        QWidget#AuraBrowserWin {{ background: {C.DARK}; }}
+        QFrame#BrowserBody {{ background: {C.DARK}; border: 1px solid {C.BORDER_B}; }}
+        QWidget#BrowserHdr {{ background: {C.DARK}; border-bottom: 1px solid {C.BORDER}; }}
+        QWidget#BrowserNote {{ background: {C.PRI_GHO}; border-bottom: 1px solid {C.BORDER}; }}
+        QLabel#BrowserNoteText {{ color: {C.TEXT}; background: transparent; border: none; }}
+        QLineEdit#BrowserUrl {{
+            background: {C.DARK}; color: {C.TEXT};
+            border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 8px;
+            selection-background-color: {C.PRI_GHO};
+        }}
+        QLineEdit#BrowserUrl:focus {{ border: 1px solid {C.PRI}; }}
+        QPushButton#BrowserBtn, QPushButton#BrowserTextBtn {{
+            background: {C.PANEL}; color: {C.PRI};
+            border: 1px solid {C.PRI_DIM}; border-radius: 3px;
+        }}
+        QPushButton#BrowserTextBtn {{ padding: 0 10px; }}
+        QPushButton#BrowserBtn:hover, QPushButton#BrowserTextBtn:hover {{
+            background: {C.PRI_GHO}; border: 1px solid {C.PRI};
+        }}
+        QPushButton#BrowserBtn:disabled {{ color: {C.TEXT_DIM}; border: 1px solid {C.BORDER}; }}
+        QPushButton#BrowserClose {{ background: transparent; color: {C.TEXT_DIM}; border: none; }}
+        QPushButton#BrowserClose:hover {{ color: {C.MUTED_C}; }}
+        QProgressBar#BrowserProgress {{ background: {C.DARK}; border: none; }}
+        QProgressBar#BrowserProgress::chunk {{ background: {C.PRI}; }}
+    """
+
+
+class _BrowserPopup(_FramelessEdges, QWidget):
+    """Small window for a page's pop-up (sign-in dialogs and the like). The
+    address stays visible so you can see where you are signing in."""
+
+    closed = pyqtSignal(object)
+
+    def __init__(self, owner: "AuraBrowserWindow"):
+        super().__init__(owner, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self._owner = owner
+        self.setObjectName("AuraBrowserWin")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMouseTracking(True)
+        self.setMinimumSize(360, 300)
+
+        E = self._EDGE
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(E, E, E, E)
+        outer.setSpacing(0)
+        self._body = QFrame(self)
+        self._body.setObjectName("BrowserBody")
+        self._body.setCursor(Qt.CursorShape.ArrowCursor)
+        outer.addWidget(self._body)
+        body = QVBoxLayout(self._body)
+        body.setContentsMargins(1, 1, 1, 1)
+        body.setSpacing(0)
+
+        self._hdr = _BrowserHeader(self)
+        hl = QHBoxLayout(self._hdr)
+        hl.setContentsMargins(10, 0, 6, 0)
+        hl.setSpacing(8)
+        dot = QLabel("◈")
+        dot.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        dot.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(dot)
+        tag = QLabel("POP-UP")
+        tag.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        tag.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 1px; border: none;")
+        tag.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(tag)
+        self._title = QLabel("")
+        self._title.setFont(QFont("Courier New", 8))
+        self._title.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        self._title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(self._title, 1)
+        close = QPushButton("✕")
+        close.setObjectName("BrowserClose")
+        close.setFixedSize(22, 22)
+        close.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.clicked.connect(self.close)
+        hl.addWidget(close)
+        body.addWidget(self._hdr)
+
+        bar = QWidget(self._body)
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(8, 6, 8, 6)
+        self._url = QLineEdit()
+        self._url.setObjectName("BrowserUrl")
+        self._url.setFont(QFont("Courier New", 9))
+        self._url.setReadOnly(True)
+        bl.addWidget(self._url)
+        body.addWidget(bar)
+
+        self.view = QWebEngineView(self._body)
+        self.page = _BrowserPage(owner._profile, self)
+        self.page.aura_owner = owner               # pop-ups of pop-ups land beside it
+        self.view.setPage(self.page)
+        self.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        body.addWidget(self.view, 1)
+
+        self.page.windowCloseRequested.connect(self.close)     # window.close()
+        self.page.geometryChangeRequested.connect(self._on_geometry)
+        self.view.urlChanged.connect(self._on_url)
+        self.view.titleChanged.connect(self._on_title)
+        self.setStyleSheet(_browser_stylesheet())
+
+        self._place(520, 680)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_maximize(self) -> None:          # the header's double-click
+        return
+
+    def _place(self, w: int, h: int) -> None:
+        try:
+            area = (self._owner.screen() or QApplication.primaryScreen()).availableGeometry()
+        except Exception:
+            area = QApplication.primaryScreen().availableGeometry()
+        w = max(self.minimumWidth(), min(int(w), int(area.width() * 0.9)))
+        h = max(self.minimumHeight(), min(int(h), int(area.height() * 0.9)))
+        c = self._owner.frameGeometry().center()
+        x = max(area.left(), min(c.x() - w // 2, area.right() - w + 1))
+        y = max(area.top(), min(c.y() - h // 2, area.bottom() - h + 1))
+        self.setGeometry(x, y, w, h)
+
+    def _on_geometry(self, rect: QRect) -> None:
+        """The page asked for a particular size (window.open features)."""
+        if rect.width() >= 200 and rect.height() >= 200:
+            self._place(rect.width() + 2 * self._EDGE + 2,
+                        rect.height() + 2 * self._EDGE + 72)
+
+    def _on_url(self, u: QUrl) -> None:
+        self._url.setText(u.toString())
+        self._url.setCursorPosition(0)
+
+    def _on_title(self, t: str) -> None:
+        fm = self._title.fontMetrics()
+        self._title.setText(fm.elidedText(f"—  {t}" if t else "",
+                                          Qt.TextElideMode.ElideRight, max(40, self._title.width())))
+
+    def closeEvent(self, ev):
+        super().closeEvent(ev)
+        self.closed.emit(self)
+        QTimer.singleShot(0, self.deleteLater)
+
+
+class AuraBrowserWindow(_FramelessEdges, QWidget):
+    """Floating in-app browser: draggable by its header, resizable from every
+    edge and corner, three times the size of the news / briefing panel by
+    default (kept inside the screen), HUD-styled from the live palette."""
+
+    closed          = pyqtSignal()
+    audible_changed = pyqtSignal(bool)      # the page is making sound
+    backend_failed  = pyqtSignal(str)       # the Edge engine could not start
+    edge_requested  = pyqtSignal(str)       # user asked to play this page in the Edge engine
+
+    _EDGE = 7                               # invisible resize border, px
+    _NEWS_W, _NEWS_H = 520, 280             # the briefing panel's largest size
+    _SCALE = 3
+
+    def __init__(self, main: QWidget, backend: str = "qt"):
+        super().__init__(main, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self._main = main
+        self._backend = backend                 # "qt" = built-in Chromium · "edge" = WebView2
+        self.setObjectName("AuraBrowserWin")
+        self.setWindowTitle("A.U.R.A Browser")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMouseTracking(True)
+        self.setMinimumSize(480, 320)
+
+        self._fallback = ""
+        self._fallback_host = ""
+        self._loading = False
+        self._placed = False
+        self._pre_fs_max = False
+        self._page_title = ""
+        self._popups: list = []
+        self._media = {"h264": None, "drm": None}   # what this engine can decode
+        self._probe_state = 0                          # 0 not run · 1 running · 2 done
+        self._probe_tries = 0
+        self._warned: set[str] = set()
+        if backend == "edge":
+            self._probe_state = 2               # Edge decodes H.264; nothing to probe
+
+        self._build_profile()
+        self._build_ui()
+        self._apply_style()
+
+    # ── construction ─────────────────────────────────────────────────────
+    def _build_profile(self) -> None:
+        if self._backend == "edge":
+            self._profile = None
+            return
+        data = CONFIG_DIR / "browser_profile"
+        try:
+            data.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._profile = QWebEngineProfile("aura_browser", self)
+        try:
+            self._profile.setPersistentStoragePath(str(data))
+            self._profile.setCachePath(str(data / "cache"))
+            self._profile.setPersistentCookiesPolicy(
+                QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
+            # Present as ordinary Chromium: sites sometimes refuse the
+            # "QtWebEngine" token.
+            ua = re.sub(r"\s*QtWebEngine/[\d.]+", "", self._profile.httpUserAgent())
+            self._profile.setHttpUserAgent(ua)
+        except Exception:
+            pass
+        self._profile.downloadRequested.connect(self._on_download)
+
+        self._page = _BrowserPage(self._profile, self)
+        self._page.aura_owner = self
+        st = self._page.settings()
+        WA = QWebEngineSettings.WebAttribute
+        for name, val in (("FullScreenSupportEnabled", True),
+                          ("PlaybackRequiresUserGesture", False),
+                          ("ScrollAnimatorEnabled", True),
+                          ("JavascriptCanOpenWindows", True),
+                          ("LocalStorageEnabled", True)):
+            try:
+                st.setAttribute(getattr(WA, name), val)
+            except Exception:
+                pass
+
+    def _build_ui(self) -> None:
+        E = self._EDGE
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(E, E, E, E)
+        outer.setSpacing(0)
+
+        self._body = QFrame(self)
+        self._body.setObjectName("BrowserBody")
+        self._body.setCursor(Qt.CursorShape.ArrowCursor)
+        outer.addWidget(self._body)
+        body = QVBoxLayout(self._body)
+        body.setContentsMargins(1, 1, 1, 1)
+        body.setSpacing(0)
+
+        # header ----------------------------------------------------------
+        self._hdr = _BrowserHeader(self)
+        hl = QHBoxLayout(self._hdr)
+        hl.setContentsMargins(10, 0, 6, 0)
+        hl.setSpacing(8)
+        dot = QLabel("◈")
+        dot.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        dot.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(dot)
+        tag = QLabel("BROWSER" if self._backend == "qt" else "BROWSER · EDGE")
+        tag.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        tag.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 1px; border: none;")
+        tag.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(tag)
+        self._title = QLabel("")
+        self._title.setFont(QFont("Courier New", 8))
+        self._title.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        self._title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(self._title, 1)
+
+        self._max_btn = QPushButton("▢")
+        self._max_btn.setObjectName("BrowserClose")
+        self._max_btn.setFixedSize(22, 22)
+        self._max_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._max_btn.setToolTip("Maximise / restore")
+        self._max_btn.clicked.connect(self.toggle_maximize)
+        hl.addWidget(self._max_btn)
+        close = QPushButton("✕")
+        close.setObjectName("BrowserClose")
+        close.setFixedSize(22, 22)
+        close.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setToolTip("Close (stops playback)")
+        close.clicked.connect(self.close)
+        hl.addWidget(close)
+        body.addWidget(self._hdr)
+
+        # toolbar ---------------------------------------------------------
+        self._bar = QWidget(self._body)
+        bl = QHBoxLayout(self._bar)
+        bl.setContentsMargins(8, 6, 8, 6)
+        bl.setSpacing(5)
+
+        def _btn(txt: str, tip: str, fn) -> QPushButton:
+            b = QPushButton(txt)
+            b.setObjectName("BrowserBtn")
+            b.setFixedSize(30, 26)
+            b.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            return b
+
+        if self._backend == "edge":
+            self.view = _EdgeView(self._body)
+            self._page = self.view.page()
+            self.view.failed.connect(self.backend_failed.emit)
+        else:
+            self.view = QWebEngineView(self._body)
+            self.view.setPage(self._page)
+
+        self._back = _btn("◀", "Back (Alt+←)", self.view.back)
+        self._fwd = _btn("▶", "Forward (Alt+→)", self.view.forward)
+        self._reload = _btn("⟳", "Reload (F5)", self._reload_or_stop)
+        self._sound = _btn("🔊", "Sound on / off", self._toggle_sound)
+        self._ext = _btn("↗", "Open this page in the PC browser", self._open_external)
+        self._url = QLineEdit()
+        self._url.setObjectName("BrowserUrl")
+        self._url.setFont(QFont("Courier New", 9))
+        self._url.setPlaceholderText("Type a website or a search…")
+        self._url.returnPressed.connect(lambda: self.go_text(self._url.text()))
+        for w in (self._back, self._fwd, self._reload):
+            bl.addWidget(w)
+        bl.addWidget(self._url, 1)
+        bl.addWidget(self._sound)
+        bl.addWidget(self._ext)
+        body.addWidget(self._bar)
+
+        self._progress = QProgressBar()
+        self._progress.setObjectName("BrowserProgress")
+        self._progress.setRange(0, 100)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(2)
+        self._progress.hide()
+        body.addWidget(self._progress)
+
+        # Notice strip: shown on sites whose video this engine cannot decode.
+        self._notice = QWidget(self._body)
+        self._notice.setObjectName("BrowserNote")
+        self._notice.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        nl = QHBoxLayout(self._notice)
+        nl.setContentsMargins(10, 5, 6, 5)
+        nl.setSpacing(8)
+        self._note_text = QLabel("")
+        self._note_text.setObjectName("BrowserNoteText")
+        self._note_text.setFont(QFont("Courier New", 8))
+        self._note_text.setWordWrap(True)
+        nl.addWidget(self._note_text, 1)
+        self._note_edge = QPushButton("PLAY HERE · EDGE ENGINE")
+        self._note_edge.setObjectName("BrowserTextBtn")
+        self._note_edge.setFixedHeight(22)
+        self._note_edge.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._note_edge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._note_edge.clicked.connect(self._request_edge)
+        self._note_edge.hide()
+        nl.addWidget(self._note_edge)
+        note_btn = QPushButton("OPEN IN PC BROWSER ↗")
+        note_btn.setObjectName("BrowserTextBtn")
+        note_btn.setFixedHeight(22)
+        note_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        note_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        note_btn.clicked.connect(self._open_external)
+        nl.addWidget(note_btn)
+        note_x = QPushButton("✕")
+        note_x.setObjectName("BrowserClose")
+        note_x.setFixedSize(20, 20)
+        note_x.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        note_x.setCursor(Qt.CursorShape.PointingHandCursor)
+        note_x.clicked.connect(self._notice.hide)
+        nl.addWidget(note_x)
+        self._notice.hide()
+        body.addWidget(self._notice)
+
+        self.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        body.addWidget(self.view, 1)
+
+        # wiring ----------------------------------------------------------
+        self.view.loadStarted.connect(self._on_load_started)
+        self.view.loadProgress.connect(self._on_progress)
+        self.view.loadFinished.connect(self._on_load_finished)
+        self.view.urlChanged.connect(self._on_url_changed)
+        self.view.titleChanged.connect(self._on_title_changed)
+        self._page.recentlyAudibleChanged.connect(self.audible_changed.emit)
+        self._page.fullScreenRequested.connect(self._on_fullscreen_request)
+
+        for seq, fn in (("Ctrl+L", lambda: (self._url.setFocus(), self._url.selectAll())),
+                        ("F5", self.view.reload), ("Ctrl+R", self.view.reload),
+                        ("Alt+Left", self.view.back), ("Alt+Right", self.view.forward),
+                        ("Ctrl+=", lambda: self._zoom(+0.1)), ("Ctrl++", lambda: self._zoom(+0.1)),
+                        ("Ctrl+-", lambda: self._zoom(-0.1)), ("Ctrl+0", lambda: self._zoom(0))):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(fn)
+
+    def _apply_style(self) -> None:
+        self.setStyleSheet(_browser_stylesheet())
+        self._sync_nav()
+
+    # ── public API ───────────────────────────────────────────────────────
+    def open_url(self, url: str, fallback: str = "") -> None:
+        """Show the window (if hidden) and load `url`. `fallback` is loaded
+        once if `url` was only a guess and does not load."""
+        self._fallback = fallback or ""
+        self._fallback_host = QUrl(url).host() if fallback else ""
+        self.present()
+        self.view.setUrl(QUrl(url))
+
+    def go_text(self, text: str) -> None:
+        """Address-bar entry: URL, local file, site name or search words."""
+        t = (text or "").strip()
+        if not t:
+            return
+        if t.lower().startswith("file://"):
+            self.open_url(t)
+        elif re.match(r"^[A-Za-z]:[\\/]", t) or t.startswith("/"):
+            if Path(t).exists():
+                self.open_url(QUrl.fromLocalFile(t).toString())
+            else:
+                self.open_url(_BR_SEARCH_URLS["google"].format(q=quote_plus(t)))
+        else:
+            url, fb, _kind = _resolve_site(t)
+            if url:
+                self.open_url(url, fb)
+        self.view.setFocus()
+
+    def present(self) -> None:
+        if not self._placed:
+            self._place()
+            self._placed = True
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_maximize(self) -> None:
+        if self.isFullScreen():
+            return
+        if self.isMaximized():
+            self.showNormal()
+            self._max_btn.setText("▢")
+        else:
+            self.showMaximized()
+            self._max_btn.setText("❐")
+
+    def shutdown(self) -> None:
+        """App exit: release the engine objects in a safe order."""
+        if self._backend == "edge":
+            try:
+                self.hide()
+                self.view.dispose()
+            except Exception:
+                pass
+            return
+        try:
+            self.view.setUrl(QUrl("about:blank"))
+            self.hide()
+            from PyQt6 import sip
+            for p in list(self._popups):
+                try:
+                    sip.delete(p)
+                except Exception:
+                    pass
+            sip.delete(self.view)
+            sip.delete(self._page)
+            sip.delete(self._profile)
+        except Exception:
+            pass
+
+    # ── placement ────────────────────────────────────────────────────────
+    def _news_panel_size(self) -> tuple[int, int]:
+        """The size the news / briefing panel has right now (same rule as
+        MainWindow._position_content_panel)."""
+        try:
+            cs = self._main._center_split
+            pw = min(max(cs.width() - 48, 280), self._NEWS_W)
+            ph = min(max(cs.height() - 60, 160), self._NEWS_H)
+            return int(pw), int(ph)
+        except Exception:
+            return self._NEWS_W, self._NEWS_H
+
+    def _place(self) -> None:
+        try:
+            screen = self._main.screen() or QApplication.primaryScreen()
+            area = screen.availableGeometry()
+        except Exception:
+            area = QApplication.primaryScreen().availableGeometry()
+        nw, nh = self._news_panel_size()
+        w = min(nw * self._SCALE, int(area.width() * 0.96))
+        h = min(nh * self._SCALE, int(area.height() * 0.94))
+        w, h = max(w, self.minimumWidth()), max(h, self.minimumHeight())
+        c = self._main.frameGeometry().center()
+        x = max(area.left(), min(c.x() - w // 2, area.right() - w + 1))
+        y = max(area.top(), min(c.y() - h // 2, area.bottom() - h + 1))
+        self.setGeometry(x, y, w, h)
+
+    # ── page events ──────────────────────────────────────────────────────
+    def _sync_nav(self) -> None:
+        try:
+            h = self.view.history()
+            self._back.setEnabled(h.canGoBack())
+            self._fwd.setEnabled(h.canGoForward())
+        except Exception:
+            pass
+        self._reload.setText("■" if self._loading else "⟳")
+        self._reload.setToolTip("Stop" if self._loading else "Reload (F5)")
+
+    def _reload_or_stop(self) -> None:
+        if self._loading:
+            self.view.stop()
+        else:
+            self.view.reload()
+
+    def _toggle_sound(self) -> None:
+        muted = not self._page.isAudioMuted()
+        self._page.setAudioMuted(muted)
+        self._sound.setText("🔇" if muted else "🔊")
+
+    def _zoom(self, delta: float) -> None:
+        z = 1.0 if delta == 0 else self.view.zoomFactor() + delta
+        self.view.setZoomFactor(max(0.25, min(5.0, z)))
+
+    def _on_load_started(self) -> None:
+        self._loading = True
+        self._progress.setValue(5)
+        self._progress.show()
+        self._sync_nav()
+
+    def _on_progress(self, pct: int) -> None:
+        self._progress.setValue(max(5, int(pct)))
+
+    def _on_load_finished(self, ok: bool) -> None:
+        self._loading = False
+        self._progress.hide()
+        self._sync_nav()
+        if ok and self._probe_state == 0:
+            u = self.view.url()
+            if u.scheme() in ("https", "file") or u.host() in ("localhost", "127.0.0.1"):
+                self._probe_media()
+        if (not ok and self._fallback
+                and self.view.url().host() == self._fallback_host):
+            fb, self._fallback = self._fallback, ""     # one retry only
+            self.view.setUrl(QUrl(fb))
+
+    def _on_url_changed(self, u: QUrl) -> None:
+        s = u.toString()
+        if s == "about:blank":
+            s = ""
+        if not self._url.hasFocus():
+            self._url.setText(s)
+            self._url.setCursorPosition(0)
+        self._sync_nav()
+        self._check_notice()
+
+    def _on_title_changed(self, t: str) -> None:
+        self._page_title = t or ""
+        self._refresh_title()
+
+    def _refresh_title(self) -> None:
+        fm = self._title.fontMetrics()
+        self._title.setText(fm.elidedText(
+            f"—  {self._page_title}" if self._page_title else "",
+            Qt.TextElideMode.ElideRight, max(40, self._title.width())))
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._refresh_title()
+
+    def _set_chrome(self, on: bool) -> None:
+        self._hdr.setVisible(on)
+        self._bar.setVisible(on)
+        m = self._EDGE if on else 0
+        self.layout().setContentsMargins(m, m, m, m)
+
+    def _on_fullscreen_request(self, req) -> None:
+        """The page's own fullscreen button (e.g. YouTube) — the chrome steps
+        aside and the page fills the screen; Esc / the button brings it back."""
+        req.accept()
+        if req.toggleOn():
+            if self.isFullScreen():
+                return
+            self._pre_fs_max = self.isMaximized()
+            self._set_chrome(False)
+            self.showFullScreen()
+        else:
+            self._set_chrome(True)
+            if self._pre_fs_max:
+                self.showMaximized()
+            else:
+                self.showNormal()
+
+    # ── pop-ups ──────────────────────────────────────────────────────────
+    def make_popup_page(self):
+        """A page asked for a pop-up window: give it one and hand back its page."""
+        pop = _BrowserPopup(self)
+        self._popups.append(pop)
+        pop.closed.connect(lambda p: self._popups.remove(p) if p in self._popups else None)
+        return pop.page
+
+    def _request_edge(self) -> None:
+        u = self.view.url()
+        if u.isValid() and u.scheme() in ("http", "https"):
+            self.edge_requested.emit(u.toString())
+
+    def _open_external(self) -> None:
+        """User-pressed escape hatch: this page in the PC's own browser."""
+        u = self.view.url()
+        if u.isValid() and u.scheme() in ("http", "https"):
+            QDesktopServices.openUrl(u)
+
+    # ── what can this engine play? ───────────────────────────────────────
+    def _probe_media(self) -> None:
+        """Ask the engine itself (once) whether it can decode H.264 and use DRM,
+        so the notice below is true for this PC's Qt build, not assumed."""
+        if self._probe_state != 0:
+            return
+        self._probe_state, self._probe_tries = 1, 0
+        js = ("(function(){var r={h264:false};try{r.h264=MediaSource.isTypeSupported("
+              "'video/mp4; codecs=\"avc1.42E01E, mp4a.40.2\"');}catch(e){}"
+              "window.__auraDrm='pending';try{navigator.requestMediaKeySystemAccess("
+              "'com.widevine.alpha',[{initDataTypes:['cenc'],videoCapabilities:["
+              "{contentType:'video/mp4; codecs=\"avc1.42E01E\"'}]}]).then("
+              "function(){window.__auraDrm='yes'},function(){window.__auraDrm='no'});"
+              "}catch(e){window.__auraDrm='no'}return JSON.stringify(r);})()")
+        self._page.runJavaScript(js, self._on_probe_h264)
+
+    def _on_probe_h264(self, res) -> None:
+        try:
+            self._media["h264"] = bool(json.loads(res).get("h264"))
+        except Exception:
+            self._media["h264"] = False
+        QTimer.singleShot(1500, lambda: self._page.runJavaScript(
+            "window.__auraDrm||'lost'", self._on_probe_drm))
+
+    def _on_probe_drm(self, res) -> None:
+        if res == "pending" and self._probe_tries < 4:
+            self._probe_tries += 1
+            QTimer.singleShot(1000, lambda: self._page.runJavaScript(
+                "window.__auraDrm||'lost'", self._on_probe_drm))
+            return
+        if res == "lost":                       # navigated away mid-probe: try again later
+            self._probe_state = 0
+            return
+        self._media["drm"] = bool(res == "yes" and self._media["h264"])
+        self._probe_state = 2
+        self._main._log.append_log(
+            "SYS: Browser video support — H.264 "
+            f"{'yes' if self._media['h264'] else 'no'} · protected (DRM) streaming "
+            f"{'yes' if self._media['drm'] else 'no'}.")
+        self._check_notice()
+
+    def _check_notice(self, host: str | None = None) -> None:
+        if self._backend != "qt" or self._probe_state != 2:
+            return
+        host = (host if host is not None else self.view.url().host() or "").lower()
+        if not host:
+            return
+
+        edge = _edge_available()
+        tail = "Try the Edge engine →" if edge else "Use your PC browser →"
+        if _br_hit(host, _BR_DRM_HOSTS) and not self._media["drm"]:
+            msg = ("This site streams protected (DRM) video, which this built-in "
+                   "engine cannot play. " + tail)
+        elif _br_hit(host, _BR_H264_HOSTS) and not self._media["h264"]:
+            msg = ("Videos here use H.264, which this built-in engine cannot "
+                   "decode, so they stay black. " + tail)
+        else:
+            self._notice.hide()
+            return
+        if host in self._warned:
+            return
+        self._warned.add(host)
+        self._note_text.setText(msg)
+        self._note_edge.setVisible(edge)
+        self._notice.show()
+
+    def _on_download(self, item) -> None:
+        """A download the user started: saved to the Downloads folder."""
+        try:
+            folder = Path.home() / "Downloads"
+            folder.mkdir(parents=True, exist_ok=True)
+            base = Path(item.downloadFileName() or "download")
+            dest, n = folder / base.name, 1
+            while dest.exists():
+                dest = folder / f"{base.stem} ({n}){base.suffix}"
+                n += 1
+            item.setDownloadDirectory(str(folder))
+            item.setDownloadFileName(dest.name)
+            item.accept()
+            self._main._log.append_log(f"SYS: Downloading {dest.name} → Downloads folder.")
+            item.isFinishedChanged.connect(
+                lambda n=dest.name: self._main._log.append_log(f"SYS: Download finished — {n}"))
+        except Exception as exc:
+            try:
+                item.cancel()
+            except Exception:
+                pass
+            self._main._log.append_log(f"ERR: Download failed — {exc}")
+
+    def closeEvent(self, ev):
+        # Closing ends playback too: a page left running would keep making sound.
+        for p in list(self._popups):
+            try:
+                p.close()
+            except Exception:
+                pass
+        try:
+            self.view.setUrl(QUrl("about:blank"))
+            self._page.setAudioMuted(False)
+            self._sound.setText("🔊")
+            if self.isFullScreen():
+                self._set_chrome(True)
+                self.showNormal()
+        except Exception:
+            pass
+        super().closeEvent(ev)
+        self.closed.emit()
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -5613,6 +7238,7 @@ class MainWindow(QMainWindow):
     _notification_command_sig = pyqtSignal(str)
     _system_panel_sig = pyqtSignal(str)
     _system_state_sig = pyqtSignal(str, object)
+    _browser_cmd_sig = pyqtSignal(str, str, str, str)   # (action, url, fallback, label)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -5726,6 +7352,15 @@ class MainWindow(QMainWindow):
         # centre of the HUD for a while and then gives it back.
         self._video_split = False        # is the sound a separate stream?
         self._video_auto_muted = False   # did the app close the mic, or the user?
+        self._browser_win = None         # in-app browser window, created on first use
+        self._edge_win = None            # Edge-engine browser window (optional, Windows)
+        self._edge_broken = False        # the Edge engine failed to start once
+        self._edge_last = None           # what the Edge window was asked to open
+        self._browser_auto_muted = False # did the browser close the mic, or the user?
+        self._br_last_cmd = None         # de-duplicates an echoed command
+        self._br_last_t = 0.0
+        self._br_buf = ""                # spoken command arriving in pieces
+        self._br_buf_t = 0.0
         self._video_on = False           # plain flag: safe to read from plugin threads
         self._video_cont = self._build_video_surface()
 
@@ -5775,6 +7410,11 @@ class MainWindow(QMainWindow):
         self._update_metrics()
 
         self._log_sig.connect(self._log.append_log)
+        self._log_sig.connect(self._browser_log_tap)       # spoken "… in you" commands
+        self._browser_cmd_sig.connect(self._on_browser_cmd)
+        _install_browser_guard()
+        _set_browser_swallow_cb(
+            lambda _u: self._log_sig.emit("SYS: Kept the page inside the in-app browser."))
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -5834,6 +7474,7 @@ class MainWindow(QMainWindow):
         self._face_samples      = []
         self._face_new          = []
         self._face_streak       = 0
+        self._face_verified     = False
         self._face_last         = 0.0
         self._face_last_sample  = 0.0
         self._face_prev_enabled = {}
@@ -6336,6 +7977,7 @@ class MainWindow(QMainWindow):
                     if msg:
                         self._face_overlay.set_status(msg, C.PRI)
             elif kind == "unlock":
+                self._face_verified = True
                 self._log.append_log("SYS: Face recognised — unlocked.")
                 self._face_unlock_ui("ACCESS GRANTED")
             elif kind == "enrolled":
@@ -6375,6 +8017,18 @@ class MainWindow(QMainWindow):
                 stored = self._face_stored
                 if stored is None or len(stored) == 0:
                     return
+                if n != 1:
+                    self._face_streak = 0
+                    emit("warn", 0, "ONLY ONE PERSON IN FRAME, PLEASE")
+                    return
+                if fw < _FACE_MIN_WIDTH:
+                    self._face_streak = 0
+                    emit("warn", 0, "MOVE CLOSER — FACE MUST BE WITHIN 3 METRES")
+                    return
+                if fw > _FACE_MAX_WIDTH:
+                    self._face_streak = 0
+                    emit("warn", 0, "MOVE BACK — FACE MUST BE AT LEAST 1 METRE AWAY")
+                    return
                 score = float(np.max(stored @ feat))
                 if score >= _FACE_THRESH:
                     self._face_streak += 1
@@ -6391,8 +8045,11 @@ class MainWindow(QMainWindow):
             if n > 1:
                 emit("warn", 0, "ONLY ONE PERSON IN FRAME, PLEASE")
                 return
-            if fw < 90:
-                emit("warn", 0, "MOVE A LITTLE CLOSER TO THE CAMERA")
+            if fw < _FACE_MIN_WIDTH:
+                emit("warn", 0, "MOVE CLOSER — FACE MUST BE WITHIN 3 METRES")
+                return
+            if fw > _FACE_MAX_WIDTH:
+                emit("warn", 0, "MOVE BACK — FACE MUST BE AT LEAST 1 METRE AWAY")
                 return
             if now - self._face_last_sample < 0.6:
                 return
@@ -6670,6 +8327,12 @@ class MainWindow(QMainWindow):
                     mini.hide_mini()
 
     def closeEvent(self, e):
+        for _bw in (self._browser_win, self._edge_win):
+            try:
+                if _bw is not None:
+                    _bw.shutdown()
+            except Exception as exc:
+                print(f"[Browser] Shutdown failed: {exc}")
         try:
             if callable(self.on_notification_stop):
                 self.on_notification_stop()
@@ -6695,6 +8358,148 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(e)
+
+    # --- In-app browser ("Run <site> in you") ------------------------------
+    #
+    # Typed commands are caught in _send(); spoken ones arrive as "You: …" log
+    # lines (the same lines the log panel shows) and are caught by
+    # _browser_log_tap(). Both end in _on_browser_cmd(), which runs on the Qt
+    # thread. Plugins and worker threads can use AuraUI.open_in_browser() etc.,
+    # which go through _browser_cmd_sig like every other panel.
+    def _ensure_browser(self, backend: str = "qt"):
+        """The browser window for an engine: "qt" = built-in Chromium (always
+        there), "edge" = Windows' Edge engine (only when it is installed)."""
+        if not HAVE_WEB:
+            self._log.append_log("ERR: The in-app browser needs the QtWebEngine "
+                                 "package — run: pip install PyQt6-WebEngine")
+            return None
+        if backend == "edge":
+            if self._edge_win is None:
+                w = AuraBrowserWindow(self, backend="edge")
+                w.audible_changed.connect(self._on_browser_audible)
+                w.closed.connect(self._on_browser_closed)
+                w.backend_failed.connect(self._on_edge_failed)
+                self._edge_win = w
+            return self._edge_win
+        if self._browser_win is None:
+            w = AuraBrowserWindow(self)
+            w.audible_changed.connect(self._on_browser_audible)
+            w.closed.connect(self._on_browser_closed)
+            w.edge_requested.connect(self._on_edge_requested)
+            self._browser_win = w
+        return self._browser_win
+
+    def _wants_edge(self, url: str) -> bool:
+        """Sites this build of Chromium cannot play go to the Edge engine."""
+        if self._edge_broken or not _edge_available():
+            return False
+        if _BR_PREFER_EDGE:
+            return True
+        host = QUrl(url).host()
+        return _br_hit(host, _BR_DRM_HOSTS) or _br_hit(host, _BR_H264_HOSTS)
+
+    def _open_in(self, backend: str, url: str, fallback: str, label: str) -> None:
+        win = self._ensure_browser(backend)
+        if win is None:
+            return
+        other = self._browser_win if backend == "edge" else self._edge_win
+        if other is not None and other.isVisible():     # one window at a time: take its place
+            win._placed = True
+            win.setGeometry(other.geometry())
+            other.close()
+        if backend == "edge":
+            self._edge_last = (url, fallback, label)
+        win.open_url(url, fallback)
+        engine = " (Edge engine)" if backend == "edge" else ""
+        self._log.append_log(f"SYS: Opening {label} inside {self._assistant_name}{engine}.")
+
+    def _on_edge_failed(self, why: str) -> None:
+        """The Edge engine would not start: say why and carry on in the built-in one."""
+        self._edge_broken = True
+        self._log.append_log(f"ERR: Edge engine could not start ({why}). "
+                             "Using the built-in browser instead.")
+        last = self._edge_last
+        if self._edge_win is not None:
+            self._edge_win.close()
+        if last:
+            self._open_in("qt", *last)
+
+    def _on_edge_requested(self, url: str) -> None:
+        """'PLAY HERE · EDGE ENGINE' pressed in the built-in browser's notice."""
+        if self._edge_broken or not _edge_available():
+            return
+        self._open_in("edge", url, "", url)
+
+    def _browser_handle_text(self, text: str, voice: bool = False) -> bool:
+        """True when `text` was an in-app browser command and has been handled
+        here, so the caller must not pass it on to the assistant."""
+        if not HAVE_WEB or not getattr(self, "_ready", True):
+            return False
+        if getattr(self, "_face_mode", None) in _FACE_COVER:
+            return False
+        cmd = _parse_browser_command(text, self._assistant_name)
+        if cmd is None:
+            return False
+        now = time.monotonic()
+        if cmd == self._br_last_cmd and now - self._br_last_t < 4.0:
+            return True                         # the same command echoed twice
+        self._br_last_cmd, self._br_last_t = cmd, now
+        if voice:
+            _arm_browser_guard(10.0)            # keep the PC's browser shut
+        self._on_browser_cmd(*cmd)
+        return True
+
+    def _browser_log_tap(self, text: str) -> None:
+        """Spoken commands: watch the 'You: …' lines the voice pipeline logs."""
+        try:
+            lines = (text or "").strip().splitlines()
+            line = lines[0].strip() if lines else ""
+            if line[:4].lower() != "you:":
+                return
+            spoken = line[4:].strip()
+            if not spoken:
+                return
+            now = time.monotonic()
+            joined = spoken
+            if self._br_buf and now - self._br_buf_t < 2.5:
+                joined = f"{self._br_buf} {spoken}"      # transcript in pieces
+            self._br_buf, self._br_buf_t = joined, now
+            for cand in (spoken, joined):
+                if self._browser_handle_text(cand, voice=True):
+                    self._br_buf = ""
+                    return
+        except Exception as exc:                          # never break the log
+            print(f"[Browser] voice tap failed: {exc}")
+
+    def _on_browser_cmd(self, action: str, url: str, fallback: str, label: str) -> None:
+        if action == "close":
+            shut = False
+            for w in (self._browser_win, self._edge_win):
+                if w is not None and w.isVisible():
+                    w.close()
+                    shut = True
+            self._log.append_log("SYS: Browser closed." if shut else "SYS: The browser is not open.")
+            return
+        self._open_in("edge" if self._wants_edge(url) else "qt", url, fallback, label)
+
+    def _on_browser_audible(self, audible: bool) -> None:
+        """Close the microphone while a page is making sound.
+
+        Same reasoning as the HUD video: the page plays through its own output,
+        so the assistant would otherwise answer it. Only if the app closed the
+        mic — a mic the user muted stays muted, and F4 hands control back."""
+        if audible and not self._muted:
+            self._browser_auto_muted = True
+            self._set_muted(True, "The browser is playing sound — close it, silence "
+                                  "it, or press F4 to talk. Typing still works.")
+        elif not audible and self._browser_auto_muted:
+            self._browser_auto_muted = False
+            self._set_muted(False, "The browser is quiet again.")
+
+    def _on_browser_closed(self) -> None:
+        if self._browser_auto_muted:                    # give the mic back
+            self._browser_auto_muted = False
+            self._set_muted(False, "The browser was closed.")
 
     # --- Video in the HUD area ---------------------------------------------
     #
@@ -8607,8 +10412,25 @@ class MainWindow(QMainWindow):
         ov.on_preview = self._preview_ui_color
         ov.saved.connect(self._apply_name_update)
         ov.configure_local_ai.connect(self._open_local_ai_settings)
+        ov.open_permissions.connect(self._open_permissions)
         ov.show()
         self._customize_overlay = ov
+
+    def _open_permissions(self):
+        broker = getattr(self, "_access_broker", None)
+        if broker is None:
+            QMessageBox.warning(
+                self, "Permissions unavailable",
+                "The confirmation service has not been initialized.",
+            )
+            return
+        existing = getattr(self, "_permissions_overlay", None)
+        if existing is not None:
+            existing.hide()
+            existing.deleteLater()
+        overlay = PermissionsOverlay(broker, parent=self.centralWidget())
+        self._centre_overlay(overlay)
+        self._permissions_overlay = overlay
 
     def _open_local_ai_settings(self):
         if self._customize_overlay:
@@ -8833,6 +10655,7 @@ class MainWindow(QMainWindow):
         # A deliberate press settles the question: whatever the video did, or is
         # about to do, the user has now said what they want.
         self._video_auto_muted = False
+        self._browser_auto_muted = False
         self._set_muted(not self._muted)
 
     def _set_muted(self, muted: bool, note: str = ""):
@@ -8860,6 +10683,8 @@ class MainWindow(QMainWindow):
         if not txt: return
         self._input.clear()
         self._log.append_log(f"You: {txt}")
+        if self._browser_handle_text(txt):      # "Run <site> in you" → in-app browser
+            return
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
@@ -8963,6 +10788,10 @@ class AuraUI:
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
+        from core.confirmation import configure_confirmation_broker
+        self._win._access_broker = configure_confirmation_broker(
+            parent=self._win, accent_provider=lambda: C.PRI
+        )
         self.on_system_control_action = None
         self._win.show()
         self.root = _RootShim(self._app)
@@ -8970,6 +10799,10 @@ class AuraUI:
     @property
     def muted(self) -> bool:
         return self._win._muted
+
+    @property
+    def face_unlock_verified(self) -> bool:
+        return bool(getattr(self._win, "_face_verified", False))
 
     @muted.setter
     def muted(self, v: bool):
@@ -9036,6 +10869,24 @@ class AuraUI:
     def hide_confirm(self) -> None:
         """Thread-safe: take the gate down."""
         self._win._confirm_hide_sig.emit()
+
+    def open_in_browser(self, target: str) -> None:
+        """Thread-safe: open a website (name, domain or URL) in the floating
+        in-app browser instead of the PC's browser."""
+        url, fallback, _kind = _resolve_site(target or "")
+        if url:
+            self._win._browser_cmd_sig.emit("open", url, fallback, str(target)[:60])
+
+    def search_in_browser(self, query: str, site: str = "google") -> None:
+        """Thread-safe: run a web search in the in-app browser."""
+        key = (site or "google").strip().lower()
+        tpl = _BR_SEARCH_URLS.get(key, _BR_SEARCH_URLS["google"])
+        self._win._browser_cmd_sig.emit(
+            "search", tpl.format(q=quote_plus(query or "")), "", f"{query} ({key})"[:80])
+
+    def close_browser(self) -> None:
+        """Thread-safe: close the in-app browser (this also stops playback)."""
+        self._win._browser_cmd_sig.emit("close", "", "", "")
 
     def request_earth_command(self, command: str, origin: str = "",
                               destination: str = "") -> None:
