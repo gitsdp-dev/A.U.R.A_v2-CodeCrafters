@@ -337,43 +337,6 @@ can require confirmation before execution.
 
 To extend the agent, tools can be added as typed and documented functions within the agent tool system.
 
-## Confirmed File and Windows Settings Access
-
-The `list_folder`, `read_file`, `search_files`, `get_file_info`, `create_folder`,
-`create_file`, `write_file`, `copy`, `move`, `rename`, and `delete` tools show a
-confirmation note before acting. File reads are text-only and capped at 2 MB;
-searches and batches are bounded. Delete sends items to the Recycle Bin/Trash.
-Protected system, credential, A.U.R.A source/configuration, and drive-root
-locations cannot be modified; protected reads require the highest confirmation.
-Session read grants are kept in memory and can be revoked under Customize →
-Permissions. Permission decisions are appended to `memory/file_access_audit.jsonl`.
-
-The Windows settings tool currently allows changing the current user's app
-theme, hidden-file visibility, and file-extension visibility; UAC status is
-read-only. Each change is confirmed, read back for verification, and recorded
-for session undo. System-wide settings requiring administrator elevation are
-not exposed until a safe, verifiable UAC helper is available. To add a setting,
-add a `SettingSpec` to `core/windows_settings.py` with explicit values, getter,
-setter, registry location, risk, and reversibility; never add a generic command
-runner.
-
-## Agent Mode, IDE Coding & Workflows
-
-The generalized agent can plan arbitrary multi-step tasks using registered browser, screen, files, web research, Python sandbox, and application-launch tools. Each step has bounded execution, deterministic checks, optional Gemini evidence verification, and a final evidence check. Ambiguous plans ask one clarification question instead of guessing.
-
-Phase 2 IDE coding is available through the `ide_agent` plugin. It detects an explicit or active project root, reads and searches files, applies atomic unified diffs with rollback, runs whitelisted tests, and shows large changes for confirmation. It never writes `.git`, secrets, or files outside the project root.
-
-Phase 3 workflows are available through the `workflows` plugin for YouTube Markdown notes and verified FFmpeg edits. Successful plans are stored in `memory/agent_plans.json`; recurring goals are persisted in `memory/agent_schedule.json`. Safe defaults are configured under `agent:` in `config.yaml`.
-
-Example requests:
-
-```text
-AURA, research three sources about battery recycling and write a linked report.
-AURA, add login validation to this project and run the tests.
-AURA, turn this YouTube video into timestamped Markdown notes.
-AURA, trim the video from 00:01:00 to 00:02:30 and verify the new file.
-```
-
 ---
 
 # Agent Tool Calling
@@ -421,96 +384,6 @@ This keeps optional functionality separate from the core assistant and provides 
 
 ---
 
-## In-App Web Browser
-
-A.U.R.A can open any website in its own floating HUD window, on a typed or spoken command, without opening the PC's browser. Say **"Run YouTube in you"** and YouTube appears in a draggable, resizable window with the A.U.R.A frame around it.
-
-### Commands
-
-Say or type a command that ends with where to run it (`in you`, `inside yourself`, `in aura`, `in your browser`, `in your window`, `here`, `in-app`).
-
-| You say | What happens |
-|---|---|
-| `Run YouTube in you` | Opens YouTube in the A.U.R.A browser |
-| `Open github dot com in you` | Opens a spoken domain |
-| `Launch w3schools inside yourself` | Opens a known site by name |
-| `Open codepen in you` | Unknown names are tried as `name.com`, then fall back to a web search |
-| `Search lo-fi music on YouTube in you` | Runs a search on that site (YouTube, Google, Wikipedia, GitHub, Reddit, Amazon, Maps and more) |
-| `Go to localhost:3000 in you` | Opens local web apps and dev servers |
-| `Close the browser` | Closes the window and stops any playback |
-
-Supported verbs: run, open, launch, start, load, show, play, go to, browse, visit, bring up, pull up, take me to, navigate to. A command without a place to run it ("open YouTube") is passed to the assistant as usual. Around 90 popular sites are recognised by name; anything else can be given as a domain or full URL.
-
-### The window
-
-- **Draggable** by its header and **resizable** from every edge and corner. Double-click the header to maximize.
-- Opens at **3x the size of the news/briefing panel**, kept inside your screen.
-- Toolbar: back, forward, reload/stop, address bar, sound on/off, and an **↗** button that opens the current page in your normal PC browser.
-- The address bar accepts URLs, site names, search words and local `.html` file paths.
-- Logins and cookies are saved between sessions. To sign out of everything, delete `config/browser_profile` (and `config/edge_profile` if present).
-- A page's own fullscreen button works (for example on YouTube).
-- Closing the window stops playback.
-- While a page is playing sound, A.U.R.A's microphone closes so it does not answer the video. Press **F4** to talk, or type. The mic reopens when the page goes quiet.
-
-### Two engines
-
-| Engine | Used for | Can play |
-|---|---|---|
-| **Built-in** (Chromium via QtWebEngine) | Everything by default, including YouTube | Most sites; VP9, AV1, Opus, MP3 video and audio |
-| **Edge** (Windows WebView2) | Sites that need H.264 video, picked automatically | Instagram reels, Twitch, TikTok, Facebook, X, Reddit, Vimeo |
-
-The built-in engine cannot decode H.264 or play protected (DRM) video. On those sites A.U.R.A routes the page to the Edge engine automatically when it is installed. The window header then reads **BROWSER · EDGE**. Only one browser window is open at a time, and a new one takes the position of the old one.
-
-Streaming services such as Netflix, Prime Video, Disney+ and Hotstar are also routed to the Edge engine, but protected playback is not guaranteed there. If a site will not play, use the **↗** button to open it in your PC browser.
-
-If the Edge engine is not installed, a notice strip appears on those sites explaining why video stays black, with a button to open the page in your PC browser. When Edge is installed, the strip also offers **PLAY HERE · EDGE ENGINE**.
-
-### Setup
-
-```bash
-# Required: the built-in browser
-pip install PyQt6-WebEngine
-
-# Optional, Windows only: the Edge engine (Instagram reels, Twitch, TikTok ...)
-pip install pythonnet pywebview
-```
-
-- Install the packages into the **same Python** that runs A.U.R.A, then restart it.
-- `pywebview` is only used to supply the WebView2 `.dll` files and is never imported. If you prefer not to install it, put `Microsoft.Web.WebView2.Core.dll`, `Microsoft.Web.WebView2.WinForms.dll` and the `runtimes` folder in `lib/webview2/`, or point the `AURA_WEBVIEW2_DIR` environment variable at them.
-- The WebView2 runtime is built into Windows 11 and up-to-date Windows 10 with Edge.
-- If `PyQt6-WebEngine` is missing, only the browser feature is disabled and the rest of A.U.R.A starts normally.
-
-To open **every** site in the Edge engine when it is available, set `_BR_PREFER_EDGE = True` in `ui.py`.
-
-### Use it from plugins and actions
-
-These methods on the UI object are thread-safe, so they can be called from any worker thread:
-
-```python
-ui.open_in_browser("youtube")                 # a site name, domain or URL
-ui.search_in_browser("lo-fi music", "youtube")  # query, site (default: google)
-ui.close_browser()
-```
-
-### Good to know
-
-- Voice commands are recognised from the live transcript. After one is handled, A.U.R.A suppresses Python-initiated opens in the PC browser for about 10 seconds so the page does not open twice.
-- Sign-in pop-ups ("Sign in with Google" and similar) open in their own small window and keep their connection to the page that opened them. Google may still refuse sign-in in the built-in engine; the Edge engine may fare better.
-- Downloads started in the built-in engine are saved to your Downloads folder.
-- Browser data stays on your PC, in `config/`.
-
-### Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| Reels or other videos stay black and there is no **PLAY HERE · EDGE ENGINE** button | Install `pythonnet` and `pywebview` in the same Python as A.U.R.A, then restart |
-| `ERR: Edge engine could not start (...)` in the log | A.U.R.A has fallen back to the built-in browser. Check that the WebView2 runtime is installed |
-| `ERR: The in-app browser needs the QtWebEngine package` | `pip install PyQt6-WebEngine` |
-| Log shows `Browser video support — H.264 no` | Expected for the built-in engine; the Edge engine handles those sites |
-| "Run X in you" does nothing | Make sure the command ends with `in you` (or one of the other phrases above) |
-
----
-
 # Architecture
 
 A.U.R.A v2 follows a modular Python architecture:
@@ -521,14 +394,10 @@ A.U.R.A v2
 ├── actions/          # Desktop and system actions
 ├── config/           # Configuration and preferences
 ├── core/             # Core assistant and voice logic
-│   └── agent/         # Typed registry, planning, verification, safety, scheduling
 ├── dashboard/        # Dashboard components
 |-- earth/            # Earth View Assets
 ├── memory/           # Persistent memory system
 ├── plugins/          # Plugin architecture
-│   ├── ide_agent/     # IDE-independent coding tools and adapters
-│   ├── workflows/     # YouTube notes and FFmpeg workflows
-│   └── *_tool.py      # General browser, screen, files, research, sandbox tools
 ├── voices/           # Voice-related resources
 │
 ├── aura/             # Local AI and agent components
