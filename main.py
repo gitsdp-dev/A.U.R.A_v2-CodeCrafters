@@ -76,6 +76,7 @@ from memory.config_manager     import (
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_input_device, get_output_device,
     get_local_llm_config, get_notifications_config, get_system_controls_config,
+    get_user_name,
     get_memory_config,
 )
 from core.notifications.intent import match_notification_intent
@@ -95,6 +96,9 @@ from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
+from core.agent.registry       import AgentToolRegistry
+from screen_agent.config import settings_section as screen_agent_settings_section
+from screen_agent.fastpath import is_screen_agent_request
 
 def _capture_camera_shared(ui):
     """Grab a webcam frame while the always-on room watch briefly lets go of the device."""
@@ -701,6 +705,7 @@ class AuraLive:
         self.ui             = ui
         self._memory_service = MemoryService()
         self._asst_name     = "AURA"   # updated each session from config
+        self._face_welcome_pending = bool(getattr(ui, "face_unlock_verified", False))
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
@@ -819,8 +824,17 @@ class AuraLive:
             logger=lambda msg: print(f"[Plugins] {msg}"),
             notify=lambda msg: self.ui.write_log(f"SYS: {msg}"),
         )
+        # Phase 1 adapter: expose the existing registries through the new async
+        # agent contract without changing the legacy Gemini dispatch path.
+        self._agent_registry = AgentToolRegistry.from_existing(
+            self._action_registry, self._plugin_registry,
+            context={"player": self.ui, "speak": self.speak,
+                     "response": None, "session_memory": None},
+        )
         self.ui.get_plugins = self._plugin_registry.list_for_ui
-        self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
+        self.ui.get_plugin_settings = lambda: (
+            self._plugin_registry.settings_schemas() + [screen_agent_settings_section()]
+        )
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
         # Restore the saved push-to-talk preference. Doing it here rather than
@@ -904,6 +918,25 @@ class AuraLive:
         except Exception as exc:
             self.ui.write_log(f"SYS: Local voice unavailable: {exc}")
             self._local_tts_failed = True
+
+    async def _speak_face_welcome(self) -> None:
+        if not self._face_welcome_pending:
+            return
+        self._face_welcome_pending = False
+        try:
+            user_name = (get_user_name() or "Sir").strip() or "Sir"
+            message = f"Welcome Home, {user_name}."
+            if self._local_mode_active:
+                await self._local_speak_sentence(message)
+            elif self.session:
+                await self.session.send_client_content(
+                    turns={"role": "user", "parts": [{
+                        "text": f'Say exactly this and nothing else: "{message}"'
+                    }]},
+                    turn_complete=True,
+                )
+        except Exception as exc:
+            self.ui.write_log(f"SYS: Welcome greeting unavailable: {exc}")
 
     async def _local_tool_execute(self, name: str, args: dict) -> str:
         """Send local-model tool calls through the same confirmation/undo path."""
@@ -1052,6 +1085,18 @@ class AuraLive:
                 name="aura-system-voice",
                 daemon=True,
             ).start()
+            return
+        if is_screen_agent_request(text):
+            result = await asyncio.to_thread(
+                self._action_registry.run,
+                "screen_agent",
+                {"goal": text},
+                {"player": self.ui, "speak": self.speak,
+                 "response": None, "session_memory": None},
+            )
+            self.ui.write_log("SYS: Screen Agent task finished.")
+            if result:
+                await self._local_speak_sentence(str(result)[:320])
             return
         if not hasattr(self, "_local_turn_lock"):
             self._local_turn_lock = asyncio.Lock()
@@ -1294,6 +1339,8 @@ class AuraLive:
                 asyncio.create_task(self._listen_local_audio()),
                 asyncio.create_task(self._play_audio()),
             }
+            if self._face_welcome_pending:
+                tasks.add(asyncio.create_task(self._speak_face_welcome()))
             reconnect = asyncio.create_task(self._reconnect_event.wait())
             try:
                 done, pending = await asyncio.wait(
@@ -1380,6 +1427,19 @@ class AuraLive:
         intent = match_notification_intent(text)
         if intent and (intent not in {"stop", "skip"} or self._notification_read_active()):
             self.ui.handle_notification_command(intent)
+            return
+        if is_screen_agent_request(text):
+            threading.Thread(
+                target=self._action_registry.run,
+                args=(
+                    "screen_agent",
+                    {"goal": text},
+                    {"player": self.ui, "speak": self.speak,
+                     "response": None, "session_memory": None},
+                ),
+                name="aura-screen-agent-text",
+                daemon=True,
+            ).start()
             return
         if not self._loop:
             return
@@ -1745,6 +1805,9 @@ class AuraLive:
 
     def interrupt(self) -> None:
         """Stop AURA mid-speech: drain queued audio and open mic immediately."""
+        from screen_agent import request_stop
+
+        request_stop()
         self.stop_notification_readout()
         self._interrupted = True
         if self._local_turn_task and self._loop:
@@ -2314,7 +2377,8 @@ class AuraLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[AURA] 📤 {name} → {str(result)[:80]}")
+        _log_result = "[redacted]" if name == "screen_agent" else str(result)[:80]
+        print(f"[AURA] 📤 {name} → {_log_result}")
 
         # A tool that declared itself NON_BLOCKING also says when its answer may
         # re-enter the conversation. Without this the model finishes whatever it
@@ -3271,6 +3335,8 @@ class AuraLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    if self._face_welcome_pending:
+                        tg.create_task(self._speak_face_welcome())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 

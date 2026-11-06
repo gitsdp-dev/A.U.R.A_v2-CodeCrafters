@@ -4,6 +4,8 @@
 # ── Credentials, tokens, and private keys ────────────────────────────────────
 **/api_keys.json
 **/api_key.json
+config/*.json
+config/*.jsonl
 **/secrets.json
 **/secret*.json
 **/*token*.json
@@ -38,6 +40,9 @@ config/tg_avatars/
 config/tg_chats.json
 config/tg_chat_log.json
 config/mail_watch.json
+config/browser_profile/
+config/edge_profile/
+config/*_profile/
 
 # ── Personal assistant data and local backups ────────────────────────────────
 memory/*.json
@@ -52,6 +57,13 @@ bugs_backup.txt
 *.bak
 *.backup
 *.old
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.dmp
+*.pma
+*.session
 
 # ── Downloaded models, user media, and generated output ──────────────────────
 models/
