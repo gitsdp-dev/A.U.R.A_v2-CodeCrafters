@@ -569,47 +569,47 @@ The complete voice architecture can be represented as:
                     └────────┬────────┘
                              │
                              ▼
-                    ┌─────────────────┐
+                    ┌───────────────
                     │ Wake Detection  │
-                    └────────┬────────┘
-                             │
+                    └────────┬──────
+                             |
                              ▼
-                    ┌─────────────────┐
+                    ┌──────────────
                     │ Voice / Vosk    │
                     │ Recognition     │
-                    └────────┬────────┘
+                    └────────┬─────
                              │
                              ▼
-                 ┌─────────────────────────┐
+                 ┌─────────────────────
                  │      AI Processing      │
                  │                         │
                  │ Gemini / Ollama /       │
                  │ LM Studio               │
-                 └────────────┬────────────┘
+                 └────────────┬────────
                               │
                               ▼
-                    ┌─────────────────┐
+                    ┌───────────────
                     │ Agent / Actions │
-                    └────────┬────────┘
+                    └────────┬──────
                              │
                              ▼
-                    ┌─────────────────┐
-                    │ Text Response   │
-                    └────────┬────────┘
+                    ┌───────────────
+                    │ Text Response   |
+                    └────────┬──────
                              │
                              ▼
-                 ┌─────────────────────────┐
+                 ┌──────────────────────
                  │       TTS Engine        │
                  │                         │
                  │ Kokoro / Edge /         │
                  │ ElevenLabs              │
-                 └────────────┬────────────┘
+                 └────────────┬─────────
                               │
                               ▼
-                    ┌─────────────────┐
+                    ┌───────────────
                     │ Selected Output │
-                    │    Speaker      │
-                    └─────────────────┘
+                    │    Speaker      |
+                    └──────────────
 ```
 
 ---
@@ -908,6 +908,48 @@ The Kokoro synthesis test runs when the required model files are available; othe
 
 ---
 
+## Screen Agent
+
+Screen Agent operates desktop apps through their operating-system accessibility
+trees; it does not use screenshots or a vision model in its default path.
+
+### Install and choose a local model
+
+Install the open-source CLI separately, then restart A.U.R.A.:
+
+```powershell
+npm install -g agent-desktop
+```
+
+In A.U.R.A.'s **Plugin Settings → Screen Agent**, leave **Model engine** on
+`auto` to try deterministic commands first and then A.U.R.A.'s configured local
+model. For CPU-only use, install Ollama and choose a small instruct model such
+as `qwen2.5:3b` or `llama3.2:3b` in A.U.R.A.'s existing Local AI settings. The
+model name and Ollama endpoint are read from that configuration; choose a model
+that fits your memory and CPU budget.
+
+### Settings and privacy
+
+Screen Agent settings include enable/disable, engine (`auto`, `local`, or
+`gemini`), step and prompt-token limits, optional Gemini escalation, app
+allow/deny lists, and physical input. Physical mouse/keyboard input is off by
+default; enabling it may interfere with other work. Password managers and
+banking/payment apps are blocked by default. You can add further denied apps or restrict access to an allow list.
+
+Accessibility text stays on-device by default. Gemini is unavailable for
+screen tasks until **Allow accessibility text to be sent to Google Gemini** is
+explicitly enabled; escalation is also off by default. Gemini uses A.U.R.A.'s
+existing API key and text-model configuration. Destructive actions and typing
+into password-like fields require confirmation.
+
+### Limits
+
+Apps with incomplete accessibility trees may expose few or no usable controls.
+Some apps or windows run elevated and may require A.U.R.A. to be run elevated
+as well. Screen Agent cannot safely operate apps blocked by its default or user defined deny list.
+
+---
+
 # Project Status
 
 A.U.R.A v2 is actively under development.
@@ -964,7 +1006,7 @@ https://github.com/gitsdp-dev
 
 ### Instagram
 
-https://instagram.com/codecrafters_org_2011sdp
+https://instagram.com/_codecrafters._org_
 
 ---
 
@@ -983,45 +1025,3 @@ See the `LICENSE` file for details.
 ## Your Desktop. Smarter Than Ever.
 
 ### Built by CodeCrafters.
-
-## Screen Agent
-
-Screen Agent operates desktop apps through their operating-system accessibility
-trees; it does not use screenshots or a vision model in its default path.
-
-### Install and choose a local model
-
-Install the open-source CLI separately, then restart A.U.R.A.:
-
-```powershell
-npm install -g agent-desktop
-```
-
-In A.U.R.A.'s **Plugin Settings → Screen Agent**, leave **Model engine** on
-`auto` to try deterministic commands first and then A.U.R.A.'s configured local
-model. For CPU-only use, install Ollama and choose a small instruct model such
-as `qwen2.5:3b` or `llama3.2:3b` in A.U.R.A.'s existing Local AI settings. The
-model name and Ollama endpoint are read from that configuration; choose a model
-that fits your memory and CPU budget.
-
-### Settings and privacy
-
-Screen Agent settings include enable/disable, engine (`auto`, `local`, or
-`gemini`), step and prompt-token limits, optional Gemini escalation, app
-allow/deny lists, and physical input. Physical mouse/keyboard input is off by
-default; enabling it may interfere with other work. Password managers and
-banking/payment apps are blocked by default. You can add further denied apps
-or restrict access to an allow list.
-
-Accessibility text stays on-device by default. Gemini is unavailable for
-screen tasks until **Allow accessibility text to be sent to Google Gemini** is
-explicitly enabled; escalation is also off by default. Gemini uses A.U.R.A.'s
-existing API key and text-model configuration. Destructive actions and typing
-into password-like fields require confirmation.
-
-### Limits
-
-Apps with incomplete accessibility trees may expose few or no usable controls.
-Some apps or windows run elevated and may require A.U.R.A. to be run elevated
-as well. Screen Agent cannot safely operate apps blocked by its default or
-user-defined deny list.
