@@ -1,13 +1,12 @@
 """
 Action discovery, validation, and dispatch — the built-in twin of plugin_loader.
 
-Every actions/*.py that exposes a module-level ``TOOL`` dict or ``TOOLS`` list is auto-discovered
+Every actions/*.py that exposes a module-level ``TOOL`` dict is auto-discovered
 here, exactly like a drop-in plugin, so main.py never has to hardcode a tool
 declaration or a dispatch branch for it. Adding a new bundled action is then the
 same one-file operation as writing a plugin: define ``TOOL`` and a handler.
 
-``TOOL`` shape (see actions/open_app.py for a live example). Modules may expose
-``TOOLS`` when several independently callable actions share implementation:
+``TOOL`` shape (see actions/open_app.py for a live example):
 
     TOOL = {
         "name":        "open_app",              # unique, ^[a-zA-Z_][a-zA-Z0-9_]{0,63}$
@@ -122,11 +121,12 @@ def _call_handler(fn: Callable, parameters: dict, ctx: dict) -> str:
     return fn(parameters=parameters, **kwargs)
 
 
-def _validate_tool(tool: dict, filename: str) -> ActionRecord:
+def _validate(module, filename: str) -> ActionRecord:
     """Returns an ActionRecord; .valid=False + .error set on any problem. Never raises."""
+    tool = getattr(module, "TOOL", None)
     if not isinstance(tool, dict):
         return ActionRecord(name=Path(filename).stem, file=filename,
-                            error="Tool declaration must be a dict.")
+                            error="No module-level TOOL dict (not a discoverable action).")
 
     name = tool.get("name")
     if not isinstance(name, str) or not _NAME_RE.match(name):
@@ -152,15 +152,6 @@ def _validate_tool(tool: dict, filename: str) -> ActionRecord:
                         handler=handler, file=filename, valid=True, error="",
                         behavior=_opt_upper(tool.get("behavior"), _BEHAVIORS),
                         scheduling=_opt_upper(tool.get("scheduling"), _SCHEDULING))
-
-
-def _validate(module, filename: str) -> ActionRecord:
-    """Validate a module's legacy single TOOL declaration."""
-    tool = getattr(module, "TOOL", None)
-    if tool is None:
-        return ActionRecord(name=Path(filename).stem, file=filename,
-                            error="No module-level TOOL dict (not a discoverable action).")
-    return _validate_tool(tool, filename)
 
 
 def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
@@ -198,46 +189,31 @@ def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
                     sys.modules.pop(module_name, None)
                     raise
 
-            if getattr(module, "TOOL", None) is None and getattr(module, "TOOLS", None) is None:
+            if getattr(module, "TOOL", None) is None:
                 continue   # not an action file — a helper/capture-only module
 
-            declarations = getattr(module, "TOOLS", None)
-            if declarations is None:
-                declarations = [getattr(module, "TOOL")]
-            if not isinstance(declarations, (list, tuple)) or not declarations:
-                recs = [ActionRecord(name=path.stem, file=path.name,
-                                     error="TOOLS must be a non-empty list of tool declarations.")]
-            else:
-                recs = [_validate_tool(tool, path.name) for tool in declarations]
-            module_names: set[str] = set()
-            for index, rec in enumerate(recs):
-                if rec.valid and rec.name in reserved:
-                    recs[index] = ActionRecord(
-                        name=rec.name, file=path.name,
-                        error=f"Name '{rec.name}' collides with a reserved core tool — rejected.",
-                    )
-                elif rec.valid and (rec.name in valid or rec.name in module_names):
-                    other = valid[rec.name].file if rec.name in valid else path.name
-                    recs[index] = ActionRecord(
-                        name=rec.name, file=path.name,
-                        error=f"Name '{rec.name}' already used by action '{other}' — rejected.",
-                    )
-                elif rec.valid:
-                    module_names.add(rec.name)
+            rec = _validate(module, path.name)
+
+            if rec.valid and rec.name in reserved:
+                rec = ActionRecord(name=rec.name, file=path.name,
+                                   error=f"Name '{rec.name}' collides with a reserved core tool — rejected.")
+            elif rec.valid and rec.name in valid:
+                other = valid[rec.name].file
+                rec = ActionRecord(name=rec.name, file=path.name,
+                                   error=f"Name '{rec.name}' already used by action '{other}' — rejected.")
 
         except Exception as e:
-            recs = [ActionRecord(name=path.stem, file=path.name,
-                                 error=f"Failed to load: {e}")]
+            rec = ActionRecord(name=path.stem, file=path.name,
+                               error=f"Failed to load: {e}")
             traceback.print_exc()
 
-        for rec in recs:
-            all_records.append(rec)
-            if rec.valid:
-                valid[rec.name] = rec
-                logger(f"Action loaded: {rec.name} ({path.name})")
-            else:
-                # Only log a rejection if the file actually tried to be an action.
-                logger(f"Action rejected: {path.name} — {rec.error}")
+        all_records.append(rec)
+        if rec.valid:
+            valid[rec.name] = rec
+            logger(f"Action loaded: {rec.name} ({path.name})")
+        else:
+            # Only log a rejection if the file actually tried to be an action.
+            logger(f"Action rejected: {path.name} — {rec.error}")
 
     registry = ActionRegistry(valid, logger)
     registry._all_records = all_records
