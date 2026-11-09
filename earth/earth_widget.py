@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from PyQt6.QtCore import QPoint, QUrl, Qt
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 try:
@@ -23,12 +24,31 @@ HAVE_WEBENGINE = QWebEngineView is not None
 
 if HAVE_WEBENGINE:
     class _EarthPage(QWebEnginePage):
-        """Keep the top-level page local while allowing map data requests."""
+        """Keep the shell local while allowing approved remote map/media frames."""
 
         def acceptNavigationRequest(self, url, _navigation_type, is_main_frame):
             if is_main_frame:
-                return url.scheme().lower() in {"file", "about", "data"}
-            return url.scheme().lower() in {"file", "about", "data"}
+                if url.scheme().lower() in {"file", "about", "data"}:
+                    return True
+                if url.scheme().lower() == "https":
+                    QDesktopServices.openUrl(url)
+                return False
+            # Public camera footage is commonly embedded from YouTube or an
+            # operator CDN. The local Earth shell remains the only top-level
+            # document; remote HTTPS is permitted only for child frames/media.
+            return url.scheme().lower() in {"file", "about", "data", "https"}
+
+        def createWindow(self, _window_type):
+            """Forward target=_blank links from embedded footage externally."""
+            popup = QWebEnginePage(self.profile(), self)
+
+            def open_external(url):
+                if url.isValid() and url.scheme().lower() in {"http", "https"}:
+                    QDesktopServices.openUrl(url)
+                popup.deleteLater()
+
+            popup.urlChanged.connect(open_external)
+            return popup
 
 
     class _EarthWebView(QWebEngineView):

@@ -52,6 +52,8 @@
     button:hover, button.active { border-color: #ff9224; color: #ffb456; background: #251508; }
     .toolbar .grow { flex: 1; }
     .toolbar .hint { color: #ad8058; font-size: 10px; padding: 0 4px; }
+    .toolbar .live-toggle { color: #d59a5c; }
+    .toolbar .live-toggle.active { color: #ffb456; border-color: #ff9224; }
     .route-panel {
       display: none; top: 55px; left: 10px; width: min(390px, calc(100% - 20px));
       padding: 9px; border-radius: 5px;
@@ -90,6 +92,10 @@
     <button class="mode" data-mode="satellite">SATELLITE</button>
     <button class="mode" data-mode="terrain">TERRAIN</button>
     <button class="mode" data-mode="air">AIR ROUTES</button>
+    <button class="live-toggle" data-live="earthquakes">QUAKES</button>
+    <button class="live-toggle" data-live="events">EARTH EVENTS</button>
+    <button class="live-toggle" data-live="cameras">CAMERAS</button>
+    <button class="live-toggle" data-live="satellites">SATELLITES</button>
     <span class="grow"></span>
     <button id="route-toggle">ROUTE FINDER</button>
     <button id="zoom-in" aria-label="Zoom in">＋</button>
@@ -131,6 +137,477 @@
       let expandedCamera = null;
       let lastReverseRequest = 0;
       let reverseQueue = Promise.resolve();
+      const liveLayers = { earthquakes: true, events: true, cameras: true, satellites: true };
+      let liveTimer = null;
+      let liveRequest = 0;
+      let satelliteTleCache = (() => {
+        try {
+          const cached = JSON.parse(localStorage.getItem("aura-earth-satellites") || "[]");
+          return Array.isArray(cached) ? cached : [];
+        } catch (_) {
+          return [];
+        }
+      })();
+      let satelliteTleLoaded = false;
+      let providerCameraCache = null;
+
+      const PUBLIC_CAMERAS = [
+        { id: "jp-shibuya", lat: 35.6595, lng: 139.7005, name: "Shibuya Scramble", city: "Tokyo", country: "Japan", stream: "https://www.youtube.com/embed/coYw-eVU0Ks?autoplay=1&mute=1", source: "Public operator stream" },
+        { id: "jp-tokyo-tower", lat: 35.6586, lng: 139.7454, name: "Tokyo Tower", city: "Tokyo", country: "Japan", stream: "https://www.youtube.com/embed/4pu3pP1m8cY?autoplay=1&mute=1", source: "Public operator stream" },
+        { id: "cz-prague-old-town", lat: 50.0878, lng: 14.4205, name: "Old Town Square", city: "Prague", country: "Czechia", stream: "https://www.youtube.com/embed/IFnbDmgP69Q?autoplay=1&mute=1", source: "Public operator stream" },
+        { id: "de-berlin-alexanderplatz", lat: 52.5200, lng: 13.4050, name: "Alexanderplatz", city: "Berlin", country: "Germany", stream: "https://www.youtube.com/embed/IRqboacDNFg?autoplay=1&mute=1", source: "Public operator stream" },
+        { id: "tw-taipei-101", lat: 25.0330, lng: 121.5654, name: "Taipei 101", city: "Taipei", country: "Taiwan", stream: "https://www.youtube.com/embed/rL5YKnxBudA?autoplay=1&mute=1", source: "Public operator stream" },
+        { id: "fr-paris-eiffel", lat: 48.8584, lng: 2.2945, name: "Eiffel Tower area", city: "Paris", country: "France", stream: "https://www.youtube.com/embed/UMuEooW0iAQ?autoplay=1&mute=1", source: "Public operator stream" },
+        { id: "nl-amsterdam", lat: 52.3676, lng: 4.9041, name: "Amsterdam public webcam", city: "Amsterdam", country: "Netherlands", stream: "https://www.youtube.com/embed/7fKpKk5Vj3M?autoplay=1&mute=1", source: "Public operator stream" },
+        { id: "us-jonesborough", lat: 36.2945, lng: -82.4734, name: "Historic Town", city: "Jonesborough", country: "United States", stream: "https://www.youtube.com/@Jonesborough/live", source: "Public operator stream" },
+        { id: "us-port-angeles", lat: 48.1181, lng: -123.4307, name: "Port Angeles", city: "Port Angeles", country: "United States", stream: "https://www.youtube.com/@portofportangeles6052/live", source: "Public operator stream" },
+      ];
+
+      const emptyFeatureCollection = () => ({ type: "FeatureCollection", features: [] });
+
+      function cameraFeature(camera) {
+        return {
+          type: "Feature",
+          geometry: { type: "Point", coordinates: [Number(camera.lng), Number(camera.lat)] },
+          properties: camera
+        };
+      }
+
+      function tflCameraRows(payload) {
+        return (Array.isArray(payload) ? payload : []).flatMap((camera, index) => {
+          const image = (camera.additionalProperties || []).find(item => item.key === "imageUrl")?.value;
+          const lat = Number(camera.lat), lng = Number(camera.lon);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng) || !/^https:\/\//.test(String(image || ""))) return [];
+          return [{ id: "tfl-" + (camera.id || index), lat, lng,
+            name: camera.commonName || "London JamCam", city: "London", country: "United Kingdom",
+            feed: image, external: "https://tfl.gov.uk/modes/driving/traffic-cameras", source: "Transport for London" }];
+        });
+      }
+
+      function wsdotCameraRows(payload) {
+        return (Array.isArray(payload) ? payload : []).flatMap((camera, index) => {
+          const location = camera.CameraLocation || {};
+          const lat = Number(location.Latitude), lng = Number(location.Longitude);
+          const image = camera.ImageURL || camera.ImageUrl || camera.image_url;
+          if (!Number.isFinite(lat) || !Number.isFinite(lng) || !/^https:\/\//.test(String(image || ""))) return [];
+          return [{ id: "wsdot-" + (camera.CameraID || index), lat, lng,
+            name: camera.Title || "Washington traffic camera", city: "Washington", country: "United States",
+            feed: image, external: "https://wsdot.wa.gov/travel/roads-bridges", source: "WSDOT" }];
+        });
+      }
+
+      function singaporeCameraRows(payload) {
+        const cameras = payload?.items?.[0]?.cameras || [];
+        return cameras.flatMap((camera, index) => {
+          const lat = Number(camera.location?.latitude), lng = Number(camera.location?.longitude);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng) || !/^https:\/\//.test(String(camera.image || ""))) return [];
+          return [{ id: "sg-" + (camera.camera_id || index), lat, lng,
+            name: "Singapore traffic camera " + (camera.camera_id || ""), city: "Singapore", country: "Singapore",
+            feed: camera.image, external: "https://data.gov.sg/", source: "LTA Singapore" }];
+        });
+      }
+
+      async function loadProviderCameras() {
+        if (providerCameraCache !== null || !map) return;
+        const jobs = [
+          ["tfl", "https://api.tfl.gov.uk/Place/Type/JamCam", tflCameraRows],
+          ["wsdot", "https://data.wsdot.wa.gov/log/public/cameras.json", wsdotCameraRows],
+          ["singapore", "https://api.data.gov.sg/v1/transport/traffic-images", singaporeCameraRows]
+        ];
+        const results = await Promise.all(jobs.map(async ([name, url, parse]) => {
+          try {
+            const response = await requestJson(url);
+            return response.ok ? parse(await response.json()) : [];
+          } catch (_) {
+            return [];
+          }
+        }));
+        providerCameraCache = results.flat().slice(0, 900);
+        const source = map.getSource("aura-cameras");
+        if (source && providerCameraCache.length) {
+          source.setData({ type: "FeatureCollection", features: [
+            ...PUBLIC_CAMERAS.map(cameraFeature),
+            ...providerCameraCache.map(cameraFeature)
+          ] });
+        }
+      }
+
+      function ensureLiveLayers() {
+        if (!map) return;
+        if (!map.getSource("aura-earthquakes")) {
+          map.addSource("aura-earthquakes", { type: "geojson", data: emptyFeatureCollection() });
+          map.addLayer({
+            id: "aura-earthquakes-glow", type: "circle", source: "aura-earthquakes",
+            paint: {
+              "circle-radius": ["interpolate", ["linear"], ["get", "magnitude"], 2.5, 4, 5, 10, 7, 22],
+              "circle-color": ["interpolate", ["linear"], ["get", "magnitude"], 2.5, "#ffcc00", 5, "#ff9224", 7, "#ff3355"],
+              "circle-opacity": 0.22, "circle-blur": 0.7
+            }
+          });
+          map.addLayer({
+            id: "aura-earthquakes", type: "circle", source: "aura-earthquakes",
+            paint: {
+              "circle-radius": ["interpolate", ["linear"], ["get", "magnitude"], 2.5, 2, 5, 5, 7, 10],
+              "circle-color": ["interpolate", ["linear"], ["get", "magnitude"], 2.5, "#ffcc00", 5, "#ff9224", 7, "#ff3355"],
+              "circle-opacity": 0.9,
+              "circle-stroke-width": 1,
+              "circle-stroke-color": "#05090e",
+              "circle-stroke-opacity": 0.85
+            }
+          });
+        }
+        if (!map.getSource("aura-events")) {
+          map.addSource("aura-events", { type: "geojson", data: emptyFeatureCollection() });
+          map.addLayer({
+            id: "aura-events-glow", type: "circle", source: "aura-events",
+            paint: { "circle-radius": 12, "circle-color": "#ff6b00", "circle-opacity": 0.12, "circle-blur": 0.8 }
+          });
+          map.addLayer({
+            id: "aura-events", type: "circle", source: "aura-events",
+            paint: { "circle-radius": 4, "circle-color": "#ff6b00", "circle-opacity": 0.85,
+              "circle-stroke-width": 1, "circle-stroke-color": "#ffdcb0" }
+          });
+        }
+        if (!map.getSource("aura-cameras")) {
+          map.addSource("aura-cameras", {
+            type: "geojson",
+            data: { type: "FeatureCollection", features: PUBLIC_CAMERAS.map(camera => ({
+              type: "Feature", geometry: { type: "Point", coordinates: [camera.lng, camera.lat] },
+              properties: camera
+            })) }
+          });
+          map.addLayer({
+            id: "aura-cameras-glow", type: "circle", source: "aura-cameras",
+            paint: { "circle-radius": 12, "circle-color": "#00d4ff", "circle-opacity": 0.13, "circle-blur": 0.8 }
+          });
+          map.addLayer({
+            id: "aura-cameras", type: "circle", source: "aura-cameras",
+            paint: { "circle-radius": 5, "circle-color": "#00d4ff", "circle-opacity": 0.92,
+              "circle-stroke-width": 1, "circle-stroke-color": "#031018" }
+          });
+        }
+        if (!map.getSource("aura-satellites")) {
+          map.addSource("aura-satellites", { type: "geojson", data: emptyFeatureCollection() });
+          map.addLayer({
+            id: "aura-satellites-glow", type: "circle", source: "aura-satellites",
+            paint: { "circle-radius": 11, "circle-color": "#ffcc00", "circle-opacity": 0.14, "circle-blur": 0.8 }
+          });
+          map.addLayer({
+            id: "aura-satellites", type: "circle", source: "aura-satellites",
+            paint: { "circle-radius": 4, "circle-color": "#ffcc00", "circle-opacity": 0.95,
+              "circle-stroke-width": 1, "circle-stroke-color": "#221500" }
+          });
+        }
+        updateLiveVisibility();
+      }
+
+      function updateLiveVisibility() {
+        if (!map) return;
+        const visibility = (on) => on ? "visible" : "none";
+        ["aura-earthquakes", "aura-earthquakes-glow"].forEach(id => {
+          if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(liveLayers.earthquakes));
+        });
+        ["aura-events", "aura-events-glow"].forEach(id => {
+          if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(liveLayers.events));
+        });
+        ["aura-cameras", "aura-cameras-glow"].forEach(id => {
+          if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(liveLayers.cameras));
+        });
+        ["aura-satellites", "aura-satellites-glow"].forEach(id => {
+          if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(liveLayers.satellites));
+        });
+      }
+
+      function eventFeatures(payload) {
+        return (payload && Array.isArray(payload.features) ? payload.features : []).flatMap(feature => {
+          const coords = feature.geometry && feature.geometry.coordinates;
+          if (!Array.isArray(coords) || coords.length < 2) return [];
+          const props = feature.properties || {};
+          const magnitude = Number(props.mag);
+          if (!Number.isFinite(magnitude)) return [];
+          return [{
+            type: "Feature",
+            geometry: { type: "Point", coordinates: [Number(coords[0]), Number(coords[1])] },
+            properties: { magnitude, title: String(props.title || "Earthquake"), url: String(props.url || "") }
+          }];
+        });
+      }
+
+      function eonetFeatures(payload) {
+        return (payload && Array.isArray(payload.events) ? payload.events : []).flatMap(event => {
+          const geometry = Array.isArray(event.geometry) ? event.geometry[event.geometry.length - 1] : null;
+          const coords = geometry && geometry.coordinates;
+          if (!Array.isArray(coords) || coords.length < 2) return [];
+          return [{
+            type: "Feature",
+            geometry: { type: "Point", coordinates: [Number(coords[0]), Number(coords[1])] },
+            properties: { title: String(event.title || "Earth event"), category: String(event.categories?.[0]?.title || "Event") }
+          }];
+        });
+      }
+
+      function parseTle(text) {
+        const lines = String(text || "").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+        const records = [];
+        for (let i = 0; i + 2 < lines.length;) {
+          if (!lines[i].startsWith("1") && lines[i + 1].startsWith("1") && lines[i + 2].startsWith("2")) {
+            records.push({ name: lines[i].replace(/^0\s+/, ""), line1: lines[i + 1], line2: lines[i + 2] });
+            i += 3;
+          } else {
+            i += 1;
+          }
+        }
+        return records;
+      }
+
+      function parseCelestrak(payload) {
+        if (!Array.isArray(payload)) return [];
+        return payload.map(item => ({
+          name: String(item.OBJECT_NAME || item.name || "Satellite"),
+          epoch: String(item.EPOCH || ""),
+          inclination: Number(item.INCLINATION),
+          raan: Number(item.RA_OF_ASC_NODE),
+          eccentricity: Number(item.ECCENTRICITY),
+          argument: Number(item.ARG_OF_PERICENTER),
+          meanAnomaly: Number(item.MEAN_ANOMALY),
+          meanMotion: Number(item.MEAN_MOTION)
+        })).filter(item => item.epoch && [item.inclination, item.raan, item.eccentricity,
+          item.argument, item.meanAnomaly, item.meanMotion].every(Number.isFinite));
+      }
+
+      function satellitePosition(record, now = Date.now()) {
+        try {
+          let epoch, inclination, raan, eccentricity, argument, meanAnomaly, meanMotion;
+          if (record.epoch) {
+            epoch = Date.parse(record.epoch);
+            inclination = record.inclination * Math.PI / 180;
+            raan = record.raan * Math.PI / 180;
+            eccentricity = record.eccentricity;
+            argument = record.argument * Math.PI / 180;
+            meanAnomaly = record.meanAnomaly * Math.PI / 180;
+            meanMotion = record.meanMotion;
+          } else {
+            const l1 = record.line1, l2 = record.line2;
+            const epochYear = Number(l1.slice(18, 20));
+            const epochDay = Number(l1.slice(20, 32));
+            const year = epochYear < 57 ? 2000 + epochYear : 1900 + epochYear;
+            epoch = Date.UTC(year, 0, 1) + (epochDay - 1) * 86400000;
+            inclination = Number(l2.slice(8, 16)) * Math.PI / 180;
+            raan = Number(l2.slice(17, 25)) * Math.PI / 180;
+            eccentricity = Number("0." + l2.slice(26, 33));
+            argument = Number(l2.slice(34, 42)) * Math.PI / 180;
+            meanAnomaly = Number(l2.slice(43, 51)) * Math.PI / 180;
+            meanMotion = Number(l2.slice(52, 63));
+          }
+          if (![epoch, inclination, raan, eccentricity, argument, meanAnomaly, meanMotion].every(Number.isFinite)
+              || meanMotion <= 0 || eccentricity >= 1) return null;
+          const mean = meanAnomaly + meanMotion * 2 * Math.PI * ((now - epoch) / 86400000);
+          let eccentricAnomaly = mean;
+          for (let i = 0; i < 5; i++) eccentricAnomaly -= (eccentricAnomaly - eccentricity * Math.sin(eccentricAnomaly) - mean)
+            / (1 - eccentricity * Math.cos(eccentricAnomaly));
+          const trueAnomaly = 2 * Math.atan2(
+            Math.sqrt(1 + eccentricity) * Math.sin(eccentricAnomaly / 2),
+            Math.sqrt(1 - eccentricity) * Math.cos(eccentricAnomaly / 2));
+          const earthRadius = 6378.137;
+          const semiMajor = Math.cbrt(398600.4418 / Math.pow(meanMotion * 2 * Math.PI / 86400, 2));
+          const radius = semiMajor * (1 - eccentricity * Math.cos(eccentricAnomaly));
+          const u = argument + trueAnomaly;
+          const xOrb = radius * Math.cos(u), yOrb = radius * Math.sin(u);
+          const x = xOrb * Math.cos(raan) - yOrb * Math.sin(raan) * Math.cos(inclination);
+          const y = xOrb * Math.sin(raan) + yOrb * Math.cos(raan) * Math.cos(inclination);
+          const z = yOrb * Math.sin(inclination);
+          const days = (now - Date.UTC(2000, 0, 1, 12)) / 86400000;
+          const gmst = (18.697374558 + 24.06570982441908 * days) * Math.PI / 12;
+          const longitude = Math.atan2(y, x) - gmst;
+          return {
+            lat: Math.atan2(z, Math.hypot(x, y)) * 180 / Math.PI,
+            lng: ((longitude * 180 / Math.PI + 540) % 360) - 180,
+            alt: Math.max(0, radius - earthRadius)
+          };
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function satelliteFeatures(records) {
+        const now = Date.now();
+        return records.slice(0, 500).flatMap(record => {
+          const position = satellitePosition(record, now);
+          if (!position) return [];
+          return [{
+            type: "Feature",
+            geometry: { type: "Point", coordinates: [position.lng, position.lat] },
+            properties: { name: record.name, altitude: Math.round(position.alt), source: "CelesTrak TLE (approx.)" }
+          }];
+        });
+      }
+
+      async function refreshSatellites() {
+        if (!liveLayers.satellites || !map) return;
+        const source = map.getSource("aura-satellites");
+        if (satelliteTleCache.length && source) {
+          source.setData({ type: "FeatureCollection", features: satelliteFeatures(satelliteTleCache) });
+        }
+        if (satelliteTleLoaded) return;
+        satelliteTleLoaded = true;
+        try {
+          // Stations is small and arrives quickly; the other groups enrich the
+          // map after the first useful frame instead of blocking startup.
+          const groups = ["stations", "visual", "weather"];
+          const results = await Promise.all(groups.map(async group => {
+            try {
+              const response = await requestJson(
+                "https://celestrak.org/NORAD/elements/gp.php?GROUP=" + group + "&FORMAT=json"
+              );
+              return response.ok ? parseCelestrak(await response.json()) : [];
+            } catch (_) {
+              return [];
+            }
+          }));
+          const merged = new Map();
+          results.flat().forEach(record => merged.set(record.name, record));
+          satelliteTleCache = [...merged.values()];
+          try {
+            localStorage.setItem("aura-earth-satellites", JSON.stringify(satelliteTleCache));
+          } catch (_) {
+            // The map still works when browser storage is unavailable.
+          }
+        } catch (_) {
+          satelliteTleCache = satelliteTleCache || [];
+        }
+        if (map) {
+          const updated = map.getSource("aura-satellites");
+          if (updated) updated.setData({ type: "FeatureCollection", features: satelliteFeatures(satelliteTleCache) });
+        }
+      }
+
+      async function refreshLiveLayers() {
+        if (!map || (!liveLayers.earthquakes && !liveLayers.events && !liveLayers.cameras && !liveLayers.satellites)) return;
+        if (liveLayers.cameras) await loadProviderCameras();
+        const requestId = ++liveRequest;
+        const jobs = [];
+        if (liveLayers.earthquakes) {
+          jobs.push(requestJson("https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson")
+            .then(async response => ({ kind: "earthquakes", data: response.ok ? eventFeatures(await response.json()) : [] }))
+            .catch(() => ({ kind: "earthquakes", data: [] })));
+        }
+        if (liveLayers.events) {
+          jobs.push(requestJson("https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=100")
+            .then(async response => ({ kind: "events", data: response.ok ? eonetFeatures(await response.json()) : [] }))
+            .catch(() => ({ kind: "events", data: [] })));
+        }
+        const results = await Promise.all(jobs);
+        if (requestId !== liveRequest || !map) return;
+        results.forEach(result => {
+          const source = map.getSource("aura-" + result.kind);
+          if (source) source.setData({ type: "FeatureCollection", features: result.data });
+        });
+        if (liveLayers.satellites) await refreshSatellites();
+      }
+
+      function syncLivePolling() {
+        if (liveTimer !== null) {
+          clearInterval(liveTimer);
+          liveTimer = null;
+        }
+        if (liveLayers.earthquakes || liveLayers.events || liveLayers.satellites) {
+          refreshLiveLayers();
+          liveTimer = setInterval(refreshLiveLayers, liveLayers.satellites ? 2 * 60 * 1000 : 5 * 60 * 1000);
+        }
+      }
+
+      function setLiveLayer(kind, enabled) {
+        liveLayers[kind] = !!enabled;
+        document.querySelectorAll(".live-toggle").forEach(button =>
+          button.classList.toggle("active", !!liveLayers[button.dataset.live]));
+        ensureLiveLayers();
+        syncLivePolling();
+        const credits = [
+          liveLayers.earthquakes ? "Earthquakes: USGS" : "",
+          liveLayers.events ? "Events: NASA EONET" : "",
+          liveLayers.cameras ? "Cameras: public operator feeds" : "",
+          liveLayers.satellites ? "Orbit data: CelesTrak" : ""
+        ].filter(Boolean);
+        const baseCredit = currentMode === "satellite"
+          ? "Imagery © Esri, Maxar, Earthstar Geographics"
+          : currentMode === "terrain"
+            ? "© OpenStreetMap contributors · Elevation © AWS"
+            : "© OpenStreetMap contributors";
+        byId("attribution").textContent = [baseCredit, ...credits].join(" · ");
+        setStatus(enabled ? "Loading live " + kind + " data…" : "Live " + kind + " layer hidden.");
+      }
+
+      function installLivePopups() {
+        if (!map) return;
+        const youtubeWatchUrl = stream => {
+          const value = String(stream || "");
+          const match = value.match(/youtube\.com\/embed\/([^?&/]+)/i);
+          return match ? "https://www.youtube.com/watch?v=" + encodeURIComponent(match[1]) : value;
+        };
+        map.on("click", "aura-earthquakes", event => {
+          const feature = event.features && event.features[0];
+          if (!feature) return;
+          const p = feature.properties || {};
+          const url = String(p.url || "");
+          const link = /^https:\/\//.test(url)
+            ? "<br><a href=\"" + escapeHtml(url) + "\" target=\"_blank\" rel=\"noopener noreferrer\">USGS DETAILS ↗</a>"
+            : "";
+          new maplibregl.Popup({ closeButton: true, maxWidth: "280px" })
+            .setLngLat(event.lngLat)
+            .setHTML("<div class='popup-title'>M" + escapeHtml(p.magnitude) + " EARTHQUAKE</div>"
+              + escapeHtml(p.title || "Earthquake") + link)
+            .addTo(map);
+        });
+        map.on("click", "aura-events", event => {
+          const feature = event.features && event.features[0];
+          if (!feature) return;
+          const p = feature.properties || {};
+          new maplibregl.Popup({ closeButton: true, maxWidth: "280px" })
+            .setLngLat(event.lngLat)
+            .setHTML("<div class='popup-title'>" + escapeHtml(p.category || "EARTH EVENT") + "</div>"
+              + escapeHtml(p.title || "Earth event")
+              + "<br><small>NASA Earth Observatory Natural Event Tracker</small>")
+            .addTo(map);
+        });
+        map.on("click", "aura-cameras", event => {
+          const feature = event.features && event.features[0];
+          if (!feature) return;
+          const p = feature.properties || {};
+          const stream = String(p.stream || "");
+          const feed = String(p.feed || "");
+          const external = String(p.external || "");
+          const watchUrl = youtubeWatchUrl(stream || external);
+          const watchLink = /^https:\/\/(?:www\.)?youtube\.com\//i.test(watchUrl)
+            ? "<a href=\"" + escapeHtml(watchUrl) + "\" target=\"_blank\" rel=\"noopener noreferrer\">OPEN ON YOUTUBE ↗</a>"
+            : /^https:\/\//.test(watchUrl)
+              ? "<a href=\"" + escapeHtml(watchUrl) + "\" target=\"_blank\" rel=\"noopener noreferrer\">OPEN PUBLIC CAMERA ↗</a>"
+              : "";
+          const media = /^https:\/\//.test(stream) && /youtube\.com\/embed\//i.test(stream)
+            ? watchLink + "<iframe src=\"" + escapeHtml(stream) + "\" title=\"Public webcam\" loading=\"lazy\" allow=\"autoplay; encrypted-media\" style=\"display:block;width:100%;height:150px;border:0;border-radius:4px;margin-top:8px;\"></iframe>"
+            : /^https:\/\//.test(feed)
+              ? "<img src=\"" + escapeHtml(feed) + "\" alt=\"Live public camera snapshot\" loading=\"lazy\" style=\"display:block;width:100%;max-height:160px;object-fit:cover;border-radius:4px;margin-top:8px;\"><br>" + watchLink
+            : /^https:\/\//.test(stream)
+              ? "<br>" + watchLink
+              : external ? "<br>" + watchLink : "";
+          new maplibregl.Popup({ closeButton: true, maxWidth: "320px" })
+            .setLngLat(event.lngLat)
+            .setHTML("<div class='popup-title'>" + escapeHtml(p.name || "PUBLIC CAMERA") + "</div>"
+              + escapeHtml([p.city, p.country].filter(Boolean).join(", ")) + media
+              + "<br><small>" + escapeHtml(p.source || "Public operator feed") + "</small>")
+            .addTo(map);
+        });
+        map.on("click", "aura-satellites", event => {
+          const feature = event.features && event.features[0];
+          if (!feature) return;
+          const p = feature.properties || {};
+          new maplibregl.Popup({ closeButton: true, maxWidth: "260px" })
+            .setLngLat(event.lngLat)
+            .setHTML("<div class='popup-title'>" + escapeHtml(p.name || "SATELLITE") + "</div>"
+              + "Altitude: " + escapeHtml(p.altitude || "—") + " km<br><small>"
+              + escapeHtml(p.source || "CelesTrak") + " Positions are approximate.</small>")
+            .addTo(map);
+        });
+      }
 
       if (window.qt && window.QWebChannel) {
         new QWebChannel(qt.webChannelTransport, channel => {
@@ -556,6 +1033,9 @@
       byId("zoom-out").addEventListener("click", () => map && map.zoomOut());
       document.querySelectorAll(".mode").forEach(button =>
         button.addEventListener("click", () => setMode(button.dataset.mode)));
+      document.querySelectorAll(".live-toggle").forEach(button =>
+        button.addEventListener("click", () =>
+          setLiveLayer(button.dataset.live, !liveLayers[button.dataset.live])));
       document.addEventListener("pointerdown", event => {
         if (activePopup && !event.target.closest(".maplibregl-popup")
             && !event.target.closest("#map")) {
@@ -579,9 +1059,17 @@
         map.addControl(new maplibregl.NavigationControl({ showCompass: true }), "bottom-right");
         map.on("load", () => {
           if (map.setProjection) map.setProjection({ type: "globe" });
+          ensureLiveLayers();
+          installLivePopups();
+          document.querySelectorAll(".live-toggle").forEach(button =>
+            button.classList.toggle("active", !!liveLayers[button.dataset.live]));
+          syncLivePolling();
           setStatus("Interactive globe ready. Click a place for weather and location details.");
         });
-        map.on("style.load", drawRoute);
+        map.on("style.load", () => {
+          ensureLiveLayers();
+          drawRoute();
+        });
         map.on("error", event => {
           const message = event.error && event.error.message || "Unknown map error";
           if (/webgl|context/i.test(message)) {

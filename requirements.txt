@@ -70,6 +70,7 @@ openpyxl                     # excel_writer — spreadsheet output
 youtube-transcript-api       # youtube_video — transcript fetch for summaries
 pygetwindow                  # game_updater, chat_takeover — window geometry
 
+
 # ── Windows-only (pip skips these automatically on macOS / Linux) ─────────────
 comtypes;   sys_platform == "win32"
 pycaw;      sys_platform == "win32"
@@ -95,6 +96,7 @@ ddgs>=9,<10                  # web_search — the maintained successor to
 pdfplumber                   # file_processor — PDF text and tables
 PyPDF2                       # file_processor — PDF fallback reader
 python-docx                  # file_processor — .docx reading
+reportlab>=4,<5              # workflows — optional YouTube PDF export
 # NVIDIA GPU metrics use the driver's NVML library directly through ctypes.
 
 # ── Optional: heavy extras, install only if you want the feature ──────────────
@@ -126,3 +128,15 @@ ollama
 PyYAML
 edge-tts
 miniaudio
+
+# ── Multi-Step Task Execution ───────────────────────────────────────────────
+
+flake8
+ruff
+ffmpeg
+ffprobe
+
+
+# Web Browser integration for Edge and Chrome (Windows only)
+pywebview; sys_platform == "win32"
+pythonnet; sys_platform == "win32"

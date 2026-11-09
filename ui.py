@@ -5,11 +5,14 @@ import math
 import os
 import platform
 import random
+import re
 import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import psutil
 
@@ -24,11 +27,12 @@ else:
 os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
 
 from PyQt6.QtCore import (
-    QEasingCurve, QEvent, QMimeData, QObject, QPoint, QPointF, QPropertyAnimation,
-    QRectF, QSize, QSizeF, Qt, QThread, QTimer, QUrl, pyqtSignal,
+    QEasingCurve, QEvent, QLineF, QMimeData, QObject, QPoint, QPointF, QPropertyAnimation,
+    QRect, QRectF, QSize, QSizeF, Qt, QThread, QTimer, QUrl, QVariantAnimation,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QConicalGradient, QCursor, QDragEnterEvent, QDropEvent, QFont,
+    QBrush, QColor, QConicalGradient, QCursor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
@@ -45,12 +49,26 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
     HAVE_VIDEO = False
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
 
+# In-app browser (real Chromium via QtWebEngine). Imported here, before any
+# QApplication exists, as Qt requires. If the package is missing only the
+# browser feature is lost; the rest of the app starts normally.
+try:
+    from PyQt6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile,
+                                       QWebEngineScript, QWebEngineSettings)
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    HAVE_WEB = True
+except Exception as _e:            # noqa: BLE001 - reported, never fatal
+    QWebEnginePage = QWebEngineProfile = QWebEngineScript = QWebEngineSettings = QWebEngineView = None
+    HAVE_WEB = False
+    print(f"[Browser] in-app browser unavailable ({_e}) — pip install PyQt6-WebEngine")
+
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QScrollArea, QSizePolicy, QSplitter,
+    QScrollArea, QSizePolicy, QSlider,  # NEURAL: force-control slider
+    QSplitter,
     QGraphicsScene, QGraphicsView,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QSizeGrip,
 )
 try:
     from earth.earth_widget import EarthWidget
@@ -162,6 +180,10 @@ _FACE_MODEL_MIN_BYTES = 100_000
 _FACE_THRESH    = 0.38     # cosine similarity needed to count as "same person" (SFace default 0.363)
 _FACE_NEED      = 3        # consecutive matching checks required before unlocking
 _FACE_ENROLL_N  = 8        # face samples captured during enrolment
+# YuNet reports face width in a 640-pixel-wide working frame. These bounds
+# approximate a 1-3 m seating range for a typical 60-degree webcam.
+_FACE_MIN_WIDTH = 32       # farther than roughly 3 m: reject
+_FACE_MAX_WIDTH = 400       # nearer than roughly 20-30 cm: reject
 # Modes in which the lock/enrol overlay covers the window.
 _FACE_COVER = ("pending", "prep", "lock", "enroll", "reenroll", "unlocking")
 
@@ -288,7 +310,7 @@ class _FaceEngine:
             return False
 
     def analyse(self, frame):
-        """→ (face_count, unit descriptor of the largest face | None, its width in px)."""
+        """→ (face_count, unit descriptor, largest face width at 640 px)."""
         import cv2
         import numpy as np
         h, w = frame.shape[:2]
@@ -300,7 +322,7 @@ class _FaceEngine:
             _ret, faces = self._det.detect(frame)
             if faces is None or len(faces) == 0:
                 return 0, None, 0
-            good = [f for f in faces if float(f[14]) >= 0.8 and float(f[2]) >= 40.0]
+            good = [f for f in faces if float(f[14]) >= 0.8 and float(f[2]) >= 32.0]
             if not good:
                 return 0, None, 0
             best = max(good, key=lambda f: float(f[2]) * float(f[3]))
@@ -310,7 +332,7 @@ class _FaceEngine:
         nrm = float(np.linalg.norm(feat))
         if nrm <= 0.0:
             return 0, None, 0
-        return len(good), feat / nrm, int(best[2])
+        return len(good), feat / nrm, int(best[2] * 640 / w)
 
 
 class C:
@@ -422,6 +444,642 @@ def retheme_all_widgets(old: dict[str, str], new: dict[str, str]) -> None:
 
 def qcol(h: str, a: int = 255) -> QColor:
     c = QColor(h); c.setAlpha(a); return c
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MOTION ENGINE — holographic open / close for every floating panel & window
+#
+#  Floating panels (children of the HUD) are animated with a *ghost*: one cached
+#  snapshot of the panel is painted scaled / faded / scan-revealed by a tiny
+#  click-through widget, while the real panel is shown or hidden instantly. The
+#  panel never re-lays-out or repaints during the animation (cheap, 60 fps) and
+#  its visibility semantics — isVisible(), hideEvent, deleteLater() — are exactly
+#  what they were before.
+#
+#  Top-level windows (browser, graph, news player, main window, mini orb) use the
+#  OS compositor instead: windowOpacity plus a short glide, no repaint at all.
+#
+#  Set AURA_REDUCE_MOTION=1 to switch every animation off.
+# ═══════════════════════════════════════════════════════════════════════════
+_MOTION_ON = os.environ.get("AURA_REDUCE_MOTION", "0").strip().lower() not in (
+    "1", "true", "yes", "on")
+
+_MO_OPEN_MS    = 300      # panel: materialise
+_MO_CLOSE_MS   = 190      # panel: dematerialise
+_MO_WIN_IN_MS  = 280      # window: fade + glide in
+_MO_WIN_OUT_MS = 160      # window: fade + glide out
+_MO_MAX_PIXELS = 2_400_000  # bigger panels than this skip the ghost (stay instant)
+_MO_LIVE: set = set()     # keeps running ghosts referenced
+
+
+def _mo_alive(o) -> bool:
+    if o is None:
+        return False
+    try:
+        from PyQt6 import sip
+        return not sip.isdeleted(o)
+    except Exception:
+        return True
+
+
+class _MotionGhost(QWidget):
+    """Click-through snapshot player. Parent = the panel's own parent, so it sits
+    in the same coordinate space and stacks above the panel."""
+
+    _M = 20          # margin around the panel for brackets / glow
+
+    def __init__(self, target: QWidget, pix: QPixmap):
+        super().__init__(target.parentWidget())
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._t = target
+        self._pm = pix
+        self._sz = pix.deviceIndependentSize()
+        self._s = 0.0              # 0 = gone … 1 = fully materialised
+        self._opening = True
+        self._fx = None
+        self._anim = None
+        self._geo = QRect()
+        self._sync_geometry()
+        _MO_LIVE.add(self)
+        self.destroyed.connect(lambda *_a, g=self: _MO_LIVE.discard(g))
+
+    # ── geometry / veil ─────────────────────────────────────────────────────
+    def _sync_geometry(self) -> None:
+        try:
+            g = self._t.geometry()
+        except RuntimeError:
+            return
+        if g != self._geo:
+            self._geo = g
+            m = self._M
+            self.setGeometry(g.adjusted(-m, -m, m, m))
+
+    def veil(self) -> None:
+        """Make the real panel invisible while the ghost stands in for it."""
+        t = self._t
+        if t.graphicsEffect() is None:
+            fx = QGraphicsOpacityEffect(t)
+            fx.setOpacity(0.0)
+            t.setGraphicsEffect(fx)
+            self._fx = fx
+
+    def unveil(self) -> None:
+        try:
+            if self._fx is not None and self._t.graphicsEffect() is self._fx:
+                self._t.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+        self._fx = None
+
+    def refresh(self) -> None:
+        """One tick after the panel was shown: callers often resize / move it right
+        after show(), so re-sync, and re-grab if the size changed."""
+        try:
+            if not self._opening or not self._t.isVisible():
+                return
+            if self._t.size() != self._sz.toSize():
+                self.unveil()
+                pm = self._t.grab()
+                self.veil()
+                if not pm.isNull():
+                    self._pm = pm
+                    self._sz = pm.deviceIndependentSize()
+            self._sync_geometry()
+        except RuntimeError:
+            pass
+
+    # ── playback ────────────────────────────────────────────────────────────
+    def play(self, opening: bool) -> None:
+        self._opening = opening
+        if self._anim is not None:
+            try:
+                self._anim.valueChanged.disconnect()
+                self._anim.finished.disconnect()
+                self._anim.stop()
+                self._anim.deleteLater()
+            except (RuntimeError, TypeError):
+                pass
+        end = 1.0 if opening else 0.0
+        span = abs(end - self._s)
+        base = _MO_OPEN_MS if opening else _MO_CLOSE_MS
+        a = QVariantAnimation(self)
+        a.setStartValue(float(self._s))
+        a.setEndValue(end)
+        a.setDuration(max(60, int(base * max(span, 0.25))))
+        a.setEasingCurve(QEasingCurve(QEasingCurve.Type.OutCubic))
+        a.valueChanged.connect(self._on_tick)
+        a.finished.connect(self._finish)
+        self._anim = a
+        if opening:
+            self.veil()
+        self.show()
+        self.raise_()
+        a.start()
+
+    def _on_tick(self, v) -> None:
+        self._s = float(v)
+        if self._opening:
+            self._sync_geometry()
+        self.update()
+
+    def _finish(self) -> None:
+        self.unveil()
+        p = self.parentWidget()
+        g = self.geometry()
+        self.hide()
+        if p is not None:
+            p.update(g)          # repaint what the ghost covered (see _HudOverlay)
+        try:
+            if getattr(self._t, "_mo_ghost", None) is self:
+                self._t._mo_ghost = None
+        except RuntimeError:
+            pass
+        self.deleteLater()
+
+    # ── painting ────────────────────────────────────────────────────────────
+    def paintEvent(self, _e) -> None:
+        s = self._s
+        if s <= 0.003:
+            return
+        w, h = self._sz.width(), self._sz.height()
+        m = self._M
+        acc = QColor(C.PRI)
+
+        reveal = min(1.0, s * 1.18)               # scan line sweeps top → bottom
+        op = min(1.0, s * 1.5)
+        sx = 0.972 + 0.028 * s                    # unfolds: height lags width
+        sy = 0.915 + 0.085 * s
+        dy = (1.0 - s) * 8.0                      # glides up into place
+        cx = m + w / 2.0
+        cy = m + h / 2.0 + dy
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        p.save()
+        p.translate(cx, cy)
+        p.scale(sx, sy)
+        p.translate(-w / 2.0, -h / 2.0)
+        p.setOpacity(op)
+        if reveal < 1.0:
+            p.setClipRect(QRectF(-2.0, -2.0, w + 4.0, h * reveal + 2.0))
+        p.drawPixmap(QPointF(0.0, 0.0), self._pm)
+        p.restore()
+
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        lx0 = cx - (w / 2.0) * sx
+        lx1 = cx + (w / 2.0) * sx
+
+        # scan line + trailing glow
+        if reveal < 1.0:
+            ly = cy + (h * reveal - h / 2.0) * sy
+            fade = min(1.0, s * 7.0)
+            glow = QColor(acc)
+            glow.setAlpha(int((24 + 70 * (1.0 - reveal) ** 0.5) * fade))
+            clear = QColor(acc)
+            clear.setAlpha(0)
+            grad = QLinearGradient(0.0, ly - 18.0, 0.0, ly)
+            grad.setColorAt(0.0, clear)
+            grad.setColorAt(1.0, glow)
+            p.fillRect(QRectF(lx0, ly - 18.0, lx1 - lx0, 18.0), QBrush(grad))
+            line = QColor(acc)
+            line.setAlpha(int(255 * (1.0 - reveal) ** 0.55 * fade))
+            p.setPen(QPen(line, 1.4))
+            p.drawLine(QPointF(lx0, ly), QPointF(lx1, ly))
+
+        # corner brackets: close in on the panel, flash, release
+        ba = int(230 * math.sin(math.pi * s ** 2.2))
+        if ba > 6:
+            d = 3.0 + 12.0 * (1.0 - s) ** 1.5
+            n = 11.0
+            x0, x1 = lx0 - d, lx1 + d
+            y0 = cy - (h / 2.0) * sy - d
+            y1 = cy + (h / 2.0) * sy + d
+            bc = QColor(acc)
+            bc.setAlpha(ba)
+            p.setPen(QPen(bc, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap))
+            p.drawLines([
+                QLineF(x0, y0, x0 + n, y0), QLineF(x0, y0, x0, y0 + n),
+                QLineF(x1, y0, x1 - n, y0), QLineF(x1, y0, x1, y0 + n),
+                QLineF(x0, y1, x0 + n, y1), QLineF(x0, y1, x0, y1 - n),
+                QLineF(x1, y1, x1 - n, y1), QLineF(x1, y1, x1, y1 - n),
+            ])
+        p.end()
+
+
+class _Motion:
+    quitting = False         # set once the app is really shutting down: no more fades
+
+    # ── floating panels (ghost) ─────────────────────────────────────────────
+    @staticmethod
+    def _live_ghost(target):
+        g = getattr(target, "_mo_ghost", None)
+        return g if _mo_alive(g) else None
+
+    @staticmethod
+    def _eligible(target) -> bool:
+        par = target.parentWidget()
+        if par is None or target.isWindow() or not par.isVisible():
+            return False
+        if par.window().isMinimized() or target.graphicsEffect() is not None:
+            return False
+        sz = target.size()
+        return (sz.width() >= 24 and sz.height() >= 16
+                and sz.width() * sz.height() <= _MO_MAX_PIXELS)
+
+    @staticmethod
+    def snap(target):
+        """Snapshot of a visible panel, taken just before it hides (None = skip)."""
+        if _Motion._live_ghost(target) is not None:
+            return False                       # a ghost already owns the picture
+        if not _Motion._eligible(target):
+            return None
+        pm = target.grab()
+        return None if pm.isNull() else pm
+
+    @staticmethod
+    def panel_in(target) -> None:
+        g = _Motion._live_ghost(target)
+        if g is None:
+            if not _Motion._eligible(target):
+                return
+            pm = target.grab()
+            if pm.isNull():
+                return
+            g = _MotionGhost(target, pm)
+            target._mo_ghost = g
+            QTimer.singleShot(0, g.refresh)
+        g.play(True)
+
+    @staticmethod
+    def panel_out(target, pm) -> None:
+        g = _Motion._live_ghost(target)
+        if g is None:
+            if not isinstance(pm, QPixmap):
+                return
+            g = _MotionGhost(target, pm)
+            g._s = 1.0
+            target._mo_ghost = g
+        g.play(False)
+
+    # ── top-level windows (compositor) ──────────────────────────────────────
+    @staticmethod
+    def _stop(owner) -> None:
+        a = getattr(owner, "_mo_anim", None)
+        owner._mo_anim = None
+        if a is not None and _mo_alive(a):
+            try:
+                a.valueChanged.disconnect()
+                a.finished.disconnect()
+                a.stop()
+                a.deleteLater()
+            except (RuntimeError, TypeError):
+                pass
+
+    @staticmethod
+    def _run(owner, start, end, ms, curve, on_val, on_end=None) -> None:
+        _Motion._stop(owner)
+        a = QVariantAnimation(owner)
+        a.setStartValue(float(start))
+        a.setEndValue(float(end))
+        a.setDuration(max(1, int(ms)))
+        a.setEasingCurve(curve if isinstance(curve, QEasingCurve) else QEasingCurve(curve))
+        a.valueChanged.connect(on_val)
+        if on_end is not None:
+            a.finished.connect(on_end)
+        owner._mo_anim = a
+        a.start()
+
+    @staticmethod
+    def _glide(w, drop):
+        """Return a setter that fades w and offsets it vertically; the offset is
+        tracked relative so moves made by the app mid-animation are respected."""
+        st = getattr(w, "_mo_state", None)
+        if st is None:
+            st = w._mo_state = {"off": 0}
+        if st["off"] == 0:
+            st["rest"] = w.pos()       # where the window sits when not animating
+
+        def apply(s: float) -> None:
+            try:
+                w.setWindowOpacity(max(0.0, min(1.0, s)))
+                off = int(round((1.0 - s) * drop))
+                d = off - st["off"]
+                if d:
+                    w.move(w.x(), w.y() + d)
+                    st["off"] = off
+            except RuntimeError:
+                pass
+        return apply
+
+    @staticmethod
+    def _to_rest(w) -> None:
+        """While the window is still up (and fully faded) put it back in place, so
+        nothing has to move a hidden window afterwards."""
+        try:
+            st = getattr(w, "_mo_state", None)
+            if st and st["off"]:
+                rest = st.get("rest")
+                if rest is not None:
+                    w.move(rest)
+                else:
+                    w.move(w.x(), w.y() - st["off"])
+                st["off"] = 0
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def win_restore(w) -> None:
+        """Back to rest (opacity 1, no offset) — used after a window has gone."""
+        if not _mo_alive(w):
+            return
+        try:
+            st = getattr(w, "_mo_state", None)
+            if st and st["off"]:
+                rest = st.get("rest")
+                if rest is not None:
+                    w.move(rest)           # absolute: immune to frame-strut shifts on hide
+                else:
+                    w.move(w.x(), w.y() - st["off"])
+                st["off"] = 0
+            w.setWindowOpacity(1.0)
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def win_cancel(w) -> None:
+        """Abort a fade-out in flight and snap the window back to rest."""
+        if getattr(w, "_mo_fading", False) or getattr(w, "_mo_closing", False):
+            w._mo_fading = False
+            w._mo_closing = False
+            _Motion._stop(w)
+            _Motion.win_restore(w)
+
+    @staticmethod
+    def win_in(w, skip=None, rise=14, ms=_MO_WIN_IN_MS, overshoot=0.0) -> None:
+        if not _MOTION_ON or (skip is not None and skip(w)):
+            return
+        if w.isMaximized() or w.isFullScreen() or w.isMinimized():
+            return
+        _Motion.win_cancel(w)
+        _Motion._stop(w)
+        w.setWindowOpacity(0.0)        # before the native window exists: no flash
+
+        def start():
+            # One tick later the native window is in its final place, so the glide
+            # is measured from where the window really is.
+            if not _mo_alive(w) or not w.isVisible():
+                _Motion.win_restore(w)
+                return
+            apply = _Motion._glide(w, rise)
+            curve = QEasingCurve(QEasingCurve.Type.OutBack if overshoot
+                                 else QEasingCurve.Type.OutCubic)
+            if overshoot:
+                curve.setOvershoot(overshoot)
+
+            def end():
+                apply(1.0)
+                try:
+                    w.setWindowOpacity(1.0)
+                except RuntimeError:
+                    pass
+            _Motion._run(w, 0.0, 1.0, ms, curve, apply, end)
+        QTimer.singleShot(0, start)
+
+    @staticmethod
+    def win_fade(w, done, ms=_MO_WIN_OUT_MS, drop=8) -> None:
+        """Fade a window out, then call done() (normally w.hide)."""
+        if (not _MOTION_ON or _Motion.quitting or not w.isVisible()
+                or w.isMinimized() or w.isMaximized() or w.isFullScreen()):
+            done()
+            return
+        if getattr(w, "_mo_fading", False):
+            return
+        w._mo_fading = True
+        apply = _Motion._glide(w, drop)
+        s0 = max(0.05, min(1.0, w.windowOpacity()))
+
+        def end():
+            w._mo_fading = False
+            _Motion._to_rest(w)
+            done()
+            QTimer.singleShot(0, lambda: _Motion.win_restore(w))
+        _Motion._run(w, s0, 0.0, ms * s0 + 40, QEasingCurve.Type.OutCubic, apply, end)
+
+    @staticmethod
+    def win_out(w, e, skip=None) -> bool:
+        """closeEvent helper. True = the close was deferred for a fade-out (the
+        event has been ignored); False = go ahead and close now."""
+        if getattr(w, "_mo_pass", False):
+            w._mo_pass = False
+            return False
+        if (not _MOTION_ON or _Motion.quitting or (skip is not None and skip(w))
+                or not w.isVisible() or w.isMinimized() or w.isMaximized()
+                or w.isFullScreen()):
+            return False
+        e.ignore()
+        if getattr(w, "_mo_closing", False):
+            return True
+        w._mo_closing = True
+        apply = _Motion._glide(w, 10)
+        s0 = max(0.05, min(1.0, w.windowOpacity()))
+
+        def end():
+            w._mo_closing = False
+            w._mo_pass = True
+            _Motion._to_rest(w)
+            try:
+                w.close()
+            except RuntimeError:
+                return
+            finally:
+                if _mo_alive(w):
+                    w._mo_pass = False
+                QTimer.singleShot(0, lambda: _Motion.win_restore(w))
+        _Motion._run(w, s0, 0.0, _MO_WIN_OUT_MS * s0 + 40,
+                     QEasingCurve.Type.OutCubic, apply, end)
+        return True
+
+    @staticmethod
+    def main_out(win, e) -> bool:
+        """Main window: fade every visible window together, then really close."""
+        if getattr(win, "_mo_pass", False):
+            win._mo_pass = False
+            return False
+        if (not _MOTION_ON or _Motion.quitting or not win.isVisible()
+                or win.isMinimized() or win.isFullScreen()):
+            return False
+        e.ignore()
+        if getattr(win, "_mo_closing", False):
+            return True
+        win._mo_closing = True
+        wins = [x for x in QApplication.topLevelWidgets()
+                if x.isVisible() and not x.isMinimized()]
+
+        def tick(s):
+            for x in wins:
+                try:
+                    x.setWindowOpacity(float(s))
+                except RuntimeError:
+                    pass
+
+        def end():
+            win._mo_closing = False
+            win._mo_pass = True
+            try:
+                win.close()
+            finally:
+                if _mo_alive(win):
+                    win._mo_pass = False
+                for x in wins:
+                    if _mo_alive(x):
+                        QTimer.singleShot(0, lambda x=x: (
+                            x.setWindowOpacity(1.0) if _mo_alive(x) and not x.isVisible()
+                            else None))
+        _Motion._run(win, 1.0, 0.0, _MO_WIN_OUT_MS + 40,
+                     QEasingCurve.Type.InOutCubic, tick, end)
+        return True
+
+    @staticmethod
+    def install_app_hooks(app) -> None:
+        """Never stand between the OS and a log-off / shutdown."""
+        try:
+            app.commitDataRequest.connect(
+                lambda *_a: setattr(_Motion, "quitting", True))
+            app.aboutToQuit.connect(lambda: setattr(_Motion, "quitting", True))
+        except Exception:
+            pass
+
+
+def _mo_vis(self, v, orig):
+    """setVisible wrapper shared by every animated floating panel."""
+    if _MOTION_ON and not _Motion.quitting:
+        try:
+            if v and not self.isVisible() and self.isHidden():     # explicit show()
+                orig(self, True)
+                _Motion.panel_in(self)
+                return
+            if (not v) and self.isVisible():                         # explicit hide()
+                pm = _Motion.snap(self)
+                orig(self, False)
+                if pm is not None:
+                    _Motion.panel_out(self, pm)
+                return
+        except Exception as exc:                                     # never break the UI
+            print(f"[Motion] panel animation skipped: {exc!r}")
+    orig(self, v)
+
+
+def _motion_overlay(cls):
+    """Class decorator: holographic open / close for a floating HUD panel."""
+    orig = cls.setVisible
+
+    def setVisible(self, v):                        # noqa: N802 (Qt override)
+        _mo_vis(self, v, orig)
+    cls.setVisible = setVisible
+    return cls
+
+
+@_motion_overlay
+class _MoPanel(QWidget):
+    """Plain QWidget with the holographic open / close — for panels that are built
+    inline (PyQt only honours a setVisible override that exists from construction).
+    A Python subclass is no longer a 'plain QWidget' to the style sheet engine, so
+    the styled background (border, radius) has to be asked for explicitly."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+
+def _motion_window(cls, skip=None, close_anim=True, rise=14):
+    """Class decorator: fade + glide in on show(), fade + glide out on close()."""
+    if "_mo_win_patched" in cls.__dict__:
+        return cls
+    o_show, o_close = cls.showEvent, cls.closeEvent
+
+    def showEvent(self, e):                         # noqa: N802
+        o_show(self, e)
+        if not e.spontaneous():
+            _Motion.win_in(self, skip, rise=rise)
+
+    def closeEvent(self, e):                        # noqa: N802
+        if close_anim and _Motion.win_out(self, e, skip):
+            return
+        o_close(self, e)
+    cls.showEvent = showEvent
+    cls.closeEvent = closeEvent
+    cls._mo_win_patched = True
+    return cls
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STAGGERED OPENING — floating windows arrive one after another
+#
+#  Opening the news video, the USD/INR graph and the briefing text in the same
+#  event-loop tick made the UI hitch: a web view is created, a page starts
+#  loading and three fade-ins begin at once, so the animations were starved
+#  of frames exactly when they needed them. The sequencer runs "open this
+#  window" jobs one at a time, at least _MO_STAGGER_MS apart (measured from
+#  the end of the previous job, so a heavy build never eats into the calm
+#  gap). Every window keeps its own full open animation.
+#  AURA_STAGGER_MS=<ms> changes the gap (0 = off).
+# ═══════════════════════════════════════════════════════════════════════════
+try:
+    _MO_STAGGER_MS = max(0, int(os.environ.get("AURA_STAGGER_MS", "500")))
+except ValueError:
+    _MO_STAGGER_MS = 500
+
+
+class _OpenSequencer(QObject):
+    def __init__(self, gap_ms: int = _MO_STAGGER_MS, parent=None):
+        super().__init__(parent)
+        self._gap = max(0, int(gap_ms)) / 1000.0
+        self._jobs: list = []          # [(key, callable)] in arrival order
+        self._free_at = 0.0            # monotonic time the next job may start
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._run_next)
+
+    def pending(self, key) -> bool:
+        return any(k == key for k, _fn in self._jobs)
+
+    def hold(self) -> None:
+        """A window was just opened outside the queue: let it settle first."""
+        self._free_at = max(self._free_at, time.monotonic() + self._gap)
+
+    def submit(self, key, fn) -> None:
+        """Queue fn; a job already waiting under the same key is replaced."""
+        self.cancel(key)
+        self._jobs.append((key, fn))
+        self._arm()
+
+    def cancel(self, key=None) -> None:
+        if key is None:
+            self._jobs.clear()
+        else:
+            self._jobs = [j for j in self._jobs if j[0] != key]
+        if not self._jobs:
+            self._timer.stop()
+
+    def _arm(self) -> None:
+        if self._timer.isActive() or not self._jobs:
+            return
+        self._timer.start(max(0, int((self._free_at - time.monotonic()) * 1000)))
+
+    def _run_next(self) -> None:
+        if not self._jobs:
+            return
+        _key, fn = self._jobs.pop(0)
+        try:
+            fn()
+        except Exception as exc:                    # never break the UI
+            print(f"[Motion] staggered open failed: {exc!r}")
+        self._free_at = time.monotonic() + self._gap
+        self._arm()
+
 
 
 # ── Windows GPU via NVML DLL (no subprocess, no console window) ──────────────
@@ -1529,6 +2187,7 @@ class _DropCanvas(QWidget):
             z.mousePressEvent(e)
 
 
+@_motion_overlay
 class _CameraPreview(QWidget):
     """Floating overlay that briefly shows what the camera captured."""
 
@@ -1637,6 +2296,7 @@ class _DragHeader(QWidget):
         super().mouseReleaseEvent(ev)
 
 
+@_motion_overlay
 class _RoomWatchBox(QWidget):
     """Always-on floating room-monitor box: live webcam preview, draggable
     by its header, with a cross in the top-right corner."""
@@ -1868,6 +2528,7 @@ class FaceLockOverlay(QWidget):
             self._btn.show()
 
 
+@_motion_overlay
 class SetupOverlay(QWidget):
     done = pyqtSignal(dict)
     finished = pyqtSignal()
@@ -2962,11 +3623,13 @@ class HueWheel(QWidget):
             self.hue_committed.emit(self.color())
 
 
+@_motion_overlay
 class CustomizeOverlay(QWidget):
     """Floating overlay — change assistant name, user name, UI colour and voice."""
 
     saved = pyqtSignal(str, str, str, str, bool)   # assistant_name, user_name, ui_color, voice, local_voice
     configure_local_ai = pyqtSignal()
+    open_permissions = pyqtSignal()
     _OW, _OH = 400, 660
 
     def __init__(self, assistant_name="AURA", user_name="",
@@ -3028,7 +3691,20 @@ class CustomizeOverlay(QWidget):
             QPushButton:hover {{ border-color: {C.PRI}; }}
         """)
         local_ai_btn.clicked.connect(self.configure_local_ai.emit)
-        lay.addWidget(local_ai_btn)
+        permissions_btn = QPushButton("PERMISSIONS")
+        permissions_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        permissions_btn.setFixedHeight(28)
+        permissions_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        permissions_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ border-color: {C.PRI}; }}
+        """)
+        permissions_btn.clicked.connect(self.open_permissions.emit)
+        settings_row = QHBoxLayout()
+        settings_row.addWidget(local_ai_btn, 1)
+        settings_row.addWidget(permissions_btn)
+        lay.addLayout(settings_row)
 
         # ── Assistant voice — Gemini prebuilt voices ─────────────────────────
         # Names are language-neutral proper nouns, so the row reads the same in
@@ -3334,6 +4010,91 @@ class CustomizeOverlay(QWidget):
         self.hide()
 
 
+@_motion_overlay
+class PermissionsOverlay(QWidget):
+    """Controls process-local file-read grants and the confirmation-gated access switch."""
+
+    def __init__(self, broker, parent=None):
+        super().__init__(parent)
+        self._broker = broker
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedWidth(420)
+        self.setStyleSheet(f"""
+            PermissionsOverlay {{
+                background: rgba(0, 6, 10, 245);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(8)
+        heading = QLabel("PERMISSIONS")
+        heading.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        heading.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        root.addWidget(heading)
+
+        self._enabled = QCheckBox("Enable file & system access (confirmation required)")
+        self._enabled.setChecked(bool(getattr(broker, "enabled", True)))
+        self._enabled.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        self._enabled.toggled.connect(self._set_enabled)
+        root.addWidget(self._enabled)
+
+        grants_label = QLabel("Active read-folder grants (this session only)")
+        grants_label.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        root.addWidget(grants_label)
+        self._grants = QComboBox()
+        self._grants.setStyleSheet(
+            f"QComboBox {{ background: {C.PANEL2}; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; padding: 4px; }}"
+        )
+        root.addWidget(self._grants)
+        row = QHBoxLayout()
+        revoke = QPushButton("REVOKE SELECTED")
+        revoke.clicked.connect(self._revoke_selected)
+        row.addWidget(revoke)
+        audit = QPushButton("OPEN AUDIT LOG")
+        audit.clicked.connect(self._open_audit)
+        row.addWidget(audit)
+        root.addLayout(row)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(self.hide)
+        root.addWidget(close)
+        for button in (revoke, audit, close):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {C.PRI};
+                    border: 1px solid {C.BORDER}; border-radius: 3px; padding: 6px; }}
+                QPushButton:hover {{ border-color: {C.PRI}; }}
+            """)
+        self._refresh_grants()
+        self.adjustSize()
+
+    def _set_enabled(self, enabled: bool):
+        self._broker.enabled = bool(enabled)
+
+    def _refresh_grants(self):
+        self._grants.clear()
+        for folder in self._broker.session_read_folders():
+            self._grants.addItem(folder, folder)
+        self._grants.setEnabled(self._grants.count() > 0)
+
+    def _revoke_selected(self):
+        folder = self._grants.currentData()
+        if folder:
+            self._broker.revoke_session_read(folder)
+            self._refresh_grants()
+
+    def _open_audit(self):
+        audit_path = self._broker.audit_path
+        if not audit_path.is_file():
+            QMessageBox.information(self, "Permission audit", "The audit log has no entries yet.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(audit_path))):
+            QMessageBox.warning(self, "Permission audit", "Windows could not open the audit log.")
+
+
+@_motion_overlay
 class PluginManagerOverlay(QWidget):
     """Floating overlay — lists discovered plugins with per-plugin ON/OFF toggles."""
 
@@ -3445,6 +4206,7 @@ class PluginManagerOverlay(QWidget):
         self._style_toggle(btn, new_val)
 
 
+@_motion_overlay
 class _HudOverlay(QWidget):
     """Base for the floating panels placed by hand over the HUD.
 
@@ -3831,6 +4593,7 @@ class MemoryOverlay(_HudOverlay):
         QTimer.singleShot(0, self._rebuild)
 
 
+@_motion_overlay
 class PluginSettingsOverlay(QWidget):
     """Floating overlay — renders per-plugin settings forms.
 
@@ -4139,6 +4902,7 @@ class PluginSettingsOverlay(QWidget):
             lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
 
 
+@_motion_overlay
 class ClipboardPanel(QWidget):
     """Floating panel shown when text is copied — offers quick AURA actions."""
 
@@ -4639,9 +5403,39 @@ class NotificationToast(QFrame):
 
     def restore(self) -> None:
         self._fading = False
-        self._opacity.setOpacity(1.0)
+        self._opacity.setOpacity(0.0 if _MOTION_ON else 1.0)
         self._timer.start(int(self.timeout_seconds * 1000))
         self.show()
+        self.intro()
+
+    def intro(self) -> None:
+        """Materialise: fade in while the manager slides the toast into its slot."""
+        if not _MOTION_ON:
+            self._opacity.setOpacity(1.0)
+            return
+        a = QPropertyAnimation(self._opacity, b"opacity", self)
+        a.setDuration(260)
+        a.setStartValue(self._opacity.opacity())
+        a.setEndValue(1.0)
+        a.setEasingCurve(QEasingCurve.Type.OutCubic)
+        a.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def vanish(self) -> None:
+        """Dismissed by hand (or cleared): quick fade, then remove."""
+        self._timer.stop()
+        if (not _MOTION_ON or _Motion.quitting or not self.isVisible()
+                or self._opacity.opacity() <= 0.02):
+            self.hide()
+            self.deleteLater()
+            return
+        self._fading = True
+        a = QPropertyAnimation(self._opacity, b"opacity", self)
+        a.setDuration(150)
+        a.setStartValue(self._opacity.opacity())
+        a.setEndValue(0.0)
+        a.setEasingCurve(QEasingCurve.Type.OutCubic)
+        a.finished.connect(lambda: (self.hide(), self.deleteLater()))
+        a.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
     def _fade_out(self) -> None:
         self._fading = True
@@ -4664,6 +5458,7 @@ def _notification_color(priority: int) -> str:
     return C.TEXT_DIM
 
 
+@_motion_overlay
 class NotificationDetailCard(QFrame):
     """Expanded floating view of one notification."""
 
@@ -4740,20 +5535,23 @@ class NotificationToastManager:
             notification, self.timeout_seconds,
             self.dismiss, self.maximize, self.parent,
         )
+        # Starts a little off to the right and transparent; reposition() glides it
+        # into its slot while intro() fades it in.
         toast.move(
-            self.weather.x(),
+            self.weather.x() + (26 if _MOTION_ON else 0),
             self.weather.y() + self.weather.height() + 8,
         )
+        if _MOTION_ON:
+            toast._opacity.setOpacity(0.0)
         self._visible = {notification.id: toast, **self._visible}
         toast.show()
+        toast.intro()
         self.reposition()
 
     def dismiss(self, notification_id: str) -> None:
         toast = self._visible.pop(notification_id, None)
         if toast is not None:
-            toast._timer.stop()
-            toast.hide()
-            toast.deleteLater()
+            toast.vanish()
         card = self._details.pop(notification_id, None)
         if card is not None:
             card.hide()
@@ -4803,10 +5601,10 @@ class NotificationToastManager:
                 if previous is not None:
                     previous.stop()
                 animation = QPropertyAnimation(toast, b"pos", toast)
-                animation.setDuration(160)
+                animation.setDuration(240)
                 animation.setStartValue(toast.pos())
                 animation.setEndValue(target)
-                animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+                animation.setEasingCurve(QEasingCurve.Type.OutQuart)
                 toast._position_animation = animation
                 animation.finished.connect(
                     lambda widget=toast: setattr(widget, "_position_animation", None)
@@ -4891,6 +5689,7 @@ class _NotificationRow(QFrame):
         """)
 
 
+@_motion_overlay
 class NotificationListPanel(QFrame):
     """Scrollable notification history with local enable/disable control."""
 
@@ -4985,6 +5784,7 @@ class NotificationListPanel(QFrame):
         self.close_requested.emit()
 
 
+@_motion_overlay
 class RemoteKeyOverlay(QWidget):
     """Floating overlay — QR code for instant phone pairing + manual key fallback."""
 
@@ -5352,10 +6152,12 @@ class MiniOrbWidget(QWidget):
     # ── show / hide (driven by MainWindow.changeEvent) ──────────────────────
     def show_mini(self) -> None:
         if self.isVisible():
+            _Motion.win_cancel(self)        # a fade-out was in flight: keep the orb
             return
         self.move(self._start_pos())
         self._hide_at = None
         self._bar.hide()
+        _Motion.win_in(self, rise=18, ms=340, overshoot=1.25)   # pops up and settles
         self.show()
         self.raise_()
 
@@ -5363,7 +6165,7 @@ class MiniOrbWidget(QWidget):
         self._drag_off = None
         self._hide_at = None
         self._bar.hide()
-        self.hide()
+        _Motion.win_fade(self, self.hide, drop=10)
 
     def showEvent(self, e):
         self._tmr.start()
@@ -5468,7 +6270,9 @@ class MiniOrbWidget(QWidget):
 
         if over_orb or over_bar:
             self._hide_at = None
-            if not self._bar.isVisible():
+            if self._bar.isVisible():
+                _Motion.win_cancel(self._bar)       # fading out? the pointer is back
+            else:
                 self._place_bar()
                 self._bar.show()
                 self._bar.raise_()
@@ -5477,7 +6281,7 @@ class MiniOrbWidget(QWidget):
             if self._hide_at is None:
                 self._hide_at = t + self.HIDE_DELAY_MS / 1000.0
             elif t >= self._hide_at:
-                self._bar.hide()
+                _Motion.win_fade(self._bar, self._bar.hide, drop=0)
                 self._hide_at = None
 
     # ── drag / double-click ─────────────────────────────────────────────────
@@ -5583,6 +6387,4521 @@ class SystemControlsIconButton(QPushButton):
         painter.end()
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  In-app browser — "Run <website> in you"
+#
+#  A floating, draggable, resizable browser window (QtWebEngine = real
+#  Chromium) styled like the rest of the HUD. It opens from a typed or spoken
+#  command such as "Run YouTube in you" and never touches the PC's own browser.
+#  Everything lives in this file: the window, the command parser, the site
+#  resolver and the hooks into MainWindow / AuraUI.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Names that resolve straight to an address. Anything not listed is still
+# handled by _resolve_site(): full URLs, spoken domains ("github dot com"),
+# "<name>.com" guesses with a web-search fallback, or a plain web search.
+_BR_SITES: dict[str, str] = {
+    # Google
+    "google": "https://www.google.com", "gmail": "https://mail.google.com",
+    "google mail": "https://mail.google.com", "google drive": "https://drive.google.com",
+    "drive": "https://drive.google.com", "google maps": "https://www.google.com/maps",
+    "maps": "https://www.google.com/maps", "google docs": "https://docs.google.com",
+    "google sheets": "https://sheets.google.com", "google slides": "https://slides.google.com",
+    "google translate": "https://translate.google.com", "translate": "https://translate.google.com",
+    "google news": "https://news.google.com", "google photos": "https://photos.google.com",
+    "google calendar": "https://calendar.google.com", "calendar": "https://calendar.google.com",
+    "google meet": "https://meet.google.com", "google colab": "https://colab.research.google.com",
+    "colab": "https://colab.research.google.com", "gemini": "https://gemini.google.com",
+    "ai studio": "https://aistudio.google.com",
+    # Video / music
+    "youtube": "https://www.youtube.com", "you tube": "https://www.youtube.com",
+    "youtube music": "https://music.youtube.com", "spotify": "https://open.spotify.com",
+    "soundcloud": "https://soundcloud.com", "netflix": "https://www.netflix.com",
+    "prime video": "https://www.primevideo.com", "hotstar": "https://www.hotstar.com",
+    "twitch": "https://www.twitch.tv",
+    # AI
+    "chatgpt": "https://chatgpt.com", "chat gpt": "https://chatgpt.com",
+    "claude": "https://claude.ai", "perplexity": "https://www.perplexity.ai",
+    "hugging face": "https://huggingface.co", "huggingface": "https://huggingface.co",
+    # Dev / learning
+    "github": "https://github.com", "gitlab": "https://gitlab.com",
+    "stack overflow": "https://stackoverflow.com", "stackoverflow": "https://stackoverflow.com",
+    "hacker news": "https://news.ycombinator.com", "w3schools": "https://www.w3schools.com",
+    "w3 schools": "https://www.w3schools.com", "mdn": "https://developer.mozilla.org",
+    "codepen": "https://codepen.io", "kaggle": "https://www.kaggle.com",
+    "npm": "https://www.npmjs.com", "pypi": "https://pypi.org",
+    "geeksforgeeks": "https://www.geeksforgeeks.org", "geeks for geeks": "https://www.geeksforgeeks.org",
+    "figma": "https://www.figma.com", "canva": "https://www.canva.com",
+    "notion": "https://www.notion.so", "medium": "https://medium.com", "quora": "https://www.quora.com",
+    # Social / messaging
+    "facebook": "https://www.facebook.com", "instagram": "https://www.instagram.com",
+    "twitter": "https://x.com", "x": "https://x.com", "linkedin": "https://www.linkedin.com",
+    "reddit": "https://www.reddit.com", "pinterest": "https://www.pinterest.com",
+    "snapchat": "https://www.snapchat.com", "tiktok": "https://www.tiktok.com",
+    "threads": "https://www.threads.net", "discord": "https://discord.com/app",
+    "telegram": "https://web.telegram.org", "whatsapp": "https://web.whatsapp.com",
+    "whatsapp web": "https://web.whatsapp.com",
+    # Reference / shopping / search
+    "wikipedia": "https://www.wikipedia.org", "bing": "https://www.bing.com",
+    "duckduckgo": "https://duckduckgo.com", "duck duck go": "https://duckduckgo.com",
+    "amazon": "https://www.amazon.com", "flipkart": "https://www.flipkart.com",
+    "ebay": "https://www.ebay.com",
+}
+
+# "Search <q> on <site> in you" — sites with a search address of their own.
+_BR_SEARCH_URLS: dict[str, str] = {
+    "google": "https://www.google.com/search?q={q}",
+    "youtube": "https://www.youtube.com/results?search_query={q}",
+    "you tube": "https://www.youtube.com/results?search_query={q}",
+    "wikipedia": "https://en.wikipedia.org/w/index.php?search={q}",
+    "github": "https://github.com/search?q={q}",
+    "reddit": "https://www.reddit.com/search/?q={q}",
+    "stack overflow": "https://stackoverflow.com/search?q={q}",
+    "stackoverflow": "https://stackoverflow.com/search?q={q}",
+    "amazon": "https://www.amazon.com/s?k={q}",
+    "flipkart": "https://www.flipkart.com/search?q={q}",
+    "bing": "https://www.bing.com/search?q={q}",
+    "duckduckgo": "https://duckduckgo.com/?q={q}",
+    "maps": "https://www.google.com/maps/search/{q}",
+    "google maps": "https://www.google.com/maps/search/{q}",
+    "pinterest": "https://www.pinterest.com/search/pins/?q={q}",
+    "twitter": "https://x.com/search?q={q}", "x": "https://x.com/search?q={q}",
+}
+
+_BR_PRONOUNS = {"it", "this", "that", "them", "these", "those", "something", "anything",
+                "everything", "one", "there", "here", "stuff", "things"}
+
+# Sites whose video this embedded Chromium cannot decode: protected (DRM)
+# streaming, and sites that only serve H.264. The pip build of QtWebEngine ships
+# neither; the page below reports it if the user's build does.
+_BR_DRM_HOSTS = ("hotstar.com", "jiohotstar.com", "jiocinema.com", "netflix.com",
+                 "primevideo.com", "disneyplus.com", "sonyliv.com", "zee5.com",
+                 "hbomax.com", "max.com", "hulu.com", "peacocktv.com", "tv.apple.com",
+                 "music.apple.com", "open.spotify.com", "voot.com")
+_BR_H264_HOSTS = ("twitch.tv", "tiktok.com", "vimeo.com", "instagram.com",
+                  "facebook.com", "x.com", "twitter.com", "reddit.com")
+
+_BR_POLITE = (r"(?:(?:hey|ok|okay)\s+[\w']+[,\s]+)?"
+              r"(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?")
+_BR_OPEN_VERBS = (r"(?P<verb>run|open|launch|start|load|show|play|go\s+to|browse|visit|"
+                  r"bring\s+up|pull\s+up|take\s+me\s+to|navigate\s+to)")
+_BR_STRICT_VERBS = {"play", "show", "start"}   # only for a site we actually recognise
+_BR_SEARCH_VERBS = r"(?P<verb>search|find|look\s+up|lookup|google)"
+_BR_CLOSE_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:close|hide|exit|quit|shut(?:\s+down)?|dismiss)\s+"
+    r"(?:the\s+|your\s+|this\s+)?(?:in-?app\s+|aura\s+|web\s+)?"
+    r"(?:browser|web\s*window|web\s*page|website|web\s*site)(?:\s+window)?"
+    r"(?:\s+please)?\s*[.!?]*$", re.I)
+
+
+def _br_clean(s: str) -> str:
+    return " ".join((s or "").replace("\u2019", "'").split()).strip(" \t\r\n.,!?;:\"'")
+
+
+def _resolve_site(what: str) -> tuple[str, str, str]:
+    """Turn what the user said into (url, fallback_url, kind).
+
+    kind: "known" (alias table), "url" (address given), "guess" (<name>.com,
+    with a search as fallback if it does not load) or "search"."""
+    raw = _br_clean(what)
+    w = raw.lower()
+    w = re.sub(r"^(?:the\s+)+", "", w)
+    w = re.sub(r"\s+(?:website|web\s*site|web\s*app|webpage|web\s*page|site|page|app)$", "", w).strip()
+    if not w:
+        return "", "", ""
+    # spoken addresses: "github dot com slash gitsdp dev" → github.com/…
+    sp = re.sub(r"\s+dot\s+", ".", w)
+    sp = re.sub(r"\s+slash\s+", "/", sp)
+    sp = re.sub(r"\s+dash\s+", "-", sp)
+    if sp.startswith(("http://", "https://")):
+        return sp, "", "url"
+    if w in _BR_SITES:
+        return _BR_SITES[w], "", "known"
+    squeezed = sp.replace(" ", "")
+    if squeezed in _BR_SITES:
+        return _BR_SITES[squeezed], "", "known"
+    if re.fullmatch(r"(?:localhost|\d{1,3}(?:\.\d{1,3}){3})(?::\d{2,5})?(?:/\S*)?", squeezed):
+        return "http://" + squeezed, "", "url"
+    if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,24}(?::\d{2,5})?(?:/\S*)?", squeezed):
+        return "https://" + squeezed, "", "url"
+    search = _BR_SEARCH_URLS["google"].format(q=quote_plus(raw))
+    if re.fullmatch(r"[a-z0-9][a-z0-9 -]{1,38}", w) and len(w.split()) <= 3:
+        guess = re.sub(r"[^a-z0-9-]", "", w)
+        if guess:
+            return f"https://www.{guess}.com", search, "guess"
+    return search, "", "search"
+
+
+def _parse_browser_command(text: str, ai_name: str) -> tuple[str, str, str, str] | None:
+    """Recognise "<verb> <website> in you" and friends.
+
+    Returns (action, url, fallback_url, label) or None when the text is not a
+    browser command. The command must say where to run it (in you / in
+    yourself / inside <assistant name> / in your browser|window|screen / here)
+    — without that, the text goes to the assistant exactly as before."""
+    t = _br_clean(text)
+    if not t:
+        return None
+    if _BR_CLOSE_RE.match(t):
+        return ("close", "", "", "")
+
+    name = re.escape((ai_name or "aura").strip().lower()) or "aura"
+    where = (r"(?:\s+please)?\s+(?:in|inside|within|on|into|using)\s+(?:the\s+)?"
+             rf"(?:you(?:rself)?|{name}|your\s+(?:own\s+)?(?:browser|window|interface|screen|display)|"
+             r"here|in-?app)(?:\s+(?:window|browser|screen))?(?:\s+please)?$")
+    m = re.search(where, t, re.I)
+    if not m:
+        return None
+    body = t[:m.start()].strip()
+    if not body:
+        return None
+
+    # ── search ───────────────────────────────────────────────────────────
+    ms = re.match(rf"^{_BR_POLITE}{_BR_SEARCH_VERBS}\s+(?:for\s+)?(?P<q>.+)$", body, re.I)
+    if ms:
+        q = _br_clean(ms.group("q"))
+        site = "google"
+        mm = re.match(r"^(?P<q>.+?)\s+(?:on|in|at|from|using)\s+(?P<s>[a-z0-9 ]+)$", q, re.I)
+        if mm and _br_clean(mm.group("s")).lower() in _BR_SEARCH_URLS:
+            q, site = _br_clean(mm.group("q")), _br_clean(mm.group("s")).lower()
+        if not q or q.lower() in _BR_PRONOUNS:
+            return None
+        return ("search", _BR_SEARCH_URLS[site].format(q=quote_plus(q)), "", f"{q} ({site})")
+
+    # ── open / run ───────────────────────────────────────────────────────
+    mo = re.match(rf"^{_BR_POLITE}{_BR_OPEN_VERBS}\s+(?P<what>.+)$", body, re.I)
+    if not mo:
+        return None
+    verb = re.sub(r"\s+", " ", mo.group("verb").lower())
+    what = _br_clean(mo.group("what"))
+    if not what or what.lower() in _BR_PRONOUNS or len(what.split()) > 6:
+        return None
+    url, fallback, kind = _resolve_site(what)
+    if not url:
+        return None
+    if kind in ("guess", "search"):
+        if what.lower() in _BR_PRONOUNS or verb in _BR_STRICT_VERBS:
+            return None
+    return ("open", url, fallback, what)
+
+
+# ── keep the PC's own browser closed while an in-app command is being handled ──
+# A spoken command also reaches the voice model, which may try to open the page
+# in the normal browser as well. For a few seconds after an in-app command, web
+# addresses that would go to the PC's browser through Python are swallowed.
+_BR_GUARD_UNTIL = 0.0
+_BR_ON_SWALLOW = None            # optional callable(url) — set by MainWindow
+
+
+def _arm_browser_guard(seconds: float = 10.0) -> None:
+    global _BR_GUARD_UNTIL
+    _BR_GUARD_UNTIL = time.monotonic() + max(0.0, seconds)
+
+
+def _set_browser_swallow_cb(fn) -> None:
+    global _BR_ON_SWALLOW
+    _BR_ON_SWALLOW = fn
+
+
+def _install_browser_guard() -> None:
+    if getattr(webbrowser, "_aura_inapp_guard", False):
+        return
+
+    def _wrap(orig):
+        def guarded(url, *a, **k):
+            try:
+                if (time.monotonic() < _BR_GUARD_UNTIL
+                        and str(url).lower().startswith(("http://", "https://"))):
+                    cb = _BR_ON_SWALLOW
+                    if callable(cb):
+                        cb(str(url))
+                    return True
+            except Exception:
+                pass
+            return orig(url, *a, **k)
+        return guarded
+
+    for _n in ("open", "open_new", "open_new_tab"):
+        try:
+            setattr(webbrowser, _n, _wrap(getattr(webbrowser, _n)))
+        except Exception:
+            pass
+    webbrowser._aura_inapp_guard = True
+
+
+_BrPageBase = QWebEnginePage if HAVE_WEB else object
+
+
+class _BrowserPage(_BrPageBase):
+    """Web page. A pop-up (window.open with a size — e.g. "Sign in with Google")
+    gets its own small window, so the page that opened it can still hear back
+    from it. Ordinary new-tab links stay inside the one window."""
+
+    def createWindow(self, kind):
+        owner = getattr(self, "aura_owner", None)
+        try:
+            WT = QWebEnginePage.WebWindowType
+            popup_kinds = (WT.WebDialog, WT.WebBrowserWindow)
+        except Exception:
+            popup_kinds = ()
+        if owner is not None and kind in popup_kinds:
+            try:
+                return owner.make_popup_page()
+            except Exception as exc:
+                print(f"[Browser] pop-up failed: {exc}")
+        tmp = QWebEnginePage(self.profile(), self)
+
+        def _land(u: QUrl) -> None:
+            s = u.toString()
+            if not s or s == "about:blank":
+                return
+            self.setUrl(u)
+            QTimer.singleShot(0, tmp.deleteLater)
+
+        tmp.urlChanged.connect(_land)
+        return tmp
+
+    def javaScriptConsoleMessage(self, level, message, line, source):   # noqa: N802
+        return                                          # keep the console quiet
+
+
+class _BrowserHeader(QWidget):
+    """Title strip: drags the whole window, double-click maximises."""
+
+    def __init__(self, win: "AuraBrowserWindow"):
+        super().__init__(win._body)
+        self._win = win
+        self._off = None
+        self.setObjectName("BrowserHdr")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(30)
+
+    def _movable(self) -> bool:
+        return not (self._win.isFullScreen() or self._win.isMaximized())
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._movable():
+            h = self._win.windowHandle()
+            try:
+                if h is not None and h.startSystemMove():
+                    ev.accept()
+                    return
+            except Exception:
+                pass
+            self._off = ev.globalPosition().toPoint() - self._win.frameGeometry().topLeft()
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if (ev.buttons() & Qt.MouseButton.LeftButton) and self._off is not None and self._movable():
+            self._win.move(ev.globalPosition().toPoint() - self._off)
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        self._off = None
+        super().mouseReleaseEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._win.toggle_maximize()
+            ev.accept()
+            return
+        super().mouseDoubleClickEvent(ev)
+
+
+# ── Optional Windows engine: Microsoft Edge (WebView2) ───────────────────────
+#
+# QtWebEngine as shipped on PyPI cannot decode H.264 (Instagram reels, Twitch,
+# TikTok …) and has no DRM. Windows already carries Edge's engine, which can.
+# When `pythonnet` and the WebView2 assemblies are present, those sites open in
+# an Edge-powered view inside the same HUD window. Nothing here runs unless
+# _edge_available() says yes, and any start-up failure falls back to the
+# built-in browser. Needs:  pip install pythonnet pywebview   (pywebview only
+# supplies the WebView2 .dll files; it is never imported).
+_BR_PREFER_EDGE = False        # True: open EVERY site in the Edge engine when possible
+_EDGE_NS = None
+_EDGE_STATE: dict = {}
+
+
+def _br_hit(host: str, names) -> bool:
+    host = (host or "").lower()
+    return any(host == n or host.endswith("." + n) for n in names)
+
+
+def _edge_dll_dir():
+    """Folder holding Microsoft.Web.WebView2.*.dll — normally pywebview's lib/."""
+    cands = []
+    env = os.environ.get("AURA_WEBVIEW2_DIR")
+    if env:
+        cands.append(Path(env))
+    try:
+        import importlib.util as _iu
+        spec = _iu.find_spec("webview")
+        for loc in (spec.submodule_search_locations or []) if spec else []:
+            cands.append(Path(loc) / "lib")
+    except Exception:
+        pass
+    cands.append(BASE_DIR / "lib" / "webview2")
+    for d in cands:
+        if (d / "Microsoft.Web.WebView2.Core.dll").exists() and \
+           (d / "Microsoft.Web.WebView2.WinForms.dll").exists():
+            return d
+    return None
+
+
+def _edge_available() -> bool:
+    """Cheap check (nothing is loaded): Windows + pythonnet + the .dll files."""
+    if "ok" not in _EDGE_STATE:
+        ok = False
+        try:
+            import importlib.util as _iu
+            ok = (platform.system() == "Windows" and _iu.find_spec("clr") is not None
+                  and _edge_dll_dir() is not None)
+        except Exception:
+            ok = False
+        _EDGE_STATE["ok"] = ok
+    return bool(_EDGE_STATE["ok"])
+
+
+def _edge_runtime():
+    """Load .NET and the WebView2 assemblies once; raise a readable error if not."""
+    global _EDGE_NS
+    if _EDGE_NS is not None:
+        return _EDGE_NS
+    import types as _types
+    lib = _edge_dll_dir()
+    if lib is None:
+        raise RuntimeError("WebView2 files not found (pip install pythonnet pywebview)")
+    try:
+        import clr
+    except Exception:
+        os.environ["PYTHONNET_RUNTIME"] = "coreclr"      # same fallback pywebview uses
+        import clr
+    clr.AddReference("System.Windows.Forms")
+    clr.AddReference("System.Drawing")
+    clr.AddReference(str(lib / "Microsoft.Web.WebView2.Core.dll"))
+    clr.AddReference(str(lib / "Microsoft.Web.WebView2.WinForms.dll"))
+    mach = (platform.machine() or "").lower()
+    arch = "win-arm64" if "arm" in mach else ("win-x86" if mach in ("x86", "i386", "i686") else "win-x64")
+    native = lib / "runtimes" / arch / "native"
+    if native.is_dir():                                   # the engine's native loader
+        os.environ["PATH"] = str(native) + os.pathsep + os.environ.get("PATH", "")
+        try:
+            import ctypes
+            ctypes.WinDLL(str(native / "WebView2Loader.dll"))
+        except Exception:
+            pass
+    import System.Windows.Forms as WinForms
+    from System.Drawing import Color
+    from Microsoft.Web.WebView2.WinForms import CoreWebView2CreationProperties, WebView2
+    _EDGE_NS = _types.SimpleNamespace(WinForms=WinForms, Color=Color,
+                                      WebView2=WebView2, Props=CoreWebView2CreationProperties)
+    return _EDGE_NS
+
+
+def _win32():
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+    u.SetParent.restype = wintypes.HWND
+    u.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+    u.MoveWindow.restype = wintypes.BOOL
+    return u
+
+
+class _EdgeFsRequest:
+    """Stands in for QWebEngineFullScreenRequest."""
+
+    def __init__(self, on: bool):
+        self._on = bool(on)
+
+    def accept(self) -> None:
+        return
+
+    def toggleOn(self) -> bool:                           # noqa: N802
+        return self._on
+
+
+class _EdgePage(QObject):
+    """The few page-level calls AuraBrowserWindow makes, answered for Edge."""
+
+    recentlyAudibleChanged = pyqtSignal(bool)             # noqa: N815
+    fullScreenRequested = pyqtSignal(object)              # noqa: N815
+
+    def __init__(self, view: "_EdgeView"):
+        super().__init__(view)
+        self._view = view
+        self._muted = False
+
+    def isAudioMuted(self) -> bool:                       # noqa: N802
+        return self._muted
+
+    def setAudioMuted(self, on: bool) -> None:            # noqa: N802
+        self._muted = bool(on)
+        self._view._apply_mute()
+
+    def runJavaScript(self, script, callback=None):       # noqa: N802
+        self._view.runJavaScript(script, callback)
+
+    def settings(self):
+        return None
+
+
+class _EdgeView(QWidget):
+    """A WebView2 browser hosted in a native child window of this widget.
+
+    It offers the same small surface as QWebEngineView (back, forward, reload,
+    setUrl, url, signals …) so AuraBrowserWindow drives either one the same way.
+    WebView2 is a WinForms control; it is parented to this widget's window handle
+    and kept the size of the widget. Qt's own message loop drives it."""
+
+    loadStarted = pyqtSignal()
+    loadProgress = pyqtSignal(int)
+    loadFinished = pyqtSignal(bool)
+    urlChanged = pyqtSignal(QUrl)
+    titleChanged = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        self.setMinimumSize(200, 150)
+        self._page = _EdgePage(self)
+        self._started = False
+        self._core = None
+        self._wv = None
+        self._form = None
+        self._form_hwnd = 0
+        self._u32 = None
+        self._pending = ""
+        self._url = QUrl()
+        self._title = ""
+        self._zoom = 1.0
+        self._keep: list = []                              # keeps .NET event handlers alive
+
+    # -- QWebEngineView-like surface ---------------------------------------
+    def page(self):
+        return self._page
+
+    def history(self):
+        return self
+
+    def canGoBack(self) -> bool:                           # noqa: N802
+        try:
+            return bool(self._core is not None and self._core.CanGoBack)
+        except Exception:
+            return False
+
+    def canGoForward(self) -> bool:                        # noqa: N802
+        try:
+            return bool(self._core is not None and self._core.CanGoForward)
+        except Exception:
+            return False
+
+    def url(self) -> QUrl:
+        return self._url
+
+    def title(self) -> str:
+        return self._title
+
+    def setUrl(self, u: QUrl) -> None:                     # noqa: N802
+        self._navigate(u.toString())
+
+    def runJavaScript(self, script: str, callback=None) -> None:  # noqa: N802
+        if self._core is None:
+            if callback is not None:
+                QTimer.singleShot(0, lambda: callback(None))
+            return
+        try:
+            task = self._core.ExecuteScriptAsync(script)
+        except Exception as exc:
+            print(f"[Edge] JavaScript execution failed: {exc}")
+            if callback is not None:
+                QTimer.singleShot(0, lambda: callback(None))
+            return
+        if callback is None:
+            return
+
+        def finish() -> None:
+            if self._core is None:
+                callback(None)
+                return
+            if not task.IsCompleted:
+                QTimer.singleShot(20, finish)
+                return
+            try:
+                result = json.loads(str(task.Result))
+            except (TypeError, ValueError):
+                result = None
+            except Exception as exc:
+                print(f"[Edge] JavaScript result failed: {exc}")
+                result = None
+            callback(result)
+
+        QTimer.singleShot(0, finish)
+
+    def back(self) -> None:
+        self._call("GoBack")
+
+    def forward(self) -> None:
+        self._call("GoForward")
+
+    def reload(self) -> None:
+        self._call("Reload")
+
+    def stop(self) -> None:
+        self._call("Stop")
+
+    def zoomFactor(self) -> float:                         # noqa: N802
+        return self._zoom
+
+    def setZoomFactor(self, z: float) -> None:             # noqa: N802
+        self._zoom = float(z)
+        try:
+            if self._wv is not None:
+                self._wv.ZoomFactor = self._zoom
+        except Exception:
+            pass
+
+    # -- internals ----------------------------------------------------------
+    def _call(self, name: str) -> None:
+        try:
+            if self._core is not None:
+                getattr(self._core, name)()
+        except Exception as exc:
+            print(f"[Edge] {name} failed: {exc}")
+
+    def _navigate(self, url: str) -> None:
+        if not url:
+            return
+        if self._core is None:
+            self._pending = url                            # sent as soon as the engine is up
+            return
+        try:
+            self._core.Navigate(url)
+        except Exception as exc:
+            print(f"[Edge] navigate failed: {exc}")
+            self.loadFinished.emit(False)
+
+    def _apply_mute(self) -> None:
+        try:
+            if self._core is not None:
+                self._core.IsMuted = bool(self._page.isAudioMuted())
+        except Exception:
+            pass
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if not self._started:
+            self._started = True
+            QTimer.singleShot(0, self._start)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit()
+
+    def _fit(self) -> None:
+        if not self._form_hwnd or self._u32 is None:
+            return
+        try:
+            r = self.devicePixelRatioF()
+            self._u32.MoveWindow(self._form_hwnd, 0, 0,
+                                 max(1, int(self.width() * r)), max(1, int(self.height() * r)), True)
+        except Exception:
+            pass
+
+    def _start(self) -> None:
+        try:
+            rt = _edge_runtime()
+            WF = rt.WinForms
+            bg = QColor(C.DARK)
+            colour = rt.Color.FromArgb(255, bg.red(), bg.green(), bg.blue())
+
+            form = WF.Form()
+            form.FormBorderStyle = getattr(WF.FormBorderStyle, "None")
+            form.TopLevel = False
+            form.ShowInTaskbar = False
+            form.BackColor = colour
+
+            wv = rt.WebView2()
+            props = rt.Props()
+            data = CONFIG_DIR / "edge_profile"
+            data.mkdir(parents=True, exist_ok=True)
+            props.UserDataFolder = str(data)
+            props.AdditionalBrowserArguments = "--autoplay-policy=no-user-gesture-required"
+            wv.CreationProperties = props
+            wv.DefaultBackgroundColor = colour
+            wv.Dock = WF.DockStyle.Fill
+            form.Controls.Add(wv)
+            wv.CoreWebView2InitializationCompleted += self._on_init
+
+            self._u32 = _win32()
+            self._form, self._wv = form, wv
+            self._form_hwnd = int(form.Handle.ToInt64())
+            self._u32.SetParent(self._form_hwnd, int(self.winId()))
+            form.Show()
+            self._fit()
+            wv.EnsureCoreWebView2Async(None)
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+
+    def _on_init(self, sender, args) -> None:
+        try:
+            if not args.IsSuccess:
+                self.failed.emit(str(args.InitializationException) or "initialisation failed")
+                return
+            core = self._wv.CoreWebView2
+            self._core = core
+            try:
+                st = core.Settings
+                st.IsStatusBarEnabled = False
+                st.AreDevToolsEnabled = False
+            except Exception:
+                pass
+            core.NavigationStarting += self._on_nav_start
+            core.NavigationCompleted += self._on_nav_done
+            core.ProcessFailed += self._on_process_failed
+            core.SourceChanged += self._on_source
+            core.DocumentTitleChanged += self._on_title
+            core.HistoryChanged += self._on_history
+            core.NewWindowRequested += self._on_new_window
+            core.ContainsFullScreenElementChanged += self._on_fullscreen
+            try:
+                core.IsDocumentPlayingAudioChanged += self._on_audio
+            except Exception:
+                pass
+            self._apply_mute()
+            if self._zoom != 1.0:
+                self.setZoomFactor(self._zoom)
+            if self._pending:
+                url, self._pending = self._pending, ""
+                self._navigate(url)
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+
+    # -- engine events (all arrive on the Qt thread) -------------------------
+    def _on_nav_start(self, sender, args) -> None:
+        self.loadStarted.emit()
+
+    def _on_nav_done(self, sender, args) -> None:
+        try:
+            ok = bool(args.IsSuccess)
+        except Exception:
+            ok = True
+        self.loadProgress.emit(100)
+        self.loadFinished.emit(ok)
+
+    def _on_process_failed(self, sender, args) -> None:
+        try:
+            failure = str(args.ProcessFailedKind)
+        except Exception:
+            failure = "unknown WebView2 process failure"
+        self.failed.emit(failure)
+
+    def _on_source(self, sender, args) -> None:
+        try:
+            self._url = QUrl(str(self._core.Source))
+            self.urlChanged.emit(self._url)
+        except Exception:
+            pass
+
+    def _on_title(self, sender, args) -> None:
+        try:
+            self._title = str(self._core.DocumentTitle or "")
+            self.titleChanged.emit(self._title)
+        except Exception:
+            pass
+
+    def _on_history(self, sender, args) -> None:
+        self.urlChanged.emit(self._url)                    # refreshes back / forward state
+
+    def _on_new_window(self, sender, args) -> None:
+        """Links that want a new tab stay in this window; a real pop-up (it asks
+        for a size — "Sign in with Google" and the like) gets Edge's own pop-up
+        window, which keeps the connection back to the page that opened it."""
+        try:
+            feats = args.WindowFeatures
+            if feats is not None and bool(feats.HasSize):
+                return
+        except Exception:
+            pass
+        try:
+            args.set_Handled(True)
+            self._navigate(str(args.get_Uri()))
+        except Exception as exc:
+            print(f"[Edge] new-window handling failed: {exc}")
+
+    def _on_fullscreen(self, sender, args) -> None:
+        try:
+            self._page.fullScreenRequested.emit(_EdgeFsRequest(self._core.ContainsFullScreenElement))
+        except Exception:
+            pass
+
+    def _on_audio(self, sender, args) -> None:
+        try:
+            self._page.recentlyAudibleChanged.emit(bool(self._core.IsDocumentPlayingAudio))
+        except Exception:
+            pass
+
+    def dispose(self) -> None:
+        """App exit: release the engine."""
+        try:
+            if self._wv is not None:
+                self._wv.Dispose()
+            if self._form is not None:
+                self._form.Dispose()
+        except Exception:
+            pass
+        self._core = self._wv = self._form = None
+        self._form_hwnd = 0
+
+
+class _FramelessEdges:
+    """Mixin: resize a frameless top-level window from the invisible border
+    around its body (every edge and corner) using the system's own resize."""
+
+    _EDGE = 7
+
+    def _edges_at(self, p: QPoint):
+        e = self._EDGE + 2
+        edges = Qt.Edge(0)
+        if p.x() <= e:
+            edges |= Qt.Edge.LeftEdge
+        if p.x() >= self.width() - e:
+            edges |= Qt.Edge.RightEdge
+        if p.y() <= e:
+            edges |= Qt.Edge.TopEdge
+        if p.y() >= self.height() - e:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def _resizable(self) -> bool:
+        return not (self.isFullScreen() or self.isMaximized())
+
+    def mouseMoveEvent(self, ev):
+        if not self._resizable():
+            self.unsetCursor()
+            return super().mouseMoveEvent(ev)
+        ed = self._edges_at(ev.position().toPoint())
+        L, R = Qt.Edge.LeftEdge, Qt.Edge.RightEdge
+        T, B = Qt.Edge.TopEdge, Qt.Edge.BottomEdge
+        if (ed & L and ed & T) or (ed & R and ed & B):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif (ed & R and ed & T) or (ed & L and ed & B):
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif ed & L or ed & R:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif ed & T or ed & B:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(ev)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._resizable():
+            ed = self._edges_at(ev.position().toPoint())
+            h = self.windowHandle()
+            if ed and h is not None:
+                try:
+                    if h.startSystemResize(ed):
+                        ev.accept()
+                        return
+                except Exception:
+                    pass
+        super().mousePressEvent(ev)
+
+    def leaveEvent(self, ev):
+        self.unsetCursor()
+        super().leaveEvent(ev)
+
+
+def _browser_stylesheet() -> str:
+    """Built from the live palette; retheme_all_widgets() swaps the colours in
+    these sheets when the accent changes, like every other panel."""
+    return f"""
+        QWidget#AuraBrowserWin {{ background: {C.DARK}; }}
+        QFrame#BrowserBody {{ background: {C.DARK}; border: 1px solid {C.BORDER_B}; }}
+        QWidget#BrowserHdr {{ background: {C.DARK}; border-bottom: 1px solid {C.BORDER}; }}
+        QWidget#BrowserNote {{ background: {C.PRI_GHO}; border-bottom: 1px solid {C.BORDER}; }}
+        QLabel#BrowserNoteText {{ color: {C.TEXT}; background: transparent; border: none; }}
+        QLineEdit#BrowserUrl {{
+            background: {C.DARK}; color: {C.TEXT};
+            border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 8px;
+            selection-background-color: {C.PRI_GHO};
+        }}
+        QLineEdit#BrowserUrl:focus {{ border: 1px solid {C.PRI}; }}
+        QPushButton#BrowserBtn, QPushButton#BrowserTextBtn {{
+            background: {C.PANEL}; color: {C.PRI};
+            border: 1px solid {C.PRI_DIM}; border-radius: 3px;
+        }}
+        QPushButton#BrowserTextBtn {{ padding: 0 10px; }}
+        QPushButton#BrowserBtn:hover, QPushButton#BrowserTextBtn:hover {{
+            background: {C.PRI_GHO}; border: 1px solid {C.PRI};
+        }}
+        QPushButton#BrowserBtn:disabled {{ color: {C.TEXT_DIM}; border: 1px solid {C.BORDER}; }}
+        QPushButton#BrowserClose {{ background: transparent; color: {C.TEXT_DIM}; border: none; }}
+        QPushButton#BrowserClose:hover {{ color: {C.MUTED_C}; }}
+        QProgressBar#BrowserProgress {{ background: {C.DARK}; border: none; }}
+        QProgressBar#BrowserProgress::chunk {{ background: {C.PRI}; }}
+    """
+
+
+class _BrowserPopup(_FramelessEdges, QWidget):
+    """Small window for a page's pop-up (sign-in dialogs and the like). The
+    address stays visible so you can see where you are signing in."""
+
+    closed = pyqtSignal(object)
+
+    def __init__(self, owner: "AuraBrowserWindow"):
+        super().__init__(owner, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self._owner = owner
+        self.setObjectName("AuraBrowserWin")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMouseTracking(True)
+        self.setMinimumSize(360, 300)
+
+        E = self._EDGE
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(E, E, E, E)
+        outer.setSpacing(0)
+        self._body = QFrame(self)
+        self._body.setObjectName("BrowserBody")
+        self._body.setCursor(Qt.CursorShape.ArrowCursor)
+        outer.addWidget(self._body)
+        body = QVBoxLayout(self._body)
+        body.setContentsMargins(1, 1, 1, 1)
+        body.setSpacing(0)
+
+        self._hdr = _BrowserHeader(self)
+        hl = QHBoxLayout(self._hdr)
+        hl.setContentsMargins(10, 0, 6, 0)
+        hl.setSpacing(8)
+        dot = QLabel("◈")
+        dot.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        dot.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(dot)
+        tag = QLabel("POP-UP")
+        tag.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        tag.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 1px; border: none;")
+        tag.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(tag)
+        self._title = QLabel("")
+        self._title.setFont(QFont("Courier New", 8))
+        self._title.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        self._title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(self._title, 1)
+        close = QPushButton("✕")
+        close.setObjectName("BrowserClose")
+        close.setFixedSize(22, 22)
+        close.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.clicked.connect(self.close)
+        hl.addWidget(close)
+        body.addWidget(self._hdr)
+
+        bar = QWidget(self._body)
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(8, 6, 8, 6)
+        self._url = QLineEdit()
+        self._url.setObjectName("BrowserUrl")
+        self._url.setFont(QFont("Courier New", 9))
+        self._url.setReadOnly(True)
+        bl.addWidget(self._url)
+        body.addWidget(bar)
+
+        self.view = QWebEngineView(self._body)
+        self.page = _BrowserPage(owner._profile, self)
+        self.page.aura_owner = owner               # pop-ups of pop-ups land beside it
+        self.view.setPage(self.page)
+        self.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        body.addWidget(self.view, 1)
+
+        self.page.windowCloseRequested.connect(self.close)     # window.close()
+        self.page.geometryChangeRequested.connect(self._on_geometry)
+        self.view.urlChanged.connect(self._on_url)
+        self.view.titleChanged.connect(self._on_title)
+        self.setStyleSheet(_browser_stylesheet())
+
+        self._place(520, 680)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_maximize(self) -> None:          # the header's double-click
+        return
+
+    def _place(self, w: int, h: int) -> None:
+        try:
+            area = (self._owner.screen() or QApplication.primaryScreen()).availableGeometry()
+        except Exception:
+            area = QApplication.primaryScreen().availableGeometry()
+        w = max(self.minimumWidth(), min(int(w), int(area.width() * 0.9)))
+        h = max(self.minimumHeight(), min(int(h), int(area.height() * 0.9)))
+        c = self._owner.frameGeometry().center()
+        x = max(area.left(), min(c.x() - w // 2, area.right() - w + 1))
+        y = max(area.top(), min(c.y() - h // 2, area.bottom() - h + 1))
+        self.setGeometry(x, y, w, h)
+
+    def _on_geometry(self, rect: QRect) -> None:
+        """The page asked for a particular size (window.open features)."""
+        if rect.width() >= 200 and rect.height() >= 200:
+            self._place(rect.width() + 2 * self._EDGE + 2,
+                        rect.height() + 2 * self._EDGE + 72)
+
+    def _on_url(self, u: QUrl) -> None:
+        self._url.setText(u.toString())
+        self._url.setCursorPosition(0)
+
+    def _on_title(self, t: str) -> None:
+        fm = self._title.fontMetrics()
+        self._title.setText(fm.elidedText(f"—  {t}" if t else "",
+                                          Qt.TextElideMode.ElideRight, max(40, self._title.width())))
+
+    def closeEvent(self, ev):
+        super().closeEvent(ev)
+        self.closed.emit(self)
+        QTimer.singleShot(0, self.deleteLater)
+
+
+class AuraBrowserWindow(_FramelessEdges, QWidget):
+    """Floating in-app browser: draggable by its header, resizable from every
+    edge and corner, three times the size of the news / briefing panel by
+    default (kept inside the screen), HUD-styled from the live palette."""
+
+    closed          = pyqtSignal()
+    audible_changed = pyqtSignal(bool)      # the page is making sound
+    backend_failed  = pyqtSignal(str)       # the Edge engine could not start
+    edge_requested  = pyqtSignal(str)       # user asked to play this page in the Edge engine
+
+    _EDGE = 7                               # invisible resize border, px
+    _NEWS_W, _NEWS_H = 520, 280             # the briefing panel's largest size
+    _SCALE = 3
+
+    def __init__(self, main: QWidget, backend: str = "qt"):
+        super().__init__(main, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self._main = main
+        self._backend = backend                 # "qt" = built-in Chromium · "edge" = WebView2
+        self.setObjectName("AuraBrowserWin")
+        self.setWindowTitle("A.U.R.A Browser")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMouseTracking(True)
+        self.setMinimumSize(480, 320)
+
+        self._fallback = ""
+        self._fallback_host = ""
+        self._loading = False
+        self._placed = False
+        self._pre_fs_max = False
+        self._page_title = ""
+        self._popups: list = []
+        self._media = {"h264": None, "drm": None}   # what this engine can decode
+        self._probe_state = 0                          # 0 not run · 1 running · 2 done
+        self._probe_tries = 0
+        self._warned: set[str] = set()
+        if backend == "edge":
+            self._probe_state = 2               # Edge decodes H.264; nothing to probe
+
+        self._build_profile()
+        self._build_ui()
+        self._apply_style()
+
+    # ── construction ─────────────────────────────────────────────────────
+    def _build_profile(self) -> None:
+        if self._backend == "edge":
+            self._profile = None
+            return
+        data = CONFIG_DIR / "browser_profile"
+        try:
+            data.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._profile = QWebEngineProfile("aura_browser", self)
+        try:
+            self._profile.setPersistentStoragePath(str(data))
+            self._profile.setCachePath(str(data / "cache"))
+            self._profile.setPersistentCookiesPolicy(
+                QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
+            # Present as ordinary Chromium: sites sometimes refuse the
+            # "QtWebEngine" token.
+            ua = re.sub(r"\s*QtWebEngine/[\d.]+", "", self._profile.httpUserAgent())
+            self._profile.setHttpUserAgent(ua)
+        except Exception:
+            pass
+        self._profile.downloadRequested.connect(self._on_download)
+
+        self._page = _BrowserPage(self._profile, self)
+        self._page.aura_owner = self
+        st = self._page.settings()
+        WA = QWebEngineSettings.WebAttribute
+        for name, val in (("FullScreenSupportEnabled", True),
+                          ("PlaybackRequiresUserGesture", False),
+                          ("ScrollAnimatorEnabled", True),
+                          ("JavascriptCanOpenWindows", True),
+                          ("LocalStorageEnabled", True)):
+            try:
+                st.setAttribute(getattr(WA, name), val)
+            except Exception:
+                pass
+
+    def _build_ui(self) -> None:
+        E = self._EDGE
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(E, E, E, E)
+        outer.setSpacing(0)
+
+        self._body = QFrame(self)
+        self._body.setObjectName("BrowserBody")
+        self._body.setCursor(Qt.CursorShape.ArrowCursor)
+        outer.addWidget(self._body)
+        body = QVBoxLayout(self._body)
+        body.setContentsMargins(1, 1, 1, 1)
+        body.setSpacing(0)
+
+        # header ----------------------------------------------------------
+        self._hdr = _BrowserHeader(self)
+        hl = QHBoxLayout(self._hdr)
+        hl.setContentsMargins(10, 0, 6, 0)
+        hl.setSpacing(8)
+        dot = QLabel("◈")
+        dot.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        dot.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(dot)
+        tag = QLabel("BROWSER" if self._backend == "qt" else "BROWSER · EDGE")
+        tag.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        tag.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 1px; border: none;")
+        tag.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(tag)
+        self._title = QLabel("")
+        self._title.setFont(QFont("Courier New", 8))
+        self._title.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        self._title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        hl.addWidget(self._title, 1)
+
+        self._max_btn = QPushButton("▢")
+        self._max_btn.setObjectName("BrowserClose")
+        self._max_btn.setFixedSize(22, 22)
+        self._max_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._max_btn.setToolTip("Maximise / restore")
+        self._max_btn.clicked.connect(self.toggle_maximize)
+        hl.addWidget(self._max_btn)
+        close = QPushButton("✕")
+        close.setObjectName("BrowserClose")
+        close.setFixedSize(22, 22)
+        close.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setToolTip("Close (stops playback)")
+        close.clicked.connect(self.close)
+        hl.addWidget(close)
+        body.addWidget(self._hdr)
+
+        # toolbar ---------------------------------------------------------
+        self._bar = QWidget(self._body)
+        bl = QHBoxLayout(self._bar)
+        bl.setContentsMargins(8, 6, 8, 6)
+        bl.setSpacing(5)
+
+        def _btn(txt: str, tip: str, fn) -> QPushButton:
+            b = QPushButton(txt)
+            b.setObjectName("BrowserBtn")
+            b.setFixedSize(30, 26)
+            b.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            return b
+
+        if self._backend == "edge":
+            self.view = _EdgeView(self._body)
+            self._page = self.view.page()
+            self.view.failed.connect(self.backend_failed.emit)
+        else:
+            self.view = QWebEngineView(self._body)
+            self.view.setPage(self._page)
+
+        self._back = _btn("◀", "Back (Alt+←)", self.view.back)
+        self._fwd = _btn("▶", "Forward (Alt+→)", self.view.forward)
+        self._reload = _btn("⟳", "Reload (F5)", self._reload_or_stop)
+        self._sound = _btn("🔊", "Sound on / off", self._toggle_sound)
+        self._ext = _btn("↗", "Open this page in the PC browser", self._open_external)
+        self._url = QLineEdit()
+        self._url.setObjectName("BrowserUrl")
+        self._url.setFont(QFont("Courier New", 9))
+        self._url.setPlaceholderText("Type a website or a search…")
+        self._url.returnPressed.connect(lambda: self.go_text(self._url.text()))
+        for w in (self._back, self._fwd, self._reload):
+            bl.addWidget(w)
+        bl.addWidget(self._url, 1)
+        bl.addWidget(self._sound)
+        bl.addWidget(self._ext)
+        body.addWidget(self._bar)
+
+        self._progress = QProgressBar()
+        self._progress.setObjectName("BrowserProgress")
+        self._progress.setRange(0, 100)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(2)
+        self._progress.hide()
+        body.addWidget(self._progress)
+
+        # Notice strip: shown on sites whose video this engine cannot decode.
+        self._notice = QWidget(self._body)
+        self._notice.setObjectName("BrowserNote")
+        self._notice.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        nl = QHBoxLayout(self._notice)
+        nl.setContentsMargins(10, 5, 6, 5)
+        nl.setSpacing(8)
+        self._note_text = QLabel("")
+        self._note_text.setObjectName("BrowserNoteText")
+        self._note_text.setFont(QFont("Courier New", 8))
+        self._note_text.setWordWrap(True)
+        nl.addWidget(self._note_text, 1)
+        self._note_edge = QPushButton("PLAY HERE · EDGE ENGINE")
+        self._note_edge.setObjectName("BrowserTextBtn")
+        self._note_edge.setFixedHeight(22)
+        self._note_edge.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._note_edge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._note_edge.clicked.connect(self._request_edge)
+        self._note_edge.hide()
+        nl.addWidget(self._note_edge)
+        note_btn = QPushButton("OPEN IN PC BROWSER ↗")
+        note_btn.setObjectName("BrowserTextBtn")
+        note_btn.setFixedHeight(22)
+        note_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        note_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        note_btn.clicked.connect(self._open_external)
+        nl.addWidget(note_btn)
+        note_x = QPushButton("✕")
+        note_x.setObjectName("BrowserClose")
+        note_x.setFixedSize(20, 20)
+        note_x.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        note_x.setCursor(Qt.CursorShape.PointingHandCursor)
+        note_x.clicked.connect(self._notice.hide)
+        nl.addWidget(note_x)
+        self._notice.hide()
+        body.addWidget(self._notice)
+
+        self.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        body.addWidget(self.view, 1)
+
+        # wiring ----------------------------------------------------------
+        self.view.loadStarted.connect(self._on_load_started)
+        self.view.loadProgress.connect(self._on_progress)
+        self.view.loadFinished.connect(self._on_load_finished)
+        self.view.urlChanged.connect(self._on_url_changed)
+        self.view.titleChanged.connect(self._on_title_changed)
+        self._page.recentlyAudibleChanged.connect(self.audible_changed.emit)
+        self._page.fullScreenRequested.connect(self._on_fullscreen_request)
+
+        for seq, fn in (("Ctrl+L", lambda: (self._url.setFocus(), self._url.selectAll())),
+                        ("F5", self.view.reload), ("Ctrl+R", self.view.reload),
+                        ("Alt+Left", self.view.back), ("Alt+Right", self.view.forward),
+                        ("Ctrl+=", lambda: self._zoom(+0.1)), ("Ctrl++", lambda: self._zoom(+0.1)),
+                        ("Ctrl+-", lambda: self._zoom(-0.1)), ("Ctrl+0", lambda: self._zoom(0))):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(fn)
+
+    def _apply_style(self) -> None:
+        self.setStyleSheet(_browser_stylesheet())
+        self._sync_nav()
+
+    # ── public API ───────────────────────────────────────────────────────
+    def open_url(self, url: str, fallback: str = "") -> None:
+        """Show the window (if hidden) and load `url`. `fallback` is loaded
+        once if `url` was only a guess and does not load."""
+        self._fallback = fallback or ""
+        self._fallback_host = QUrl(url).host() if fallback else ""
+        self.present()
+        self.view.setUrl(QUrl(url))
+
+    def go_text(self, text: str) -> None:
+        """Address-bar entry: URL, local file, site name or search words."""
+        t = (text or "").strip()
+        if not t:
+            return
+        if t.lower().startswith("file://"):
+            self.open_url(t)
+        elif re.match(r"^[A-Za-z]:[\\/]", t) or t.startswith("/"):
+            if Path(t).exists():
+                self.open_url(QUrl.fromLocalFile(t).toString())
+            else:
+                self.open_url(_BR_SEARCH_URLS["google"].format(q=quote_plus(t)))
+        else:
+            url, fb, _kind = _resolve_site(t)
+            if url:
+                self.open_url(url, fb)
+        self.view.setFocus()
+
+    def present(self) -> None:
+        if not self._placed:
+            self._place()
+            self._placed = True
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_maximize(self) -> None:
+        if self.isFullScreen():
+            return
+        if self.isMaximized():
+            self.showNormal()
+            self._max_btn.setText("▢")
+        else:
+            self.showMaximized()
+            self._max_btn.setText("❐")
+
+    def shutdown(self) -> None:
+        """App exit: release the engine objects in a safe order."""
+        if self._backend == "edge":
+            try:
+                self.hide()
+                self.view.dispose()
+            except Exception:
+                pass
+            return
+        try:
+            self.view.setUrl(QUrl("about:blank"))
+            self.hide()
+            from PyQt6 import sip
+            for p in list(self._popups):
+                try:
+                    sip.delete(p)
+                except Exception:
+                    pass
+            sip.delete(self.view)
+            sip.delete(self._page)
+            sip.delete(self._profile)
+        except Exception:
+            pass
+
+    # ── placement ────────────────────────────────────────────────────────
+    def _news_panel_size(self) -> tuple[int, int]:
+        """The size the news / briefing panel has right now (same rule as
+        MainWindow._position_content_panel)."""
+        try:
+            cs = self._main._center_split
+            pw = min(max(cs.width() - 48, 280), self._NEWS_W)
+            ph = min(max(cs.height() - 60, 160), self._NEWS_H)
+            return int(pw), int(ph)
+        except Exception:
+            return self._NEWS_W, self._NEWS_H
+
+    def _place(self) -> None:
+        try:
+            screen = self._main.screen() or QApplication.primaryScreen()
+            area = screen.availableGeometry()
+        except Exception:
+            area = QApplication.primaryScreen().availableGeometry()
+        nw, nh = self._news_panel_size()
+        w = min(nw * self._SCALE, int(area.width() * 0.96))
+        h = min(nh * self._SCALE, int(area.height() * 0.94))
+        w, h = max(w, self.minimumWidth()), max(h, self.minimumHeight())
+        c = self._main.frameGeometry().center()
+        x = max(area.left(), min(c.x() - w // 2, area.right() - w + 1))
+        y = max(area.top(), min(c.y() - h // 2, area.bottom() - h + 1))
+        self.setGeometry(x, y, w, h)
+
+    # ── page events ──────────────────────────────────────────────────────
+    def _sync_nav(self) -> None:
+        try:
+            h = self.view.history()
+            self._back.setEnabled(h.canGoBack())
+            self._fwd.setEnabled(h.canGoForward())
+        except Exception:
+            pass
+        self._reload.setText("■" if self._loading else "⟳")
+        self._reload.setToolTip("Stop" if self._loading else "Reload (F5)")
+
+    def _reload_or_stop(self) -> None:
+        if self._loading:
+            self.view.stop()
+        else:
+            self.view.reload()
+
+    def _toggle_sound(self) -> None:
+        muted = not self._page.isAudioMuted()
+        self._page.setAudioMuted(muted)
+        self._sound.setText("🔇" if muted else "🔊")
+
+    def _zoom(self, delta: float) -> None:
+        z = 1.0 if delta == 0 else self.view.zoomFactor() + delta
+        self.view.setZoomFactor(max(0.25, min(5.0, z)))
+
+    def _on_load_started(self) -> None:
+        self._loading = True
+        self._progress.setValue(5)
+        self._progress.show()
+        self._sync_nav()
+
+    def _on_progress(self, pct: int) -> None:
+        self._progress.setValue(max(5, int(pct)))
+
+    def _on_load_finished(self, ok: bool) -> None:
+        self._loading = False
+        self._progress.hide()
+        self._sync_nav()
+        if ok and self._probe_state == 0:
+            u = self.view.url()
+            if u.scheme() in ("https", "file") or u.host() in ("localhost", "127.0.0.1"):
+                self._probe_media()
+        if (not ok and self._fallback
+                and self.view.url().host() == self._fallback_host):
+            fb, self._fallback = self._fallback, ""     # one retry only
+            self.view.setUrl(QUrl(fb))
+
+    def _on_url_changed(self, u: QUrl) -> None:
+        s = u.toString()
+        if s == "about:blank":
+            s = ""
+        if not self._url.hasFocus():
+            self._url.setText(s)
+            self._url.setCursorPosition(0)
+        self._sync_nav()
+        self._check_notice()
+
+    def _on_title_changed(self, t: str) -> None:
+        self._page_title = t or ""
+        self._refresh_title()
+
+    def _refresh_title(self) -> None:
+        fm = self._title.fontMetrics()
+        self._title.setText(fm.elidedText(
+            f"—  {self._page_title}" if self._page_title else "",
+            Qt.TextElideMode.ElideRight, max(40, self._title.width())))
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._refresh_title()
+
+    def _set_chrome(self, on: bool) -> None:
+        self._hdr.setVisible(on)
+        self._bar.setVisible(on)
+        m = self._EDGE if on else 0
+        self.layout().setContentsMargins(m, m, m, m)
+
+    def _on_fullscreen_request(self, req) -> None:
+        """The page's own fullscreen button (e.g. YouTube) — the chrome steps
+        aside and the page fills the screen; Esc / the button brings it back."""
+        req.accept()
+        if req.toggleOn():
+            if self.isFullScreen():
+                return
+            self._pre_fs_max = self.isMaximized()
+            self._set_chrome(False)
+            self.showFullScreen()
+        else:
+            self._set_chrome(True)
+            if self._pre_fs_max:
+                self.showMaximized()
+            else:
+                self.showNormal()
+
+    # ── pop-ups ──────────────────────────────────────────────────────────
+    def make_popup_page(self):
+        """A page asked for a pop-up window: give it one and hand back its page."""
+        pop = _BrowserPopup(self)
+        self._popups.append(pop)
+        pop.closed.connect(lambda p: self._popups.remove(p) if p in self._popups else None)
+        return pop.page
+
+    def _request_edge(self) -> None:
+        u = self.view.url()
+        if u.isValid() and u.scheme() in ("http", "https"):
+            self.edge_requested.emit(u.toString())
+
+    def _open_external(self) -> None:
+        """User-pressed escape hatch: this page in the PC's own browser."""
+        u = self.view.url()
+        if u.isValid() and u.scheme() in ("http", "https"):
+            QDesktopServices.openUrl(u)
+
+    # ── what can this engine play? ───────────────────────────────────────
+    def _probe_media(self) -> None:
+        """Ask the engine itself (once) whether it can decode H.264 and use DRM,
+        so the notice below is true for this PC's Qt build, not assumed."""
+        if self._probe_state != 0:
+            return
+        self._probe_state, self._probe_tries = 1, 0
+        js = ("(function(){var r={h264:false};try{r.h264=MediaSource.isTypeSupported("
+              "'video/mp4; codecs=\"avc1.42E01E, mp4a.40.2\"');}catch(e){}"
+              "window.__auraDrm='pending';try{navigator.requestMediaKeySystemAccess("
+              "'com.widevine.alpha',[{initDataTypes:['cenc'],videoCapabilities:["
+              "{contentType:'video/mp4; codecs=\"avc1.42E01E\"'}]}]).then("
+              "function(){window.__auraDrm='yes'},function(){window.__auraDrm='no'});"
+              "}catch(e){window.__auraDrm='no'}return JSON.stringify(r);})()")
+        self._page.runJavaScript(js, self._on_probe_h264)
+
+    def _on_probe_h264(self, res) -> None:
+        try:
+            self._media["h264"] = bool(json.loads(res).get("h264"))
+        except Exception:
+            self._media["h264"] = False
+        QTimer.singleShot(1500, lambda: self._page.runJavaScript(
+            "window.__auraDrm||'lost'", self._on_probe_drm))
+
+    def _on_probe_drm(self, res) -> None:
+        if res == "pending" and self._probe_tries < 4:
+            self._probe_tries += 1
+            QTimer.singleShot(1000, lambda: self._page.runJavaScript(
+                "window.__auraDrm||'lost'", self._on_probe_drm))
+            return
+        if res == "lost":                       # navigated away mid-probe: try again later
+            self._probe_state = 0
+            return
+        self._media["drm"] = bool(res == "yes" and self._media["h264"])
+        self._probe_state = 2
+        self._main._log.append_log(
+            "SYS: Browser video support — H.264 "
+            f"{'yes' if self._media['h264'] else 'no'} · protected (DRM) streaming "
+            f"{'yes' if self._media['drm'] else 'no'}.")
+        self._check_notice()
+
+    def _check_notice(self, host: str | None = None) -> None:
+        if self._backend != "qt" or self._probe_state != 2:
+            return
+        host = (host if host is not None else self.view.url().host() or "").lower()
+        if not host:
+            return
+
+        edge = _edge_available()
+        tail = "Try the Edge engine →" if edge else "Use your PC browser →"
+        if _br_hit(host, _BR_DRM_HOSTS) and not self._media["drm"]:
+            msg = ("This site streams protected (DRM) video, which this built-in "
+                   "engine cannot play. " + tail)
+        elif _br_hit(host, _BR_H264_HOSTS) and not self._media["h264"]:
+            msg = ("Videos here use H.264, which this built-in engine cannot "
+                   "decode, so they stay black. " + tail)
+        else:
+            self._notice.hide()
+            return
+        if host in self._warned:
+            return
+        self._warned.add(host)
+        self._note_text.setText(msg)
+        self._note_edge.setVisible(edge)
+        self._notice.show()
+
+    def _on_download(self, item) -> None:
+        """A download the user started: saved to the Downloads folder."""
+        try:
+            folder = Path.home() / "Downloads"
+            folder.mkdir(parents=True, exist_ok=True)
+            base = Path(item.downloadFileName() or "download")
+            dest, n = folder / base.name, 1
+            while dest.exists():
+                dest = folder / f"{base.stem} ({n}){base.suffix}"
+                n += 1
+            item.setDownloadDirectory(str(folder))
+            item.setDownloadFileName(dest.name)
+            item.accept()
+            self._main._log.append_log(f"SYS: Downloading {dest.name} → Downloads folder.")
+            item.isFinishedChanged.connect(
+                lambda n=dest.name: self._main._log.append_log(f"SYS: Download finished — {n}"))
+        except Exception as exc:
+            try:
+                item.cancel()
+            except Exception:
+                pass
+            self._main._log.append_log(f"ERR: Download failed — {exc}")
+
+    def closeEvent(self, ev):
+        # Closing ends playback too: a page left running would keep making sound.
+        for p in list(self._popups):
+            try:
+                p.close()
+            except Exception:
+                pass
+        try:
+            self.view.setUrl(QUrl("about:blank"))
+            self._page.setAudioMuted(False)
+            self._sound.setText("🔊")
+            if self.isFullScreen():
+                self._set_chrome(True)
+                self.showNormal()
+        except Exception:
+            pass
+        super().closeEvent(ev)
+        self.closed.emit()
+
+
+_FX_WORKERS: set = set()
+
+
+def _fx_http_text(url: str, timeout: float = 8.0) -> str:
+    """GET text with the same TLS fallbacks the weather widget uses.
+
+    A stale Windows certificate store (or a bundled build without CA files)
+    makes plain urlopen fail with a certificate error, so the certifi bundle
+    and the system store are both tried before giving up.
+    """
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/csv,*/*",
+        },
+    )
+    ctxs = _weather_ssl_contexts()
+    last_err: Exception | None = None
+    text = None
+    for i, ctx in enumerate(list(ctxs)):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=ctx) as response:
+                text = response.read(6 * 1024 * 1024).decode("utf-8", "replace")
+        except urllib.error.URLError as e:
+            if not isinstance(e.reason, ssl.SSLError):
+                raise
+            last_err = e
+            continue
+        except ssl.SSLError as e:
+            last_err = e
+            continue
+        if i:
+            ctxs.insert(0, ctxs.pop(i))
+        break
+    else:
+        raise last_err if last_err else RuntimeError("no TLS context available")
+    return text
+
+
+def _fx_http_json(url: str, timeout: float = 8.0) -> dict:
+    data = json.loads(_fx_http_text(url, timeout))
+    if not isinstance(data, dict):
+        raise ValueError("invalid exchange-rate response")
+    return data
+
+
+class _FxRateWorker(QThread):
+    """Fetch exchange-rate data without blocking the UI thread."""
+    online = pyqtSignal(int)
+    result = pyqtSignal(int, object)
+
+    def __init__(self, request_id: int, cancelled: threading.Event):
+        super().__init__()
+        self.request_id = request_id
+        self.cancelled = cancelled
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except Exception as e:
+            print(f"[FX] worker crashed: {e}")
+            try:
+                self.result.emit(self.request_id,
+                                 {"points": [], "error": f"internal error: {e}"[:300]})
+            except Exception:
+                pass
+
+    _http_json = staticmethod(_fx_http_json)
+
+    @staticmethod
+    def _parse_history(payload: dict) -> list[tuple[str, float]]:
+        from datetime import date
+
+        rates = payload.get("rates")
+        if not isinstance(rates, dict):
+            raise ValueError("history response has no rates")
+        base = str(payload.get("base", "USD")).upper()
+        if base != "USD":
+            raise ValueError("history response has the wrong base currency")
+        points = []
+        for date_text, values in rates.items():
+            try:
+                date_text = str(date_text)
+                date.fromisoformat(date_text)
+                rate = float(values["INR"])
+                if math.isfinite(rate) and rate > 0:
+                    points.append((date_text, rate))
+            except (TypeError, ValueError, KeyError):
+                continue
+        points.sort(key=lambda point: point[0])
+        if not points:
+            raise ValueError("history response contains no valid INR rates")
+        return points
+
+    @staticmethod
+    def _parse_yahoo(payload: dict) -> list[tuple[str, float]]:
+        from datetime import datetime, timezone
+
+        result = payload["chart"]["result"][0]
+        stamps = result["timestamp"]
+        closes = result["indicators"]["quote"][0]["close"]
+        by_day: dict[str, float] = {}
+        for stamp, close in zip(stamps, closes):
+            if close is None:
+                continue
+            try:
+                rate = float(close)
+                if not (math.isfinite(rate) and rate > 0):
+                    continue
+                day = datetime.fromtimestamp(int(stamp), timezone.utc).date().isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                continue
+            by_day[day] = rate
+        points = sorted(by_day.items())
+        if len(points) < 2:
+            raise ValueError("chart response contains too few INR rates")
+        return points
+
+    @staticmethod
+    def _parse_latest(payload: dict) -> tuple[str, float]:
+        from datetime import date
+        from email.utils import parsedate_to_datetime
+
+        if payload.get("result") != "success":
+            raise ValueError("latest-rate response was not successful")
+        if str(payload.get("base_code", "USD")).upper() != "USD":
+            raise ValueError("latest-rate response has the wrong base currency")
+        rate = float(payload["rates"]["INR"])
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("latest-rate response contains an invalid INR rate")
+        updated = str(payload.get("time_last_update_utc", ""))
+        try:
+            updated_date = parsedate_to_datetime(updated).date().isoformat()
+        except (TypeError, ValueError, OverflowError):
+            updated_date = date.today().isoformat()
+        return updated_date, rate
+
+    # -- sources -----------------------------------------------------------
+    @staticmethod
+    def _short(error: Exception) -> str:
+        text = str(getattr(error, "reason", None) or error) or type(error).__name__
+        return text.replace("\n", " ")[:90]
+
+    def _fetch_frankfurter(self):
+        from datetime import date, timedelta
+        from urllib.parse import urlencode
+
+        end = date.today()
+        query = urlencode({"base": "USD", "symbols": "INR"})
+        last_error = None
+        for host in ("https://api.frankfurter.dev/v1", "https://api.frankfurter.app"):
+            if self.cancelled.is_set():
+                return None
+            try:
+                # Recent window is daily; anything over ~90 days comes back
+                # weekly, so the older stretch is fetched separately.
+                recent_start = end - timedelta(days=89)
+                recent = self._parse_history(self._http_json(
+                    f"{host}/{recent_start.isoformat()}..{end.isoformat()}?{query}"))
+                merged = list(recent)
+                try:
+                    older_end = recent_start - timedelta(days=1)
+                    older_start = end - timedelta(days=370)
+                    older = self._parse_history(self._http_json(
+                        f"{host}/{older_start.isoformat()}..{older_end.isoformat()}?{query}"))
+                    cutoff = recent[0][0]
+                    merged = [p for p in older if p[0] < cutoff] + merged
+                except Exception as e:
+                    print(f"[FX] older history unavailable from {host}: {e}")
+                if len(merged) < 2:
+                    raise ValueError("too few points")
+                return {"points": merged, "source": "Frankfurter",
+                        "updated": merged[-1][0]}
+            except Exception as e:
+                last_error = e
+                print(f"[FX] {host} failed: {e}")
+        raise RuntimeError(self._short(last_error))
+
+    def _fetch_yahoo(self):
+        last_error = None
+        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+            if self.cancelled.is_set():
+                return None
+            try:
+                payload = self._http_json(
+                    f"https://{host}/v8/finance/chart/INR%3DX?range=1y&interval=1d")
+                points = self._parse_yahoo(payload)
+                return {"points": points, "source": "Yahoo Finance",
+                        "updated": points[-1][0]}
+            except Exception as e:
+                last_error = e
+                print(f"[FX] {host} failed: {e}")
+        raise RuntimeError(self._short(last_error))
+
+    def _fetch_stooq(self):
+        import csv
+        import io
+        from datetime import date, timedelta
+
+        end = date.today()
+        start = end - timedelta(days=372)
+        text = _fx_http_text(
+            "https://stooq.com/q/d/l/?s=usdinr&i=d"
+            f"&d1={start.strftime('%Y%m%d')}&d2={end.strftime('%Y%m%d')}")
+        points = []
+        for row in csv.DictReader(io.StringIO(text)):
+            try:
+                day = str(row["Date"])
+                date.fromisoformat(day)
+                rate = float(row["Close"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(rate) and rate > 0:
+                points.append((day, rate))
+        points.sort(key=lambda point: point[0])
+        if len(points) < 2:
+            raise ValueError("no usable rows")
+        return {"points": points, "source": "Stooq", "updated": points[-1][0]}
+
+    def _fetch_fawaz(self):
+        # One snapshot per day, so this is the slow last resort: the last
+        # three weeks daily, then weekly back one year, fetched in parallel.
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import date, timedelta
+
+        end = date.today()
+        days = ([end - timedelta(days=i) for i in range(0, 21)]
+                + [end - timedelta(days=i) for i in range(28, 366, 7)])
+
+        def one(day):
+            if self.cancelled.is_set():
+                return None
+            stamp = day.isoformat()
+            for url in (
+                f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{stamp}/v1/currencies/usd.json",
+                f"https://{stamp}.currency-api.pages.dev/v1/currencies/usd.json",
+            ):
+                try:
+                    payload = _fx_http_json(url, timeout=6.0)
+                    rate = float(payload["usd"]["inr"])
+                    if math.isfinite(rate) and rate > 0:
+                        return (str(payload.get("date") or stamp), rate)
+                except Exception:
+                    continue
+            return None
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            got = [item for item in pool.map(one, days) if item]
+        points = sorted(dict(got).items())
+        if len(points) < 5:
+            raise ValueError("too few snapshots")
+        return {"points": points, "source": "currency-api", "updated": points[-1][0]}
+
+    def _fetch_latest(self):
+        latest = self._parse_latest(
+            self._http_json("https://open.er-api.com/v6/latest/USD"))
+        return {"points": [latest], "source": "ExchangeRate-API",
+                "updated": latest[0]}
+
+    # -- offline cache -----------------------------------------------------
+    _CACHE_FILE = CONFIG_DIR / "fx_usd_inr_cache.json"
+
+    def _load_cache(self):
+        try:
+            data = json.loads(self._CACHE_FILE.read_text(encoding="utf-8"))
+            points = [(str(d), float(r)) for d, r in data["points"]
+                      if math.isfinite(float(r)) and float(r) > 0]
+            points.sort(key=lambda point: point[0])
+            return points if len(points) > 1 else None
+        except Exception:
+            return None
+
+    def _save_cache(self, points) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            self._CACHE_FILE.write_text(
+                json.dumps({"points": points}), encoding="utf-8")
+        except Exception as e:
+            print(f"[FX] could not write cache: {e}")
+
+    def _run(self) -> None:
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        # The panel appears straight away in its "fetching" state.
+        if self.cancelled.is_set():
+            return
+        self.online.emit(self.request_id)
+
+        data = None
+        errors: list[str] = []
+
+        # Stage 1: the three quick daily-history sources race each other, so
+        # one slow or blocked host no longer holds the graph up for ~30 s
+        # (long enough for the briefing to finish and close the panel).
+        pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="AuraFx")
+        try:
+            pending = {
+                pool.submit(fetch): fetch.__name__.replace("_fetch_", "")
+                for fetch in (self._fetch_frankfurter, self._fetch_yahoo,
+                              self._fetch_stooq)
+            }
+            while pending and data is None:
+                if self.cancelled.is_set():
+                    return
+                done, _ = wait(list(pending), timeout=0.25,
+                               return_when=FIRST_COMPLETED)
+                for future in done:
+                    name = pending.pop(future)
+                    try:
+                        found = future.result()
+                    except Exception as e:
+                        errors.append(f"{name}: {self._short(e)}")
+                        print(f"[FX] {name} failed: {e}")
+                        continue
+                    if found and len(found["points"]) > 1 and data is None:
+                        data = found
+                        print(f"[FX] using {name}: {len(found['points'])} points")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        # Stage 2: slower fallbacks, one after the other.
+        if data is None:
+            for fetch in (self._fetch_fawaz, self._fetch_latest):
+                if self.cancelled.is_set():
+                    return
+                name = fetch.__name__.replace("_fetch_", "")
+                try:
+                    data = fetch()
+                except Exception as e:
+                    errors.append(f"{name}: {self._short(e)}")
+                    print(f"[FX] {name} failed: {e}")
+                    continue
+                if data:
+                    break
+        if self.cancelled.is_set():
+            return
+
+        cached = self._load_cache()
+        if data and len(data["points"]) > 1:
+            self._save_cache(data["points"])
+        elif data and cached:
+            # Only today's rate came through: hang it on the saved history.
+            day, rate = data["points"][0]
+            points = [p for p in cached if p[0] < day] + [(day, rate)]
+            data = {"points": points, "source": f"{data['source']} + saved history",
+                    "updated": day}
+        elif data is None and cached:
+            data = {"points": cached, "source": "saved copy (offline)",
+                    "updated": cached[-1][0]}
+        if data is None:
+            data = {"points": [], "error": "; ".join(errors)[:400]}
+        self.result.emit(self.request_id, data)
+
+
+class _FxDragHeader(QWidget):
+    def __init__(self, panel):
+        super().__init__(panel)
+        self._panel = panel
+        self._drag_offset = None
+        self.setMouseTracking(True)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self._panel.pos()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_offset is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            self._panel.move_clamped(
+                event.globalPosition().toPoint() - self._drag_offset
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class _FxGraphCanvas(QWidget):
+    _RANGES = {"7D": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(180, 72)
+        self.setMouseTracking(True)
+        self._points: list[tuple[str, float]] = []
+        self._range = "1M"
+        self._view_start = 0
+        self._view_end = -1
+        self._hover_index = None
+        self._drag_x = None
+        self._draw_progress = 0.0
+        self._message = "FETCHING DAILY REFERENCE DATA"
+        self._animation = QVariantAnimation(self)
+        self._animation.setDuration(600)
+        self._animation.setStartValue(0.0)
+        self._animation.setEndValue(1.0)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._animation.valueChanged.connect(self._set_draw_progress)
+
+    def set_points(self, points: list[tuple[str, float]]) -> None:
+        self._points = points
+        self._message = ""
+        self.reset_range()
+        self._animation.start()
+
+    def set_message(self, text: str) -> None:
+        self._points = []
+        self._message = text
+        self._view_start, self._view_end = 0, -1
+        self._hover_index = None
+        self.update()
+
+    def _base_start(self) -> int:
+        """First index of the selected range, counted in calendar days.
+
+        Counting points instead of days made 7D mean "7 samples", which is
+        wrong whenever the data has gaps (weekends) or is weekly.
+        """
+        if not self._points:
+            return 0
+        from datetime import date, timedelta
+        floor = max(0, len(self._points) - 3)
+        try:
+            last = date.fromisoformat(self._points[-1][0])
+            cutoff = (last - timedelta(days=self._RANGES[self._range] - 1)).isoformat()
+        except ValueError:
+            return max(0, len(self._points) - self._RANGES[self._range])
+        for index, (day, _rate) in enumerate(self._points):
+            if day >= cutoff:
+                return min(index, floor)
+        return floor
+
+    def _set_draw_progress(self, value) -> None:
+        self._draw_progress = float(value)
+        self.update()
+
+    def reset_range(self) -> None:
+        if not self._points:
+            self._view_start, self._view_end = 0, -1
+        else:
+            self._view_end = len(self._points) - 1
+            self._view_start = self._base_start()
+        self._hover_index = None
+        self.update()
+
+    def set_range(self, name: str) -> None:
+        if name not in self._RANGES:
+            return
+        self._range = name
+        self.reset_range()
+        self._animation.start()
+
+    def visible_points(self) -> list[tuple[str, float]]:
+        if not self._points or self._view_end < self._view_start:
+            return []
+        return self._points[self._view_start:self._view_end + 1]
+
+    def _plot_rect(self) -> QRectF:
+        return QRectF(46, 10, max(1, self.width() - 60),
+                      max(1, self.height() - 39))
+
+    def _index_at_x(self, x: float) -> int | None:
+        points = self.visible_points()
+        if not points:
+            return None
+        plot = self._plot_rect()
+        ratio = max(0.0, min(1.0, (x - plot.left()) / max(1.0, plot.width())))
+        offset = round(ratio * (len(points) - 1))
+        return self._view_start + offset
+
+    def _clamp_view(self) -> None:
+        if not self._points:
+            return
+        base_start = self._base_start()
+        base_end = len(self._points) - 1
+        size = min(base_end - base_start + 1,
+                   max(3, self._view_end - self._view_start + 1))
+        self._view_start = max(base_start, min(self._view_start, base_end - size + 1))
+        self._view_end = self._view_start + size - 1
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setFont(QFont("Courier New", 7))
+        points = self.visible_points()
+        if len(points) < 2:
+            painter.setPen(qcol(C.TEXT_DIM))
+            painter.drawText(self.rect().adjusted(10, 0, -10, 0),
+                             Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                             self._message or "NOT ENOUGH HISTORY TO DRAW")
+            painter.end()
+            return
+
+        plot = self._plot_rect()
+        values = [value for _day, value in points]
+        low, high = min(values), max(values)
+        span = high - low
+        padding = max(span * 0.16, high * 0.002, 0.01)
+        low -= padding
+        high += padding
+
+        def point_for(index: int) -> QPointF:
+            local = index - self._view_start
+            x = plot.left() + (local / max(1, len(points) - 1)) * plot.width()
+            value = self._points[index][1]
+            y = plot.bottom() - ((value - low) / (high - low)) * plot.height()
+            return QPointF(x, y)
+
+        accent = QColor(C.PRI)
+        painter.setPen(QPen(qcol(C.PRI, 35), 1, Qt.PenStyle.DotLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for step in range(4):
+            y = plot.top() + plot.height() * step / 3
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+            label = high - (high - low) * step / 3
+            painter.setPen(qcol(C.TEXT_DIM))
+            painter.drawText(QRectF(0, y - 7, 42, 14),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"₹{label:.2f}")
+            painter.setPen(QPen(qcol(C.PRI, 35), 1, Qt.PenStyle.DotLine))
+
+        for ratio in (0.0, 0.5, 1.0):
+            x = plot.left() + plot.width() * ratio
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+        painter.setPen(qcol(C.TEXT_DIM))
+        for ratio, idx in ((0.0, self._view_start),
+                           (0.5, self._view_start + (len(points) - 1) // 2),
+                           (1.0, self._view_end)):
+            day = self._points[idx][0]
+            label = day[5:7] + "/" + day[8:10]
+            x = plot.left() + plot.width() * ratio
+            align = (Qt.AlignmentFlag.AlignLeft if ratio == 0 else
+                     Qt.AlignmentFlag.AlignRight if ratio == 1 else
+                     Qt.AlignmentFlag.AlignHCenter)
+            painter.drawText(QRectF(x - 35, plot.bottom() + 6, 70, 14), align, label)
+
+        line = QPainterPath()
+        line.moveTo(point_for(self._view_start))
+        for index in range(self._view_start + 1, self._view_end + 1):
+            line.lineTo(point_for(index))
+        fill = QPainterPath(line)
+        fill.lineTo(plot.right(), plot.bottom())
+        fill.lineTo(plot.left(), plot.bottom())
+        fill.closeSubpath()
+        gradient = QLinearGradient(plot.topLeft(), plot.bottomLeft())
+        top_color = QColor(accent)
+        top_color.setAlpha(72)
+        bottom_color = QColor(accent)
+        bottom_color.setAlpha(0)
+        gradient.setColorAt(0, top_color)
+        gradient.setColorAt(1, bottom_color)
+        painter.save()
+        painter.setClipRect(QRectF(plot.left(), plot.top(),
+                                   plot.width() * self._draw_progress, plot.height()))
+        painter.fillPath(fill, QBrush(gradient))
+        line_pen = QPen(accent, 2.0)
+        line_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(line_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(line)
+
+        high_index = self._view_start + values.index(max(values))
+        low_index = self._view_start + values.index(min(values))
+        for index, label, above in (
+                (high_index, f"H ₹{self._points[high_index][1]:.2f}", True),
+                (low_index, f"L ₹{self._points[low_index][1]:.2f}", False)):
+            pos = point_for(index)
+            painter.setPen(QPen(qcol(C.DARK), 2))
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(pos, 3.2, 3.2)
+            painter.setPen(qcol(C.TEXT))
+            label_y = max(plot.top() + 10, pos.y() - 7) if above else min(
+                plot.bottom() - 2, pos.y() + 14
+            )
+            painter.drawText(QPointF(pos.x() + 5, label_y), label)
+
+        painter.restore()
+
+        if self._hover_index is not None and self._view_start <= self._hover_index <= self._view_end:
+            idx = self._hover_index
+            pos = point_for(idx)
+            painter.setPen(QPen(qcol(C.PRI, 145), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(pos.x(), plot.top()), QPointF(pos.x(), plot.bottom()))
+            painter.setPen(QPen(qcol(C.DARK), 2))
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(pos, 4, 4)
+            range_start = self._base_start()
+            start_rate = self._points[range_start][1]
+            delta = self._points[idx][1] - start_rate
+            text = (
+                f"{self._points[idx][0]}   1 USD = ₹{self._points[idx][1]:.2f}\n"
+                f"Range change: {'+' if delta >= 0 else ''}₹{delta:.2f}"
+            )
+            metrics = painter.fontMetrics()
+            lines = text.splitlines()
+            box_w = max(metrics.horizontalAdvance(item) for item in lines) + 14
+            box_h = metrics.height() * len(lines) + 10
+            box_x = pos.x() + 9
+            if box_x + box_w > self.width() - 4:
+                box_x = pos.x() - box_w - 9
+            box_y = max(4, min(pos.y() - box_h - 8, self.height() - box_h - 4))
+            tooltip = QRectF(box_x, box_y, box_w, box_h)
+            painter.setPen(QPen(qcol(C.PRI, 190), 1))
+            painter.setBrush(QBrush(qcol(C.DARK, 246)))
+            painter.drawRoundedRect(tooltip, 3, 3)
+            painter.setPen(qcol(C.TEXT))
+            painter.drawText(tooltip.adjusted(7, 4, -7, -4),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             text)
+        painter.end()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_x is not None:
+            points = self.visible_points()
+            plot = self._plot_rect()
+            if len(points) > 2:
+                shift = round((self._drag_x - event.position().x())
+                              / max(1.0, plot.width()) * (len(points) - 1))
+                self._view_start += shift
+                self._view_end += shift
+                self._drag_x = event.position().x()
+                self._clamp_view()
+        else:
+            self._hover_index = self._index_at_x(event.position().x())
+        self.update()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_x = event.position().x()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_x = None
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        if not self._points:
+            return
+        current = max(3, self._view_end - self._view_start + 1)
+        new_size = max(3, round(current * (0.8 if event.angleDelta().y() > 0 else 1.25)))
+        anchor = self._index_at_x(event.position().x())
+        if anchor is None:
+            return
+        fraction = (anchor - self._view_start) / max(1, current - 1)
+        self._view_start = round(anchor - fraction * (new_size - 1))
+        self._view_end = self._view_start + new_size - 1
+        self._clamp_view()
+        self.update()
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        self.reset_range()
+        super().mouseDoubleClickEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_index = None
+        self.update()
+        super().leaveEvent(event)
+
+
+class FxGraphPanel(QWidget):
+    closed = pyqtSignal()
+
+    def __init__(self, main, size: QSize):
+        super().__init__(main, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self._main = main
+        self._closed = False
+        self.has_data = False
+        self._set_up_ui()
+        self.resize(size)
+        self.setMinimumSize(280, 160)
+
+    def _set_up_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(2)
+
+        header = _FxDragHeader(self)
+        header.setFixedHeight(25)
+        header.setStyleSheet("background: transparent;")
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(8, 0, 5, 0)
+        header_row.setSpacing(5)
+        title = QLabel("USD / INR")
+        title.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        header_row.addWidget(title)
+        header_row.addStretch()
+        close = QPushButton("×")
+        close.setFixedSize(20, 20)
+        close.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setStyleSheet(
+            f"QPushButton {{ color: {C.TEXT_DIM}; background: transparent; "
+            f"border: none; }} QPushButton:hover {{ color: {C.PRI}; }}"
+        )
+        close.clicked.connect(self.close)
+        header_row.addWidget(close)
+        outer.addWidget(header)
+
+        info_row = QHBoxLayout()
+        info_row.setContentsMargins(8, 0, 8, 0)
+        info_row.setSpacing(8)
+        self._rate_label = QLabel("1 USD = —")
+        self._rate_label.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        self._rate_label.setStyleSheet(
+            f"color: {C.TEXT}; background: transparent; border: none;"
+        )
+        info_row.addWidget(self._rate_label)
+        info_row.addStretch()
+        self._change_label = QLabel("—")
+        self._change_label.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._change_label.setStyleSheet(
+            f"color: {C.TEXT_DIM}; background: transparent; border: none;"
+        )
+        info_row.addWidget(self._change_label)
+        outer.addLayout(info_row)
+
+        self._chart = _FxGraphCanvas(self)
+        outer.addWidget(self._chart, 1)
+
+        footer = QHBoxLayout()
+        footer.setContentsMargins(7, 0, 7, 2)
+        footer.setSpacing(3)
+        self._range_buttons = {}
+        for name in self._chart._RANGES:
+            button = QPushButton(name)
+            button.setFixedSize(35, 20)
+            button.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, key=name: self._select_range(key))
+            footer.addWidget(button)
+            self._range_buttons[name] = button
+        self._footer_label = QLabel("Daily reference rate")
+        self._footer_label.setFont(QFont("Courier New", 6))
+        self._footer_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._footer_label.setStyleSheet(
+            f"color: {C.TEXT_DIM}; background: transparent; border: none;"
+        )
+        footer.addWidget(self._footer_label, 1)
+        grip = QSizeGrip(self)
+        grip.setFixedSize(14, 14)
+        footer.addWidget(grip, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
+        outer.addLayout(footer)
+        self._refresh_range_buttons()
+
+    def _refresh_range_buttons(self) -> None:
+        for name, button in self._range_buttons.items():
+            active = name == self._chart._range
+            button.setStyleSheet(
+                f"QPushButton {{ color: {C.BG if active else C.PRI}; "
+                f"background: {C.PRI if active else 'transparent'}; "
+                f"border: 1px solid {C.PRI}; border-radius: 2px; padding: 0; }}"
+                f"QPushButton:hover {{ background: {C.PRI_GHO}; }}"
+            )
+
+    def _select_range(self, name: str) -> None:
+        self._chart.set_range(name)
+        self._refresh_range_buttons()
+
+    def set_rates(self, data: dict) -> None:
+        if self._closed or not isinstance(data, dict):
+            return
+        points = data.get("points")
+        if not isinstance(points, list) or not points:
+            self.set_unavailable(str(data.get("error") or ""))
+            return
+        try:
+            points = [(str(day), float(rate)) for day, rate in points
+                      if math.isfinite(float(rate)) and float(rate) > 0]
+            points.sort(key=lambda point: point[0])
+            if not points:
+                self.set_unavailable()
+                return
+            latest = points[-1][1]
+            if len(points) > 1:
+                self._chart.set_points(points)
+                self.has_data = True
+            else:
+                self._chart.set_message("HISTORY UNAVAILABLE - SHOWING LATEST RATE ONLY")
+            self._rate_label.setText(f"1 USD = ₹{latest:.2f}")
+            if len(points) > 1:
+                previous = points[-2][1]
+                change = latest - previous
+                percent = (change / previous * 100.0) if previous else 0.0
+                arrow = "▲" if change >= 0 else "▼"
+                color = C.GREEN if change >= 0 else C.RED
+                self._change_label.setStyleSheet(
+                    f"color: {color}; background: transparent; border: none;"
+                )
+                self._change_label.setText(
+                    f"{arrow} {change:+.2f} ({percent:+.2f}%) vs prev. day"
+                )
+            else:
+                self._change_label.setStyleSheet(
+                    f"color: {C.TEXT_DIM}; background: transparent; border: none;"
+                )
+                self._change_label.setText("Previous day unavailable")
+            source = str(data.get("source") or "daily reference")
+            updated = str(data.get("updated") or points[-1][0])
+            self._footer_label.setText(f"{source} · {updated}")
+            self._footer_label.setToolTip(
+                f"Daily reference rate - source: {source} - updated {updated}"
+            )
+        except Exception as e:
+            print(f"[FX] could not draw rates: {e}")
+            self.set_unavailable(f"draw error: {e}")
+
+    def set_unavailable(self, reason: str = "") -> None:
+        if self._closed:
+            return
+        self._chart.set_message(
+            "RATE DATA UNAVAILABLE\n" + (reason or "check your connection"))
+        self._rate_label.setText("1 USD = —")
+        self._change_label.setStyleSheet(
+            f"color: {C.TEXT_DIM}; background: transparent; border: none;"
+        )
+        self._change_label.setText("—")
+        self._footer_label.setText("No exchange-rate source reachable")
+        self._footer_label.setToolTip(reason or "No exchange-rate source reachable")
+        if reason:
+            print(f"[FX] graph unavailable: {reason}")
+
+    def move_clamped(self, point: QPoint) -> None:
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            self.move(point)
+            return
+        area = screen.availableGeometry()
+        x = max(area.left(), min(point.x(), area.right() - self.width() + 1))
+        y = max(area.top(), min(point.y(), area.bottom() - self.height() + 1))
+        self.move(x, y)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width, height = float(self.width()), float(self.height())
+        margin, cut = 1.5, 11.0
+        frame = QPainterPath()
+        frame.moveTo(margin + cut, margin)
+        frame.lineTo(width - margin - cut, margin)
+        frame.lineTo(width - margin, margin + cut)
+        frame.lineTo(width - margin, height - margin - cut)
+        frame.lineTo(width - margin - cut, height - margin)
+        frame.lineTo(margin + cut, height - margin)
+        frame.lineTo(margin, height - margin - cut)
+        frame.lineTo(margin, margin + cut)
+        frame.closeSubpath()
+        painter.setBrush(QBrush(qcol(C.DARK, 247)))
+        painter.setPen(QPen(qcol(C.PRI), 2))
+        painter.drawPath(frame)
+        painter.end()
+
+    def closeEvent(self, event):
+        if not self._closed:
+            self._closed = True
+            self._chart._animation.stop()
+            self.closed.emit()
+        super().closeEvent(event)
+
+
+class _NewsVideoHeader(QWidget):
+    def __init__(self, panel: "NewsVideoPanel"):
+        super().__init__(panel)
+        self._panel = panel
+        self._drag_offset = None
+        self.setFixedHeight(34)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setStyleSheet("background: transparent;")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = (
+                event.globalPosition().toPoint()
+                - self._panel.frameGeometry().topLeft()
+            )
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (event.buttons() & Qt.MouseButton.LeftButton
+                and self._drag_offset is not None):
+            self._panel.move_clamped(
+                event.globalPosition().toPoint() - self._drag_offset
+            )
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class NewsVideoPanel(QWidget):
+    CHANNEL_HANDLE = "@RepublicWorld"
+    CHANNEL_ID: str | None = None
+    _DEFAULT_W, _DEFAULT_H = 720, 420
+
+    closed = pyqtSignal()
+
+    def __init__(self, main: "MainWindow", news_panel: QWidget,
+                 channel_id: str | None):
+        super().__init__(
+            main,
+            Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint,
+        )
+        self._main = main
+        self._channel_id = channel_id
+        self._candidate_seq = 0
+        self._closed = False
+        self._main_minimized = False
+        self._user_unmuted = False
+        self._speaking = bool(getattr(main.hud, "speaking", False))
+        self._current_title = ""
+        self.setObjectName("NewsVideoPanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._place_over_news(news_panel)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(0)
+        self._outer_layout = outer
+
+        self._header = _NewsVideoHeader(self)
+        header_layout = QHBoxLayout(self._header)
+        header_layout.setContentsMargins(8, 0, 6, 0)
+        header_layout.setSpacing(8)
+        self._brand = QLabel("REPUBLIC WORLD  |  LIVE")
+        self._brand.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._brand.setStyleSheet(
+            f"color: {C.PRI}; background: transparent; border: none;"
+        )
+        self._brand.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        header_layout.addWidget(self._brand)
+        self._title = QLabel("")
+        self._title.setFont(QFont("Courier New", 8))
+        self._title.setStyleSheet(
+            f"color: {C.TEXT}; background: transparent; border: none;"
+        )
+        self._title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self._title.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        header_layout.addWidget(self._title, 1)
+        close_button = QPushButton("×")
+        close_button.setFixedSize(24, 24)
+        close_button.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_button.setStyleSheet(f"""
+            QPushButton {{ color: {C.TEXT_DIM}; background: transparent; border: none; }}
+            QPushButton:hover {{ color: {C.MUTED_C}; }}
+        """)
+        close_button.clicked.connect(self.close)
+        header_layout.addWidget(close_button)
+        outer.addWidget(self._header)
+
+        self._using_edge = _edge_available()
+        if self._using_edge:
+            self._profile = None
+            self._view = _EdgeView(self)
+            self._page = self._view.page()
+            self._view.failed.connect(self._on_edge_failed)
+            self._view.loadFinished.connect(self._on_page_load_finished)
+        else:
+            self._create_qt_view()
+        outer.addWidget(self._view, 1)
+
+        self._unmute_button = QPushButton("UNMUTE", self._view)
+        self._unmute_button.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        self._unmute_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._unmute_button.setStyleSheet(f"""
+            QPushButton {{
+                color: {C.BG}; background: {C.PRI};
+                border: 1px solid {C.PRI}; border-radius: 3px;
+                padding: 8px 18px;
+            }}
+            QPushButton:hover {{ background: {C.ACC2}; border-color: {C.ACC2}; }}
+        """)
+        self._unmute_button.clicked.connect(self._unmute)
+        self._unmute_button.raise_()
+
+        self._candidate_timer = QTimer(self)
+        self._candidate_timer.setSingleShot(True)
+        self._candidate_timer.timeout.connect(self._on_candidate_timeout)
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.setInterval(30_000)
+        self._retry_timer.timeout.connect(self._retry_live)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(500)
+        self._poll_timer.timeout.connect(self._poll_player)
+
+        self.show()
+        self.raise_()
+        # Page load + renderer start-up are the heavy part. Begin them once the
+        # window has finished gliding in (a child timer, so it dies with the
+        # panel) rather than in the same tick as its open animation.
+        self._first_play_timer = QTimer(self)
+        self._first_play_timer.setSingleShot(True)
+        self._first_play_timer.timeout.connect(self._first_play)
+        self._first_play_timer.start((_MO_WIN_IN_MS + 80) if _MOTION_ON else 0)
+
+    def _first_play(self) -> None:
+        if not self._closed:
+            self._play_next()
+
+    def _create_qt_view(self) -> None:
+        self._profile = QWebEngineProfile("aura_news_video", self)
+        self._page = _BrowserPage(self._profile, self)
+        self._profile.setHttpUserAgent(re.sub(
+            r"\s*QtWebEngine/[\d.]+", "", self._profile.httpUserAgent()
+        ))
+        self._view = QWebEngineView(self)
+        self._view.setPage(self._page)
+        self._view.setStyleSheet("background: #000000; border: none;")
+        self._page.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False
+        )
+        self._install_player_script()
+        self._view.loadFinished.connect(self._on_page_load_finished)
+        self._page.renderProcessTerminated.connect(
+            self._on_render_process_terminated
+        )
+
+    def _on_edge_failed(self, reason: str) -> None:
+        if self._closed or not self._using_edge:
+            return
+        print(f"[YouTube] WebView2 failed: {reason}")
+        if not HAVE_WEB:
+            self._set_title("In-app browser unavailable")
+            return
+
+        self._candidate_timer.stop()
+        self._retry_timer.stop()
+        self._poll_timer.stop()
+        old_view = self._view
+        self._outer_layout.removeWidget(old_view)
+        old_view.hide()
+        old_view.dispose()
+        self._using_edge = False
+        self._create_qt_view()
+        self._outer_layout.insertWidget(1, self._view, 1)
+        self._unmute_button.setParent(self._view)
+        if self._user_unmuted:
+            self._unmute_button.hide()
+        else:
+            self._unmute_button.show()
+        self._unmute_button.raise_()
+        old_view.deleteLater()
+        self._play_next()
+
+    def _on_page_load_finished(self, ok: bool) -> None:
+        if self._closed or self.sender() is not self._view:
+            return
+        if not ok:
+            if self._using_edge:
+                self._schedule_live_retry("in-app browser could not load the live page")
+            return
+        if self._using_edge:
+            self._page.runJavaScript(self._PLAYER_JS)
+        if self._main_minimized:
+            self._pause_page()
+        self._apply_audio_state()
+
+    def _place_over_news(self, news_panel: QWidget) -> None:
+        weather = getattr(self._main, "_weather_widget", None)
+        if weather is not None and weather.isVisible():
+            anchor = weather.mapToGlobal(QPoint(weather.width() + 10, 0))
+        else:
+            anchor = self._main.mapToGlobal(QPoint(12, 64))
+        screen = QApplication.screenAt(anchor) or self._main.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        width = min(self._DEFAULT_W, area.width())
+        height = min(self._DEFAULT_H, area.height())
+        x = max(area.left(), min(anchor.x(), area.right() - width + 1))
+        y = max(area.top(), min(anchor.y(), area.bottom() - height + 1))
+        self.setGeometry(x, y, width, height)
+
+    def move_clamped(self, point: QPoint) -> None:
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = max(area.left(), min(point.x(), area.right() - self.width() + 1))
+        y = max(area.top(), min(point.y(), area.bottom() - self.height() + 1))
+        self.move(x, y)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_unmute_button") and self._view is not None:
+            self._unmute_button.adjustSize()
+            self._unmute_button.move(
+                (self._view.width() - self._unmute_button.width()) // 2,
+                (self._view.height() - self._unmute_button.height()) // 2,
+            )
+            self._unmute_button.raise_()
+        self._refresh_title()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width, height = float(self.width()), float(self.height())
+        margin, cut = 1.5, 12.0
+        frame = QPainterPath()
+        frame.moveTo(margin + cut, margin)
+        frame.lineTo(width - margin - cut, margin)
+        frame.lineTo(width - margin, margin + cut)
+        frame.lineTo(width - margin, height - margin - cut)
+        frame.lineTo(width - margin - cut, height - margin)
+        frame.lineTo(margin + cut, height - margin)
+        frame.lineTo(margin, height - margin - cut)
+        frame.lineTo(margin, margin + cut)
+        frame.closeSubpath()
+        painter.setBrush(QBrush(qcol(C.DARK, 246)))
+        painter.setPen(QPen(qcol(C.PRI), 2))
+        painter.drawPath(frame)
+        painter.end()
+
+    def _set_title(self, title: str) -> None:
+        self._current_title = title
+        self._refresh_title()
+
+    def _refresh_title(self) -> None:
+        if not hasattr(self, "_title"):
+            return
+        prefix = f"—  {self._current_title}" if self._current_title else ""
+        self._title.setText(self._title.fontMetrics().elidedText(
+            prefix, Qt.TextElideMode.ElideRight, max(20, self._title.width())
+        ))
+
+    # YouTube refuses to play many channels' videos/streams inside an <iframe>
+    # embed ("This video is unavailable - Error code: 152-4" / 153): embeds need
+    # a genuine third-party origin + Referer, and the owner can switch embedding
+    # off entirely. The normal watch page has no such restriction, so the panel
+    # loads that instead and this script (injected into every page) strips the
+    # page down to just the player and reports state back to Python.
+    _PLAYER_JS = r"""
+(function () {
+  if (window.__auraInit) return;
+  window.__auraInit = true;
+  window.__auraPausedByAura = window.__auraPausedByAura || false;
+  window.__auraDesiredMute = true;
+  window.__auraVolume = 80;
+  window.__auraHold = 0;
+  window.__auraNextPlayAttempt = 0;
+  window.__auraUserAudio = '';
+  window.__auraState = {error: '', playing: false, ended: false};
+
+  var css = document.createElement('style');
+  css.textContent =
+    'html,body{overflow:hidden!important;background:#000!important}' +
+    'ytd-masthead,#masthead-container,#secondary,#below,#comments,#related,' +
+    'ytd-miniplayer,tp-yt-iron-overlay-backdrop,ytd-consent-bump-v2-lightbox,' +
+    'ytd-mealbar-promo-renderer,.ytp-ce-element,.ytp-endscreen-content,' +
+    'ytd-popup-container,#chat,#guide,tp-yt-app-drawer{display:none!important}' +
+    '#movie_player,.html5-video-player{position:fixed!important;left:0!important;' +
+    'top:0!important;width:100vw!important;height:100vh!important;' +
+    'z-index:2147483647!important;background:#000!important}' +
+    '.html5-video-container{width:100%!important;height:100%!important}' +
+    'video.html5-main-video{width:100%!important;height:100%!important;' +
+    'left:0!important;top:0!important;object-fit:contain!important}' +
+    '.ytp-chrome-bottom{width:calc(100vw - 24px)!important;left:12px!important}';
+  (document.head || document.documentElement).appendChild(css);
+
+  // The player's own speaker button / volume slider / "m" key used to be
+  // undone by tick() within half a second (it forced the page back to the
+  // desired state), which is the "mutes again and again" symptom. A native
+  // audio gesture now pauses enforcement briefly, then is adopted as the
+  // new desired state and reported to Python.
+  function noteNativeAudio() {
+    window.__auraHold = Date.now() + 1500;
+    setTimeout(function () {
+      try {
+        var p = document.getElementById('movie_player');
+        var v = document.querySelector('video.html5-main-video') ||
+                document.querySelector('video');
+        if (!v) return;
+        var m = !!v.muted || !!(p && p.isMuted && p.isMuted());
+        window.__auraDesiredMute = m;
+        window.__auraUserAudio = m ? 'off' : 'on';
+        window.__auraHold = 0;
+      } catch (e) { window.__auraHold = 0; }
+    }, 250);
+  }
+  ['mousedown', 'click'].forEach(function (ev) {
+    document.addEventListener(ev, function (e) {
+      var t = e.target;
+      if (t && t.closest && t.closest('.ytp-mute-button,.ytp-volume-panel')) noteNativeAudio();
+    }, true);
+  });
+  document.addEventListener('keydown', function (e) {
+    if ((e.key === 'm' || e.key === 'M') && !e.ctrlKey && !e.metaKey && !e.altKey) noteNativeAudio();
+  }, true);
+
+  function tick() {
+    try {
+      var p = document.getElementById('movie_player');
+      var v = document.querySelector('video.html5-main-video') ||
+              document.querySelector('video');
+      var st = window.__auraState;
+
+      // playability / error state
+      var err = '';
+      try {
+        var r = p && p.getPlayerResponse && p.getPlayerResponse();
+        var s = r && r.playabilityStatus && r.playabilityStatus.status;
+        if (s && s !== 'OK') err = s;
+      } catch (e) {}
+      var box = document.querySelector('.ytp-error');
+      if (!err && box && box.offsetParent !== null) err = 'ERROR';
+      st.error = err;
+
+      if (v) {
+        // audio follows the desired state every tick (YouTube restores its
+        // own saved volume on load, so set it repeatedly)
+        if (!(window.__auraHold && Date.now() < window.__auraHold)) {
+          if (window.__auraDesiredMute) {
+            if (p && p.mute) p.mute();
+            v.muted = true;
+          } else {
+            if (p && p.unMute) {
+              p.unMute();
+              p.setVolume && p.setVolume(window.__auraVolume);
+            }
+            v.muted = false;
+          }
+        }
+        if (!window.__auraPausedByAura && v.paused && !v.ended && !err &&
+            Date.now() >= window.__auraNextPlayAttempt) {
+          window.__auraNextPlayAttempt = Date.now() + 5000;
+          var pr = v.play(); if (pr && pr.catch) pr.catch(function () {});
+        }
+        st.playing = !v.paused && v.readyState > 2 && v.currentTime > 0;
+        st.ended = !!v.ended;
+      }
+
+      // skip ads as soon as YouTube allows it
+      var skip = document.querySelector(
+        '.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern');
+      if (skip) skip.click();
+    } catch (e) {}
+  }
+  setInterval(tick, 500);
+})();
+"""
+
+    def _install_player_script(self) -> None:
+        script = QWebEngineScript()
+        script.setName("aura_news_player")
+        script.setSourceCode(self._PLAYER_JS)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(False)
+        self._page.scripts().insert(script)
+
+    def _watch_url(self) -> str:
+        channel_url = (
+            f"https://www.youtube.com/channel/{self._channel_id}/live"
+            if self._channel_id
+            else f"https://www.youtube.com/{self.CHANNEL_HANDLE}/live"
+        )
+        return f"{channel_url}?autoplay=1&mute=1"
+
+    def _play_next(self) -> None:
+        if self._closed or self._main_minimized:
+            return
+        self._retry_timer.stop()
+        self._candidate_timer.stop()
+        self._set_title("LIVE STREAM")
+        self._candidate_seq += 1
+        self._candidate_timer.start(60_000)
+        self._poll_timer.start()
+        self._view.setUrl(QUrl(self._watch_url()))
+
+    def pause_for_minimize(self) -> None:
+        if self._closed or self._main_minimized:
+            return
+        self._main_minimized = True
+        self._candidate_timer.stop()
+        self._retry_timer.stop()
+        self._poll_timer.stop()
+        self._pause_page()
+
+    def _pause_page(self) -> None:
+        self._view.page().runJavaScript(
+            "window.__auraPausedByAura=true;"
+            "var v=document.querySelector('video.html5-main-video')||"
+            "document.querySelector('video');if(v)v.pause();"
+        )
+
+    def resume_after_minimize(self) -> None:
+        if self._closed or not self._main_minimized:
+            return
+        self._main_minimized = False
+        if self.isMinimized():
+            self.showNormal()
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        # Reloading the channel's live page reconnects at the current live edge,
+        # instead of resuming from the time at which the window was minimized.
+        self._play_next()
+
+    def _on_candidate_timeout(self) -> None:
+        if self._main_minimized:
+            return
+        self._schedule_live_retry("live stream did not start in time")
+
+    def _on_render_process_terminated(self, status, exit_code: int) -> None:
+        print(
+            f"[YouTube] Embedded renderer terminated "
+            f"(status={status}, exit_code={exit_code})"
+        )
+        self._schedule_live_retry("embedded renderer terminated")
+
+    def _schedule_live_retry(self, reason: str) -> None:
+        if self._closed or self._main_minimized:
+            return
+        if self._retry_timer.isActive():
+            return
+        print(f"[YouTube] {reason}; retrying live in the in-app player.")
+        self._set_title("LIVE STREAM — RETRYING")
+        self._candidate_timer.stop()
+        self._poll_timer.stop()
+        self._retry_timer.start()
+
+    def _retry_live(self) -> None:
+        if self._closed or self._main_minimized:
+            return
+        self._play_next()
+
+    def _poll_player(self) -> None:
+        if self._closed or self._main_minimized or self._view is None:
+            return
+        sequence = self._candidate_seq
+        self._view.page().runJavaScript(
+            "(function(){var s=window.__auraState||{};"
+            "var ua=window.__auraUserAudio||'';window.__auraUserAudio='';"
+            "if(!ua){" + self._audio_js() + "}"
+            "return {error:s.error||'',playing:s.playing===true,"
+            "ended:s.ended===true,userAudio:ua};})()",
+            lambda result, seq=sequence: self._on_player_probe(result, seq),
+        )
+
+    def _on_player_probe(self, result, sequence: int) -> None:
+        if self._closed or self._main_minimized or not isinstance(result, dict):
+            return
+        native = result.get("userAudio")
+        if native == "on" and not self._user_unmuted:
+            self._user_unmuted = True
+            self._unmute_button.hide()
+        elif native == "off" and self._user_unmuted:
+            self._user_unmuted = False
+        if sequence != self._candidate_seq:
+            return
+        if result.get("error") or result.get("ended"):
+            self._schedule_live_retry(
+                f"live player reported {result.get('error') or 'stream ended'}"
+            )
+        elif result.get("playing"):
+            self._candidate_timer.stop()
+
+    def _unmute(self) -> None:
+        if self._closed:
+            return
+        self._user_unmuted = True
+        self._unmute_button.hide()
+        self._apply_audio_state()
+
+    def set_speaking(self, speaking: bool) -> None:
+        self._speaking = bool(speaking)
+        self._apply_audio_state()
+
+    def _audio_js(self) -> str:
+        # Muted until the user asks for sound. Once they have, AURA speaking
+        # only ducks the video (it used to force a full mute every time the
+        # assistant spoke, undoing the unmute).
+        if not self._user_unmuted:
+            muted, volume = True, 0
+        elif self._speaking:
+            muted, volume = False, 10
+        else:
+            muted, volume = False, 80
+        return "window.__auraDesiredMute=%s;window.__auraVolume=%d;" % (
+            "true" if muted else "false", volume)
+
+    def _apply_audio_state(self) -> None:
+        if self._closed or self._view is None:
+            return
+        self._view.page().runJavaScript(self._audio_js())
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._candidate_timer.stop()
+        self._retry_timer.stop()
+        self._poll_timer.stop()
+        view = self._view
+        self._view = None
+        if view is not None:
+            try:
+                view.page().runJavaScript(
+                    "(function(){var v=document.querySelector('video');"
+                    "if(v){v.muted=true;v.pause();}})();"
+                )
+                view.stop()
+                if self._using_edge:
+                    view.dispose()
+                else:
+                    view.setUrl(QUrl("about:blank"))
+                    view.deleteLater()
+            except Exception:
+                pass
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)
+        self.closed.emit()
+
+
+# ═══════ NEURAL MAP MODE – BEGIN ═══════
+
+_NEURAL_CATEGORIES = (
+    ("root", "Drive root", "#3ddc97"),
+    ("top", "Top folders", "#f5b83d"),
+    ("folder", "Folders", "#5b8def"),
+    ("document", "Documents", "#8b7cf6"),
+    ("image", "Images", "#ec5fa0"),
+    ("video", "Video", "#f08a3c"),
+    ("audio", "Audio", "#38bdf8"),
+    ("code", "Code", "#e5e7eb"),
+    ("archive", "Archives/Apps", "#ef6461"),
+    ("other", "Other files", "#4b5563"),
+)
+_NEURAL_CAT_INDEX = {name: i for i, (name, _label, _color) in enumerate(_NEURAL_CATEGORIES)}
+_NEURAL_SYSTEM_DIRS = {"$recycle.bin", "system volume information", "$windows.~bt"}
+
+
+def _neural_drives() -> list[str]:
+    roots: list[str] = []
+    try:
+        for part in psutil.disk_partitions(all=False):
+            root = str(part.mountpoint)
+            if root and root not in roots:
+                roots.append(root)
+    except Exception:
+        pass
+    if _OS == "Windows":
+        for code in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            root = f"{code}:\\"
+            if os.path.isdir(root) and root not in roots:
+                roots.append(root)
+    else:
+        for root in ("/", str(Path.home())):
+            if os.path.isdir(root) and root not in roots:
+                roots.append(root)
+    return roots or [str(Path.home())]
+
+
+def _neural_category(path: str, is_dir: bool, top: bool = False) -> int:
+    if top:
+        return _NEURAL_CAT_INDEX["top"]
+    if is_dir:
+        return _NEURAL_CAT_INDEX["folder"]
+    return _NEURAL_CAT_INDEX.get(_file_category(Path(path)), _NEURAL_CAT_INDEX["other"])
+
+
+def _neural_cache_path(root: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", root).strip("_") or "root"
+    return BASE_DIR / "config" / "neural_cache" / f"{safe[:80]}.json"
+
+
+class _NeuralScanWorker(QThread):
+    _MAX_ENTRIES_PER_FOLDER = 96
+    batch = pyqtSignal(object, bool, str)
+    finished_scan = pyqtSignal(object, float, str)
+
+    def __init__(self, root: str, include_system: bool = False, depth: int = 3, parent=None):
+        super().__init__(parent)
+        self.root = os.path.abspath(root)
+        self.include_system = bool(include_system)
+        self.depth = max(1, int(depth))
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def run(self):
+        started = time.monotonic()
+        records: list[tuple[int, str, str, int, float, int, int]] = []
+        queue: list[tuple[str, int, int]] = []
+        try:
+            root_stat = os.stat(self.root, follow_symlinks=False)
+            records.append((-1, os.path.basename(self.root.rstrip("\\/")) or self.root,
+                            self.root, 0, float(root_stat.st_mtime), 0, -1))
+            queue.append((self.root, 0, 0))
+        except OSError as exc:
+            self.finished_scan.emit([], 0.0, str(exc))
+            return
+        last_emit = time.monotonic()
+        while queue and not self.cancelled and len(records) < 6000:
+            folder, parent, level = queue.pop(0)
+            entries = []
+            try:
+                with os.scandir(folder) as iterator:
+                    for entry in iterator:
+                        if len(entries) >= self._MAX_ENTRIES_PER_FOLDER:
+                            break
+                        entries.append(entry)
+            except OSError:
+                continue
+            entries.sort(key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+            child_count = 0
+            for entry in entries:
+                if self.cancelled or len(records) >= 6000:
+                    break
+                if not self.include_system and entry.name.lower() in _NEURAL_SYSTEM_DIRS:
+                    continue
+                try:
+                    stat = entry.stat(follow_symlinks=False)
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_dir and entry.is_symlink():
+                    continue
+                if is_dir and level < self.depth:
+                    child = len(records)
+                    records.append((parent, entry.name, entry.path, 0, float(stat.st_mtime),
+                                    level + 1, 1))
+                    queue.append((entry.path, child, level + 1))
+                elif not is_dir:
+                    records.append((parent, entry.name, entry.path, int(stat.st_size),
+                                    float(stat.st_mtime), level + 1, 0))
+                child_count += 1
+            if parent >= 0 and parent < len(records):
+                old = records[parent]
+                records[parent] = (old[0], old[1], old[2], old[3], old[4], old[5],
+                                    child_count if child_count else -1)
+            now = time.monotonic()
+            if now - last_emit >= 0.25:
+                self.batch.emit(records[:], bool(queue), "Scanning files...")
+                last_emit = now
+        self.finished_scan.emit(records, time.monotonic() - started,
+                                "Scan cancelled" if self.cancelled else "")
+
+
+class _NeuralMapCanvas(QWidget):
+    _MAX_RENDER_NODES = 900
+    _MAX_RENDER_EDGES = 1100
+    _GRID_SIZE = 96.0
+    node_clicked = pyqtSignal(int, bool)
+    node_double_clicked = pyqtSignal(int)
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setMouseTracking(True)
+        self.records: list[tuple] = []
+        self.positions: list[list[float]] = []
+        self.velocity: list[list[float]] = []
+        self.visible = set()
+        self.filtered: set[int] | None = None
+        self.path_nodes: set[int] = set()
+        self.selected = -1
+        self.secondary = -1
+        self.hovered = -1
+        self.pan = QPointF(0, 0)
+        self.zoom = 1.0
+        self._drag_pos = None
+        self._rotate_drag = False
+        self._last_layout = time.monotonic()
+        self._warm = False
+        self._spatial: dict[tuple[int, int], list[int]] = {}
+        self._screen_positions: dict[int, QPointF] = {}
+        self._render_nodes: list[int] = []
+        self._children: dict[int, list[int]] = {}
+        self._repel_factor = 1.0
+        self._link_length = 260.0
+        self._yaw = 0.0
+        self._pitch = 0.0
+        self._depths: list[float] = []
+        self._initial_view_pending = True
+        self._overlay = None            # full-window layer that actually draws the map
+        self._auto_fit = True           # keep the centred start view until the user moves the map
+        self._active = False            # neural page is the selected HUD mode
+        self._refit_queued = False
+        self._bounds = None             # (x, y, w, h) of everything drawn, canvas coords
+        self._color_cache: dict = {}
+        self._pen_cache: dict = {}
+        self._label_font = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._step)
+
+    def set_records(self, records: list[tuple]):
+        self.records = records[:6000]
+        n = len(self.records)
+        self.positions = [[0.0, 0.0] for _ in range(n)]
+        self.velocity = [[0.0, 0.0] for _ in range(n)]
+        children: dict[int, list[int]] = {}
+        for i, record in enumerate(self.records):
+            children.setdefault(record[0], []).append(i)
+        self._children = children
+        self._reflow_positions()
+
+        # Large drives keep the complete compact records for search/inspection,
+        # but paint only a bounded LOD: folders plus the largest few files per folder.
+        self.visible = {0} if n else set()
+        for parent, group in children.items():
+            if parent < 0:
+                continue
+            folders = [i for i in group if self.records[i][6]]
+            files = sorted((i for i in group if not self.records[i][6]),
+                           key=lambda i: self.records[i][3], reverse=True)
+            keep = folders[:24] + files[:8]
+            self.visible.update(keep)
+            if len(self.visible) >= self._MAX_RENDER_NODES:
+                break
+        self.visible = set(sorted(self.visible)[:self._MAX_RENDER_NODES])
+        self._render_nodes = sorted(self.visible)
+        self._rebuild_spatial()
+        self._warm = False
+        self.fit_to_view(initial=self._auto_fit)
+        self._initial_view_pending = False
+        self._sync_timer()
+        self.update()
+
+    def request_initial_view(self):
+        self._initial_view_pending = True
+        self._auto_fit = True
+
+    def fit_to_view(self, initial: bool = False):
+        """Center the map; the first view starts about 70% closer than fit."""
+        self._auto_fit = bool(initial)
+        if not self._render_nodes:
+            self.pan = QPointF(self.width() / 2.0, self.height() / 2.0)
+            self._rebuild_spatial()
+            self.update()
+            return
+        points = [self._project(i) for i in self._render_nodes]
+        min_x = min(point[0] for point in points)
+        max_x = max(point[0] for point in points)
+        min_y = min(point[1] for point in points)
+        max_y = max(point[1] for point in points)
+        span_x = max(1.0, max_x - min_x)
+        span_y = max(1.0, max_y - min_y)
+        fit_zoom = min(1.0, max(0.12, min((self.width() - 70) / span_x,
+                                          (self.height() - 70) / span_y)))
+        self.zoom = min(2.0, fit_zoom * (1.7 if initial else 1.0))
+        self.pan = QPointF(self.width() / 2.0 - (min_x + max_x) * self.zoom / 2.0,
+                           self.height() / 2.0 - (min_y + max_y) * self.zoom / 2.0)
+        self._rebuild_spatial()
+        self.update()
+
+    def set_forces(self, repel: int, link_length: int):
+        self._repel_factor = max(0.35, min(2.0, float(repel) / 42.0))
+        self._link_length = 150.0 + max(1, min(100, int(link_length))) * 2.2
+        self._reflow_positions()
+        self._rebuild_spatial()
+        self.fit_to_view()
+
+    def set_rotation(self, yaw: float, pitch: float):
+        self._yaw = float(yaw)
+        self._pitch = max(-1.25, min(1.25, float(pitch)))
+        self._rebuild_spatial()
+        self.update()
+
+    def _reflow_positions(self):
+        # Stable lobe clusters produce a brain-like cloud while parent edges
+        # remain available as neural connections. No depth lanes or rings.
+        lobes = ((-0.62, -0.10, 0.08), (-0.30, 0.18, -0.18),
+                 (0.28, 0.16, 0.16), (0.62, -0.08, -0.06),
+                 (-0.05, -0.36, 0.02), (0.05, 0.38, -0.10),
+                 (-0.45, 0.32, 0.12), (0.45, 0.30, -0.12),
+                 (-0.32, -0.34, -0.12), (0.32, -0.34, 0.10))
+        spread = max(0.55, min(1.6, self._repel_factor))
+        self._depths = [0.0] * len(self.records)
+        for index, record in enumerate(self.records):
+            if index == 0:
+                self.positions[index] = [0.0, 0.0, 0.0]
+                continue
+            lobe = lobes[record[5] % len(lobes)]
+            phase = index * 2.399963 + record[5] * 0.71
+            radius = 0.24 + 0.76 * ((index * 37) % 101) / 100.0
+            file_scale = 0.82 if record[6] else 1.0
+            x = (lobe[0] + math.cos(phase) * radius * 0.30 * spread) * 520.0 * file_scale
+            y = (lobe[1] + math.sin(phase) * radius * 0.38 * spread) * 360.0 * file_scale
+            z = (lobe[2] + math.sin(phase * 0.73) * radius * 0.34 * spread) * 330.0 * file_scale
+            self.positions[index] = [x, y, z]
+
+    def _rebuild_spatial(self):
+        self._spatial.clear()
+        self._screen_positions = {}
+        nodes = self._render_nodes
+        if not nodes:
+            self._bounds = None
+            return
+        cy, sy = math.cos(self._yaw), math.sin(self._yaw)
+        cp, sp = math.cos(self._pitch), math.sin(self._pitch)
+        pan_x, pan_y, zoom = self.pan.x(), self.pan.y(), self.zoom
+        positions, depths, grid = self.positions, self._depths, self._GRID_SIZE
+        spatial, screen = self._spatial, self._screen_positions
+        lo_x = lo_y = 1.0e18
+        hi_x = hi_y = -1.0e18
+        for index in nodes:
+            x, y, z = positions[index]
+            rz = -x * sy + z * cy
+            depths[index] = rz * cp + y * sp
+            px = pan_x + (x * cy + z * sy) * zoom
+            py = pan_y + (y * cp - rz * sp) * zoom
+            screen[index] = QPointF(px, py)
+            if px < lo_x: lo_x = px
+            if px > hi_x: hi_x = px
+            if py < lo_y: lo_y = py
+            if py > hi_y: hi_y = py
+            spatial.setdefault((int(px // grid), int(py // grid)), []).append(index)
+        lim = 1.0e5
+        lo_x, lo_y = max(-lim, lo_x), max(-lim, lo_y)
+        hi_x, hi_y = min(lim, hi_x), min(lim, hi_y)
+        # ball glow radius + node label to the right of it
+        self._bounds = (lo_x - 44.0, lo_y - 44.0,
+                        max(1.0, hi_x - lo_x) + 44.0 + 190.0, max(1.0, hi_y - lo_y) + 88.0)
+
+    def set_active(self, active: bool):
+        self._active = bool(active)
+        self._sync_timer()
+
+    def _sync_timer(self):
+        if self._active and _MOTION_ON and self.records:
+            if not self._timer.isActive():
+                self._timer.start()
+        else:
+            self._timer.stop()
+
+    def _project(self, index: int) -> tuple[float, float, float]:
+        x, y, z = self.positions[index]
+        cy, sy = math.cos(self._yaw), math.sin(self._yaw)
+        cp, sp = math.cos(self._pitch), math.sin(self._pitch)
+        rotated_x = x * cy + z * sy
+        rotated_z = -x * sy + z * cy
+        rotated_y = y * cp - rotated_z * sp
+        self._depths[index] = rotated_z * cp + y * sp
+        return rotated_x, rotated_y, self._depths[index]
+
+    def _screen_uncached(self, index: int) -> QPointF:
+        rotated_x, rotated_y, _depth = self._project(index)
+        return QPointF(self.pan.x() + rotated_x * self.zoom,
+                       self.pan.y() + rotated_y * self.zoom)
+
+    def _screen(self, index: int) -> QPointF:
+        point = self._screen_positions.get(index)
+        if point is not None:
+            return point
+        return self._screen_uncached(index)
+
+    def pan_to(self, point: QPointF):
+        self._auto_fit = False
+        self.pan = QPointF(point)
+        self._rebuild_spatial()
+        self.update()
+
+    def _step(self):
+        if not self.records or not _MOTION_ON:
+            self._timer.stop()
+            return
+        win = self.window()
+        if not self.isVisible() or (win is not None and win.isMinimized()):
+            return
+        self._yaw = (self._yaw + 0.0045) % math.tau
+        self._rebuild_spatial()
+        self.update()
+
+    def _hit(self, point: QPointF) -> int:
+        best, distance = -1, 16.0
+        cell_x, cell_y = int(point.x() // self._GRID_SIZE), int(point.y() // self._GRID_SIZE)
+        candidates = []
+        reach = max(1, int(24.0 / max(0.15, self.zoom) // self._GRID_SIZE) + 1)
+        for gx in range(cell_x - reach, cell_x + reach + 1):
+            for gy in range(cell_y - reach, cell_y + reach + 1):
+                candidates.extend(self._spatial.get((gx, gy), ()))
+        for i in candidates:
+            p = self._screen(i)
+            d = math.hypot(p.x() - point.x(), p.y() - point.y())
+            size = max(4.0, min(16.0, 4.0 + math.log1p(max(0, self.records[i][3]))))
+            if d <= size + 5 and d < distance:
+                best, distance = i, d
+        return best
+
+    def mousePressEvent(self, event):
+        self._drag_pos = event.position()
+        self._rotate_drag = event.button() == Qt.MouseButton.RightButton
+        if event.button() == Qt.MouseButton.LeftButton:
+            hit = self._hit(event.position())
+            if hit >= 0:
+                self.node_clicked.emit(hit, bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier))
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        hit = self._hit(event.position())
+        if hit >= 0:
+            self.node_double_clicked.emit(hit)
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and self._rotate_drag and event.buttons() & Qt.MouseButton.RightButton:
+            delta = event.position() - self._drag_pos
+            self._auto_fit = False
+            self._yaw += delta.x() * 0.008
+            self._pitch = max(-1.25, min(1.25, self._pitch + delta.y() * 0.008))
+            self._drag_pos = event.position()
+            self._rebuild_spatial()
+            self.update()
+        elif self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            delta = event.position() - self._drag_pos
+            self._auto_fit = False
+            self.pan += delta
+            self._drag_pos = event.position()
+            self._rebuild_spatial()
+            self.update()
+        hit = self._hit(event.position())
+        if hit != self.hovered:
+            self.hovered = hit
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        self._rotate_drag = False
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        old = self.zoom
+        self._auto_fit = False
+        self.zoom = max(1.0e-5, min(1.0e5,
+                                    old * (1.12 if event.angleDelta().y() > 0 else 0.89)))
+        cursor = event.position()
+        self.pan = cursor + (self.pan - cursor) * (self.zoom / old)
+        self._rebuild_spatial()
+        self.update()
+
+    # ── window-wide drawing ──────────────────────────────────────────────
+    def attach_overlay(self, overlay):
+        self._overlay = overlay
+
+    def content_bounds(self):
+        b = self._bounds
+        return None if b is None else QRectF(b[0], b[1], b[2], b[3])
+
+    def update(self, *args):                                    # noqa: A003
+        super().update(*args)
+        ov = getattr(self, "_overlay", None)
+        if ov is not None and ov.isVisible():
+            ov.refresh()
+
+    def resizeEvent(self, event):                               # noqa: N802
+        super().resizeEvent(event)
+        ov = getattr(self, "_overlay", None)
+        if ov is not None:
+            ov.invalidate()
+        self._queue_refit()
+
+    def showEvent(self, event):                                 # noqa: N802
+        super().showEvent(event)
+        self._queue_refit()
+
+    def _queue_refit(self):
+        # Records can arrive (from the cache) before the window is laid out, so the
+        # start view is re-applied, once per burst of events, until the user moves the map.
+        if self._auto_fit and self.records and not self._refit_queued:
+            self._refit_queued = True
+            QTimer.singleShot(0, self._auto_refit)
+
+    def _auto_refit(self):
+        self._refit_queued = False
+        if self._auto_fit and self.records and self.isVisible() and self.width() > 120:
+            self.fit_to_view(initial=True)
+
+    def moveEvent(self, event):                                 # noqa: N802
+        super().moveEvent(event)
+        ov = getattr(self, "_overlay", None)
+        if ov is not None:
+            ov.invalidate()
+
+    def _color(self, color: str, alpha: int):
+        key = (color, alpha)
+        c = self._color_cache.get(key)
+        if c is None:
+            if len(self._color_cache) > 256:
+                self._color_cache.clear()
+            c = self._color_cache[key] = qcol(color, alpha)
+        return c
+
+    def _pen(self, color: str, alpha: int, width: float):
+        key = (color, alpha, width)
+        pen = self._pen_cache.get(key)
+        if pen is None:
+            if len(self._pen_cache) > 256:
+                self._pen_cache.clear()
+            pen = self._pen_cache[key] = QPen(self._color(color, alpha), width)
+        return pen
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), qcol("#000000"))
+        if not self.records:
+            p.setPen(qcol(C.TEXT_DIM))
+            p.setFont(QFont("Courier New", 9))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Select a drive to map its files")
+        else:
+            ov = getattr(self, "_overlay", None)
+            if ov is None or not ov.isVisible():
+                # standalone fallback: draw inside the canvas itself
+                self.paint_map(p, QRectF(self.rect()))
+        p.end()
+
+    def paint_map(self, p: QPainter, view_rect: QRectF):
+        """Draw the neural map. `view_rect` is the part of canvas space that is
+        actually on screen (for the window-wide layer: the dirty region of the
+        whole AURA window), so nothing is clipped at the canvas edge."""
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, len(self._render_nodes) <= 700)
+        # Margin >= the biggest ball (glow included) so balls never pop at the edge.
+        left, top = view_rect.left() - 40.0, view_rect.top() - 40.0
+        right, bottom = view_rect.right() + 40.0, view_rect.bottom() + 40.0
+        records, visible, screen = self.records, self.visible, self._screen
+        filtered, path_nodes = self.filtered, self.path_nodes
+        cats = _NEURAL_CATEGORIES
+        n_cat = len(cats)
+
+        edge_count = 0
+        for i in self._render_nodes:
+            record = records[i]
+            parent = record[0]
+            if parent < 0 or parent not in visible:
+                continue
+            if edge_count >= self._MAX_RENDER_EDGES:
+                break
+            a_pos, b_pos = screen(i), screen(parent)
+            ax, ay, bx, by = a_pos.x(), a_pos.y(), b_pos.x(), b_pos.y()
+            # keep every line that crosses the visible area, even if both ends are off-screen
+            if (ax < left and bx < left) or (ax > right and bx > right) \
+                    or (ay < top and by < top) or (ay > bottom and by > bottom):
+                continue
+            highlighted = i in path_nodes and parent in path_nodes
+            a = 150 if highlighted else (38 if filtered is not None and i not in filtered else 78)
+            edge_color = C.PRI if highlighted else cats[record[5] if record[5] < n_cat else 9][2]
+            p.setPen(self._pen(edge_color, a, 1.5 if highlighted else 1.0))
+            p.drawLine(a_pos, b_pos)
+            edge_count += 1
+
+        top_cat = _NEURAL_CAT_INDEX["top"]
+        selected, secondary, hovered, zoom = self.selected, self.secondary, self.hovered, self.zoom
+        if self._label_font is None:
+            self._label_font = QFont("Courier New", 7)
+        for i in self._render_nodes:
+            pos = screen(i)
+            x, y = pos.x(), pos.y()
+            if x < left or x > right or y < top or y > bottom:
+                continue
+            record = records[i]
+            cat = record[5] if record[5] < n_cat else 9
+            color = cats[cat][2]
+            dim = filtered is not None and i not in filtered
+            highlighted = i in path_nodes
+            radius = 7.0 if record[6] else 4.0
+            radius += min(8.0, math.log1p(max(0, record[3])) * 0.35)
+            if i == selected or i == secondary or i == hovered:
+                radius += 3
+            fill = C.PRI if highlighted else color
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self._color(fill, 90 if dim else 230))
+            p.drawEllipse(pos, radius * 2.1, radius * 2.1)
+            p.setBrush(self._color(fill, 80 if dim else 245))
+            p.drawEllipse(pos, radius, radius)
+            if i in (0, selected, hovered) or (record[5] == top_cat and zoom > 0.55):
+                p.setPen(self._color(C.TEXT, 150 if not dim else 45))
+                p.setFont(self._label_font)
+                p.drawText(pos + QPointF(radius + 4, 3), record[1][:28])
+
+
+class _NeuralMapOverlay(QWidget):
+    """Transparent, mouse-transparent layer spanning the whole AURA window.
+
+    The map is drawn here instead of inside the canvas widget, so the only
+    boundary left is the window itself. The canvas keeps all the input and
+    state; the neural HUD widgets (control panel, legend, drive tray, orb,
+    buttons) are cut out so the map never paints over them. Only the dirty
+    rectangle around the node cloud is repainted, which keeps the cost low."""
+
+    def __init__(self, host: QWidget, view):
+        super().__init__(host)
+        self._host = host
+        self._view = view
+        self._last = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setGeometry(host.rect())
+        host.installEventFilter(self)
+        self.hide()
+
+    def eventFilter(self, obj, event):                          # noqa: N802
+        if obj is self._host and event.type() == QEvent.Type.Resize:
+            self.setGeometry(self._host.rect())
+            self._last = None
+        return False
+
+    def invalidate(self):
+        self._last = None
+        if self.isVisible():
+            self.update()
+
+    def showEvent(self, event):                                 # noqa: N802
+        super().showEvent(event)
+        self._view._orb._status_external = True
+        self._view._orb.update()
+
+    def hideEvent(self, event):                                 # noqa: N802
+        super().hideEvent(event)
+        self._view._orb._status_external = False
+        self._view._orb.update()
+
+    def refresh_status(self):
+        orb = self._view._orb
+        if self.isVisible() and orb.isVisible():
+            self.update(orb.status_rect().translated(orb.mapTo(self._host, QPoint(0, 0))))
+
+    def refresh(self):
+        canvas = self._view._canvas
+        bounds = canvas.content_bounds()
+        if bounds is None:
+            self._last = None
+            self.update()
+            return
+        off = canvas.mapTo(self._host, QPoint(0, 0))
+        now = bounds.translated(off.x(), off.y())
+        dirty = now if self._last is None else now.united(self._last)
+        self._last = now
+        self.update(dirty.toAlignedRect().intersected(self.rect()))
+
+    def paintEvent(self, event):                                # noqa: N802
+        view = self._view
+        canvas = view._canvas
+        if not canvas.records or not view.isVisible():
+            return
+        from PyQt6.QtGui import QRegion as _NmRegion
+        p = QPainter(self)
+        hole = _NmRegion()
+        for w in view.hud_widgets():
+            if w.isVisible():
+                origin = w.mapTo(self._host, QPoint(0, 0))
+                shape = w.hole_region() if hasattr(w, "hole_region") else _NmRegion(QRect(QPoint(0, 0), w.size()))
+                hole = hole.united(shape.translated(origin))
+        p.setClipRegion(_NmRegion(event.rect()).subtracted(hole))
+        off = canvas.mapTo(self._host, QPoint(0, 0))
+        p.translate(off.x(), off.y())
+        canvas.paint_map(p, QRectF(event.rect()).translated(-off.x(), -off.y()))
+        orb = view._orb
+        if orb.isVisible():
+            p.resetTransform()
+            origin = orb.mapTo(self._host, QPoint(0, 0))
+            if event.rect().intersects(orb.status_rect().translated(origin)):
+                orb.paint_status(p, origin)
+        p.end()
+
+class _NeuralOrb(QWidget):
+    def __init__(self, hud: HudCanvas, name: str, parent=None):
+        super().__init__(parent)
+        self.hud = hud
+        self.name = name
+        self._angle = 0.0
+        self._status_external = False
+        self._last_state = ""
+        self.setMinimumSize(142, 168)
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    def hole_region(self):
+        """Footprint of what the orb really paints (disc + tick ring + status
+        line), so the map layer is only cut out there, not around a whole square."""
+        from PyQt6.QtGui import QRegion
+        cx = self.width() / 2.0
+        r = min(62.0, max(42.0, self.width() * 0.39)) + 14.0
+        return QRegion(QRect(int(cx - r), int(74 - r), int(2 * r), int(2 * r)),
+                       QRegion.RegionType.Ellipse)
+
+    def _state(self) -> str:
+        return "MUTED" if self.hud.muted else "SPEAKING" if self.hud.speaking else "ONLINE"
+
+    def status_rect(self) -> QRect:
+        return QRect(int(self.width() / 2.0 - 70), 146, 140, 20)
+
+    def paint_status(self, p: QPainter, origin: QPoint):
+        """Status line ("● ONLINE"), drawn by the map layer so it sits on top of the
+        balls with no box behind it."""
+        state = self._state()
+        p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        p.setPen(qcol(C.GREEN if state == "ONLINE" else C.PRI, 210))
+        p.drawText(QRectF(origin.x(), origin.y() + 148, self.width(), 16),
+                   Qt.AlignmentFlag.AlignCenter, f"● {state}")
+
+    def _tick(self):
+        if _MOTION_ON:
+            self._angle = (self._angle + 1.2) % 360
+        if self._status_external:
+            state = self._state()
+            if state != self._last_state:
+                self._last_state = state
+                ov = getattr(self.parentWidget(), "_overlay", None)
+                if ov is not None:
+                    ov.refresh_status()
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx, cy = self.width() / 2.0, 74.0
+        r = min(62.0, max(42.0, self.width() * 0.39))
+        p.setPen(QPen(qcol(C.PRI, 32), 1))
+        p.setBrush(qcol("#061117", 220))
+        p.drawEllipse(QPointF(cx, cy), r + 10, r + 10)
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(self._angle)
+        p.setPen(QPen(qcol("#38bdf8", 150), 2))
+        p.drawArc(QRectF(-r - 7, -r - 7, (r + 7) * 2, (r + 7) * 2), 20 * 16, 110 * 16)
+        p.restore()
+        p.setPen(QPen(qcol("#38bdf8", 135), 1))
+        for deg in range(0, 360, 10):
+            rad = math.radians(deg)
+            p.drawLine(QPointF(cx + (r + 8) * math.cos(rad), cy + (r + 8) * math.sin(rad)),
+                       QPointF(cx + (r + 13) * math.cos(rad), cy + (r + 13) * math.sin(rad)))
+        self.hud._draw_orb(p, cx, cy, r * 2.0)
+        p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        p.setPen(qcol(C.WHITE, 220))
+        p.drawText(QRectF(0, cy - 5, self.width(), 18), Qt.AlignmentFlag.AlignCenter, self.name)
+        if not self._status_external:
+            state = self._state()
+            p.setPen(qcol(C.GREEN if state == "ONLINE" else C.PRI, 210))
+            p.drawText(QRectF(0, 148, self.width(), 16), Qt.AlignmentFlag.AlignCenter, f"● {state}")
+
+
+# ── Neural map: futuristic HUD chrome (scoped styling, chamfered frames) ─────────────
+from PyQt6.QtGui import (QPolygonF as _NmPolygonF, QLinearGradient as _NmGrad,
+                         QPainterPath as _NmPath, QPen as _NmPen,
+                         QColor as _NmColor, QPainter as _NmPainter)
+
+
+def _nm_rgba(hex_color: str, alpha: int) -> str:
+    c = _NmColor(hex_color)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{alpha})"
+
+
+def _nm_color(hex_color: str, alpha: int = 255) -> "_NmColor":
+    c = _NmColor(hex_color)
+    c.setAlpha(alpha)
+    return c
+
+
+class _NmFrame(_MoPanel):
+    """Glass HUD frame: chamfered corners, accent edge lights, corner ticks.
+    Painted by hand so child widgets never inherit a border or background."""
+
+    def __init__(self, parent=None, cut: int = 14):
+        super().__init__(parent)
+        self._cut = cut
+
+    def paintEvent(self, _event):                       # noqa: N802
+        p = _NmPainter(self)
+        p.setRenderHint(_NmPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        c = float(self._cut)
+        path = _NmPath()
+        path.moveTo(r.left() + c, r.top())
+        path.lineTo(r.right(), r.top())
+        path.lineTo(r.right(), r.bottom() - c)
+        path.lineTo(r.right() - c, r.bottom())
+        path.lineTo(r.left(), r.bottom())
+        path.lineTo(r.left(), r.top() + c)
+        path.closeSubpath()
+
+        body = _NmGrad(r.topLeft(), r.bottomLeft())
+        body.setColorAt(0.0, QColor(11, 19, 25, 244))
+        body.setColorAt(1.0, QColor(3, 7, 10, 250))
+        p.fillPath(path, body)
+
+        glow = _NmGrad(r.topLeft(), QPointF(r.left(), r.top() + 90))
+        glow.setColorAt(0.0, _nm_color(C.PRI, 42))
+        glow.setColorAt(1.0, _nm_color(C.PRI, 0))
+        p.fillPath(path, glow)
+
+        p.setPen(_NmPen(_nm_color(C.BORDER_A, 210), 1.0))
+        p.drawPath(path)
+
+        pri = _NmPen(_nm_color(C.PRI), 2.0)
+        pri.setCapStyle(Qt.PenCapStyle.FlatCap)
+        p.setPen(pri)
+        p.drawLine(QPointF(r.left(), r.top() + c), QPointF(r.left() + c, r.top()))
+        p.drawLine(QPointF(r.right(), r.bottom() - c), QPointF(r.right() - c, r.bottom()))
+        p.drawLine(QPointF(r.left() + c + 10, r.top()), QPointF(r.left() + c + 58, r.top()))
+        p.drawLine(QPointF(r.right() - c - 58, r.bottom()), QPointF(r.right() - c - 10, r.bottom()))
+
+        p.setPen(_NmPen(_nm_color(C.PRI, 150), 1.0))
+        t = 6.0
+        p.drawLine(QPointF(r.right() - t, r.top()), QPointF(r.right(), r.top()))
+        p.drawLine(QPointF(r.right(), r.top()), QPointF(r.right(), r.top() + t))
+        p.drawLine(QPointF(r.left(), r.bottom() - t), QPointF(r.left(), r.bottom()))
+        p.drawLine(QPointF(r.left(), r.bottom()), QPointF(r.left() + t, r.bottom()))
+        p.end()
+
+
+class _NmCombo(QComboBox):
+    """Combo box with a drawn chevron (a styled drop-down loses its native arrow)."""
+
+    def paintEvent(self, event):                        # noqa: N802
+        super().paintEvent(event)
+        p = _NmPainter(self)
+        p.setRenderHint(_NmPainter.RenderHint.Antialiasing, True)
+        pen = _NmPen(_nm_color(C.PRI), 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        cx, cy = self.width() - 14.0, self.height() / 2.0
+        p.drawPolyline(_NmPolygonF([QPointF(cx - 4, cy - 2), QPointF(cx, cy + 2.5),
+                                    QPointF(cx + 4, cy - 2)]))
+        p.end()
+
+
+def _neural_qss() -> str:
+    pri, dim = C.PRI, C.BORDER_A
+    mono = '"Courier New"'
+    return f"""
+#nmRoot {{ background: #000000; }}
+#nmRoot QLabel {{ background: transparent; border: 0; color: {C.TEXT_MED};
+    font-family: {mono}; font-size: 8pt; }}
+#nmRoot QLabel#nmTitle {{ color: {pri}; }}
+#nmRoot QLabel#nmDot {{ background: {pri}; border-radius: 4px; }}
+#nmRoot QLabel#nmBar {{ background: {pri}; border-radius: 1px; }}
+#nmRoot QLabel#nmSection {{ color: {C.TEXT_MED}; }}
+#nmRoot QLabel#nmHint {{ color: {C.TEXT_DIM}; font-size: 7pt; }}
+#nmRoot QLabel#nmRowLabel {{ color: {C.TEXT}; }}
+#nmRoot QLabel#nmRowValue {{ color: {pri}; font-weight: bold; }}
+#nmRoot QLabel#nmStats {{ color: {C.TEXT_DIM}; font-size: 7pt;
+    background: {_nm_rgba('#000000', 130)}; border: 1px solid {C.BORDER};
+    border-radius: 3px; padding: 4px 6px; }}
+#nmRoot QLabel#nmInspector {{ color: {C.TEXT_MED}; background: {_nm_rgba(pri, 18)};
+    border: 0; border-left: 2px solid {pri}; border-radius: 3px; padding: 8px 10px; }}
+#nmRoot QLabel#nmProgress {{ color: {pri}; font-size: 7pt; }}
+
+#nmRoot QPushButton {{ font-family: {mono}; font-size: 8pt; font-weight: bold;
+    color: {pri}; background: {_nm_rgba(pri, 16)}; border: 1px solid {dim};
+    border-radius: 4px; padding: 6px 10px; }}
+#nmRoot QPushButton:hover {{ background: {_nm_rgba(pri, 46)}; border-color: {pri}; color: {C.WHITE}; }}
+#nmRoot QPushButton:pressed {{ background: {_nm_rgba(pri, 80)}; }}
+#nmRoot QPushButton:disabled {{ color: {C.TEXT_DIM}; border-color: {C.BORDER};
+    background: transparent; }}
+#nmRoot QPushButton#nmPrimary {{ color: #060a0d; background: {pri}; border: 1px solid {pri}; }}
+#nmRoot QPushButton#nmPrimary:hover {{ background: {C.WHITE}; border-color: {C.WHITE}; color: #060a0d; }}
+#nmRoot QPushButton#nmPrimary:pressed {{ background: {C.TEXT_MED}; }}
+#nmRoot QPushButton#nmPrimary:disabled {{ color: {C.TEXT_DIM}; background: {_nm_rgba(pri, 10)};
+    border: 1px solid {C.BORDER}; }}
+#nmRoot QPushButton#nmGhost {{ color: {C.TEXT_MED}; background: transparent; border: 0;
+    text-align: left; padding: 3px 2px; }}
+#nmRoot QPushButton#nmGhost:hover {{ color: {pri}; background: transparent; }}
+#nmRoot QPushButton#nmTrayHead {{ color: {pri}; background: transparent; border: 0;
+    text-align: left; padding: 2px 0; font-size: 9pt; }}
+#nmRoot QPushButton#nmTrayHead:hover {{ color: {C.WHITE}; background: transparent; }}
+#nmRoot QPushButton#nmChip {{ background: transparent; border: 0; border-radius: 3px;
+    text-align: left; padding: 4px 6px; font-weight: normal; }}
+#nmRoot QPushButton#nmChip:hover {{ background: {_nm_rgba('#ffffff', 20)}; }}
+#nmRoot QPushButton#nmTool {{ padding: 0; font-size: 9pt; color: {pri};
+    background: {_nm_rgba('#05090c', 235)}; border: 1px solid {dim}; border-radius: 4px; }}
+#nmRoot QPushButton#nmTool:hover {{ background: {_nm_rgba(pri, 60)}; border-color: {pri}; color: {C.WHITE}; }}
+
+#nmRoot QLineEdit {{ background: {_nm_rgba('#000000', 150)}; color: {C.TEXT};
+    border: 1px solid {dim}; border-radius: 4px; padding: 6px 8px;
+    font-family: {mono}; font-size: 8pt; selection-background-color: {pri}; selection-color: #000; }}
+#nmRoot QLineEdit:focus {{ border: 1px solid {pri}; background: {_nm_rgba(pri, 14)}; }}
+
+#nmRoot QComboBox {{ background: {_nm_rgba('#000000', 150)}; color: {C.TEXT};
+    border: 1px solid {dim}; border-radius: 4px; padding: 5px 30px 5px 8px;
+    font-family: {mono}; font-size: 8pt; font-weight: bold; }}
+#nmRoot QComboBox:hover, #nmRoot QComboBox:on {{ border-color: {pri}; }}
+#nmRoot QComboBox::drop-down {{ border: 0; width: 26px; }}
+#nmRoot QComboBox::down-arrow {{ image: none; width: 0; height: 0; }}
+#nmRoot QComboBox QAbstractItemView {{ background: #070d12; color: {C.TEXT};
+    border: 1px solid {pri}; outline: 0; padding: 2px; font-family: {mono};
+    selection-background-color: {_nm_rgba(pri, 80)}; selection-color: {C.WHITE}; }}
+
+#nmRoot QSlider::groove:horizontal {{ height: 4px; background: {_nm_rgba(pri, 46)}; border-radius: 2px; }}
+#nmRoot QSlider::sub-page:horizontal {{ background: {pri}; border-radius: 2px; }}
+#nmRoot QSlider::handle:horizontal {{ width: 8px; height: 8px; margin: -5px 0;
+    background: #070d12; border: 2px solid {pri}; border-radius: 6px; }}
+#nmRoot QSlider::handle:horizontal:hover {{ background: {pri}; }}
+
+#nmRoot QCheckBox {{ color: {C.TEXT_MED}; spacing: 8px; font-family: {mono}; font-size: 8pt; }}
+#nmRoot QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid {dim};
+    border-radius: 3px; background: {_nm_rgba('#000000', 150)}; }}
+#nmRoot QCheckBox::indicator:hover {{ border-color: {pri}; }}
+#nmRoot QCheckBox::indicator:checked {{ border-color: {pri};
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+        stop:0 {pri}, stop:0.5 {pri}, stop:0.56 {_nm_rgba('#000000', 150)},
+        stop:1 {_nm_rgba('#000000', 150)}); }}
+
+#nmRoot QScrollArea {{ background: transparent; border: 0; }}
+#nmRoot QWidget#nmInner {{ background: transparent; }}
+#nmRoot QScrollBar:vertical {{ background: transparent; width: 6px; margin: 2px 0; }}
+#nmRoot QScrollBar::handle:vertical {{ background: {_nm_rgba(pri, 110)}; border-radius: 3px; min-height: 28px; }}
+#nmRoot QScrollBar::handle:vertical:hover {{ background: {pri}; }}
+#nmRoot QScrollBar::add-line:vertical, #nmRoot QScrollBar::sub-line:vertical {{ height: 0; }}
+#nmRoot QScrollBar::add-page:vertical, #nmRoot QScrollBar::sub-page:vertical {{ background: transparent; }}
+"""
+
+
+class NeuralMapView(QWidget):
+    mode_back = pyqtSignal()
+
+    def __init__(self, hud: HudCanvas, assistant_name: str, drive: str = "", parent=None):
+        super().__init__(parent)
+        self.hud = hud
+        self._assistant_name = assistant_name
+        self._worker = None
+        self._records: list[tuple] = []
+        self._selected = -1
+        self._secondary = -1
+        self._drive = drive or _neural_drives()[0]
+        self._map_root = self._drive
+        self._map_history: list[str] = []
+        self._map_depth = 3
+        self._scan_generation = 0
+        self.setObjectName("nmRoot")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._qss_cache = ""
+        self._overlay = None
+        self._canvas = _NeuralMapCanvas(self)
+        self._orb = _NeuralOrb(hud, assistant_name, self)
+
+        # ── control panel: fixed header + scrolling body (never squashes rows) ──
+        self._panel = _NmFrame(self, cut=16)
+        outer = QVBoxLayout(self._panel)
+        outer.setContentsMargins(16, 16, 8, 18)
+        outer.setSpacing(8)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 8, 0)
+        head.setSpacing(8)
+        dot = QLabel()
+        dot.setObjectName("nmDot")
+        dot.setFixedSize(8, 8)
+        title = QLabel("NEURAL MAP")
+        title.setObjectName("nmTitle")
+        title_font = QFont("Courier New", 12, QFont.Weight.Bold)
+        title_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
+        title.setFont(title_font)
+        head.addWidget(dot)
+        head.addWidget(title)
+        head.addStretch(1)
+        outer.addLayout(head)
+        self._stats = QLabel("0 folders · 0 files · ready")
+        self._stats.setObjectName("nmStats")
+        self._stats.setWordWrap(True)
+        stats_wrap = QHBoxLayout()
+        stats_wrap.setContentsMargins(0, 0, 8, 0)
+        stats_wrap.addWidget(self._stats)
+        outer.addLayout(stats_wrap)
+
+        scroll = QScrollArea(self._panel)
+        scroll.setObjectName("nmScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        inner = QWidget()
+        inner.setObjectName("nmInner")
+        inner.setAutoFillBackground(False)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 2, 8, 0)
+        lay.setSpacing(8)
+
+        back = QPushButton("←  STANDARD")
+        back.setObjectName("nmGhost")
+        back.setCursor(Qt.CursorShape.PointingHandCursor)
+        back.clicked.connect(self.mode_back.emit)
+        lay.addWidget(back)
+        self._map_back = QPushButton("←  PREVIOUS MAP")
+        self._map_back.setObjectName("nmGhost")
+        self._map_back.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._map_back.clicked.connect(self._go_back_map)
+        self._map_back.hide()
+        lay.addWidget(self._map_back)
+
+        # Kept (hidden) because MainWindow persists the drive through _drive_box.
+        self._drive_box = _NmCombo()
+        self._drive_box.addItems(_neural_drives())
+        self._drive_box.setCurrentText(self._drive)
+        self._drive_box.currentTextChanged.connect(self._drive_changed)
+        lay.addWidget(self._drive_box)
+        row = QHBoxLayout()
+        self._rescan = QPushButton("RESCAN")
+        self._rescan.clicked.connect(self.scan)
+        self._cancel = QPushButton("CANCEL")
+        self._cancel.clicked.connect(self.cancel_scan)
+        row.addWidget(self._rescan)
+        row.addWidget(self._cancel)
+        lay.addLayout(row)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search the drive...")
+        self._search.setClearButtonEnabled(True)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
+        self._search_timer.timeout.connect(lambda: self._search_changed(self._search.text()))
+        self._search.textChanged.connect(lambda _text: self._search_timer.start())
+        lay.addWidget(self._search)
+
+        self._nm_section(lay, "INSPECTOR")
+        self._inspector = QLabel("Click a node to focus it.")
+        self._inspector.setObjectName("nmInspector")
+        self._inspector.setTextFormat(Qt.TextFormat.RichText)
+        self._inspector.setWordWrap(True)
+        self._inspector.setMinimumHeight(64)
+        self._inspector.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(self._inspector)
+        self._open_button = QPushButton("OPEN IN EXPLORER")
+        self._open_button.setObjectName("nmPrimary")
+        self._open_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._open_button.setEnabled(False)
+        self._open_button.setToolTip("Open the folder currently used as the neural-map root")
+        self._open_button.clicked.connect(self.open_selected)
+        lay.addWidget(self._open_button)
+
+        self._nm_section(lay, "TOP HUBS")
+        self._hubs = QVBoxLayout()
+        self._hubs.setSpacing(0)
+        lay.addLayout(self._hubs)
+
+        self._nm_section(lay, "FORCES")
+        self._repel = QSlider(Qt.Orientation.Horizontal)
+        self._repel.setRange(1, 100)
+        self._repel.setValue(42)
+        self._link = QSlider(Qt.Orientation.Horizontal)
+        self._link.setRange(1, 100)
+        self._link.setValue(50)
+        self._nm_slider_row(lay, "Repel", self._repel)
+        self._nm_slider_row(lay, "Link length", self._link)
+        self._repel.valueChanged.connect(
+            lambda value: self._canvas.set_forces(value, self._link.value()))
+        self._link.valueChanged.connect(
+            lambda value: self._canvas.set_forces(self._repel.value(), value))
+
+        self._nm_section(lay, "ROTATION", "right-drag the map")
+        self._yaw_slider = QSlider(Qt.Orientation.Horizontal)
+        self._yaw_slider.setRange(-180, 180)
+        self._pitch_slider = QSlider(Qt.Orientation.Horizontal)
+        self._pitch_slider.setRange(-90, 90)
+        self._nm_slider_row(lay, "Transverse", self._yaw_slider, "{}°")
+        self._nm_slider_row(lay, "Longitudinal", self._pitch_slider, "{}°")
+        self._yaw_slider.valueChanged.connect(
+            lambda value: self._canvas.set_rotation(math.radians(value),
+                                                    math.radians(self._pitch_slider.value())))
+        self._pitch_slider.valueChanged.connect(
+            lambda value: self._canvas.set_rotation(math.radians(self._yaw_slider.value()),
+                                                    math.radians(value)))
+
+        self._nm_section(lay, "DISPLAY")
+        self._include_system = QCheckBox("Include system folders")
+        self._include_system.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._include_system.toggled.connect(lambda _checked: self.scan())
+        lay.addWidget(self._include_system)
+        self._progress = QLabel("")
+        self._progress.setObjectName("nmProgress")
+        lay.addWidget(self._progress)
+        lay.addStretch(1)
+        self._canvas.node_clicked.connect(self._node_clicked)
+        self._canvas.node_double_clicked.connect(self._node_double_clicked)
+
+        # ── filter legend ────────────────────────────────────────────────
+        self._legend = _NmFrame(self, cut=12)
+        legend_lay = QVBoxLayout(self._legend)
+        legend_lay.setContentsMargins(14, 14, 10, 16)
+        legend_lay.setSpacing(1)
+        self._nm_section(legend_lay, "FILTER")
+        self._legend_buttons = []
+        for cat_id, label, color in _NEURAL_CATEGORIES:
+            button = QPushButton(f"●  {label}")
+            button.setObjectName("nmChip")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(f"color: {color};")
+            button.clicked.connect(lambda _checked=False, c=cat_id: self._filter_category(c))
+            legend_lay.addWidget(button)
+            self._legend_buttons.append((button, cat_id, label))
+
+        # ── floating tools ───────────────────────────────────────────────
+        self._panel_toggle = QPushButton("«", self)
+        self._panel_toggle.setObjectName("nmTool")
+        self._panel_toggle.setFixedSize(26, 26)
+        self._panel_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._panel_toggle.clicked.connect(self._toggle_panel)
+        self._fit_button = QPushButton("FIT", self)
+        self._fit_button.setObjectName("nmTool")
+        self._fit_button.setFixedSize(52, 26)
+        self._fit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._fit_button.clicked.connect(self._canvas.fit_to_view)
+        self._drive_box.hide()
+        self._rescan.hide()
+        self._cancel.hide()
+
+        # ── drive tray ───────────────────────────────────────────────────
+        self._drive_tray = _NmFrame(self, cut=10)
+        tray_lay = QVBoxLayout(self._drive_tray)
+        tray_lay.setContentsMargins(14, 11, 14, 14)
+        tray_lay.setSpacing(8)
+        self._drive_tray_toggle = QPushButton("DRIVES  ˄")
+        self._drive_tray_toggle.setObjectName("nmTrayHead")
+        self._drive_tray_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._drive_tray_toggle.clicked.connect(self._toggle_drive_tray)
+        tray_lay.addWidget(self._drive_tray_toggle)
+        self._drive_tray_body = QWidget(self._drive_tray)
+        body_lay = QVBoxLayout(self._drive_tray_body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(8)
+        self._tray_drive_box = _NmCombo()
+        self._tray_drive_box.addItems(_neural_drives())
+        self._tray_drive_box.setCurrentText(self._drive)
+        self._tray_drive_box.currentTextChanged.connect(self._drive_changed)
+        body_lay.addWidget(self._tray_drive_box)
+        tray_buttons = QHBoxLayout()
+        tray_buttons.setSpacing(6)
+        tray_rescan = QPushButton("RESCAN")
+        tray_rescan.setObjectName("nmPrimary")
+        tray_rescan.setCursor(Qt.CursorShape.PointingHandCursor)
+        tray_rescan.clicked.connect(self.scan)
+        tray_cancel = QPushButton("CANCEL")
+        tray_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        tray_cancel.clicked.connect(self.cancel_scan)
+        tray_buttons.addWidget(tray_rescan)
+        tray_buttons.addWidget(tray_cancel)
+        body_lay.addLayout(tray_buttons)
+        tray_lay.addWidget(self._drive_tray_body)
+        self._apply_theme()
+        self._panel.show()
+        self._legend.show()
+        self._drive_tray.show()
+        self.scan()
+
+    # ── HUD chrome helpers ───────────────────────────────────────────────
+    def _apply_theme(self):
+        qss = _neural_qss()
+        if qss != self._qss_cache:
+            self._qss_cache = qss
+            self.setStyleSheet(qss)
+        for frame in (self._panel, self._legend, self._drive_tray):
+            frame.update()
+
+    def _nm_section(self, layout, text: str, hint: str = ""):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 6, 0, 0)
+        row.setSpacing(7)
+        bar = QLabel()
+        bar.setObjectName("nmBar")
+        bar.setFixedSize(3, 11)
+        label = QLabel(text)
+        label.setObjectName("nmSection")
+        font = QFont("Courier New", 8, QFont.Weight.Bold)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
+        label.setFont(font)
+        row.addWidget(bar)
+        row.addWidget(label)
+        if hint:
+            note = QLabel(hint)
+            note.setObjectName("nmHint")
+            row.addWidget(note)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+    def _nm_slider_row(self, layout, title: str, slider, fmt: str = "{}"):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        name = QLabel(title)
+        name.setObjectName("nmRowLabel")
+        value = QLabel(fmt.format(slider.value()))
+        value.setObjectName("nmRowValue")
+        row.addWidget(name)
+        row.addStretch(1)
+        row.addWidget(value)
+        layout.addLayout(row)
+        slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout.addWidget(slider)
+        slider.valueChanged.connect(lambda v, lab=value, f=fmt: lab.setText(f.format(v)))
+
+    def hud_widgets(self):
+        return (self._panel, self._legend, self._drive_tray, self._orb,
+                self._panel_toggle, self._fit_button)
+
+    def attach_overlay(self, overlay):
+        """Hand the map over to a window-wide layer (see _NeuralMapOverlay)."""
+        self._overlay = overlay
+        self._canvas.attach_overlay(overlay)
+        overlay.setVisible(self.isVisible())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._overlay is not None:
+            self._overlay.show()
+            self._overlay.invalidate()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if self._overlay is not None:
+            self._overlay.hide()
+
+    def resizeEvent(self, event):
+        self._layout_overlays()
+        super().resizeEvent(event)
+
+    def _layout_overlays(self):
+        w, h = self.width(), self.height()
+        panel_w = min(228, max(190, int(w * 0.24))) if self._panel.isVisible() else 0
+        weather = getattr(self.window(), "_weather_widget", None)
+        panel_y = 10
+        if weather is not None and weather.isVisible():
+            try:
+                below = weather.mapToGlobal(QPoint(0, weather.height() + 8))
+                panel_y = max(10, self.mapFromGlobal(below).y())
+            except Exception:
+                pass
+        panel_h = min(640, max(120, h - panel_y - 10))
+        self._panel.setGeometry(10, panel_y + (16 if panel_w else 0), panel_w, max(120, panel_h - (16 if panel_w else 0)))
+        self._canvas.setGeometry(panel_w + 18, 0, max(1, w - panel_w - 18), h)
+        self._orb.setGeometry(max(panel_w + 20, w - 190), max(10, h - 190), 180, 180)
+        legend_h = max(150, self._legend.sizeHint().height())
+        self._legend.setGeometry(max(panel_w + 28, w - 178), 12, 166, legend_h)
+        self._panel_toggle.move(10 if panel_w else 12, 10)
+        self._panel_toggle.raise_()
+        self._panel_toggle.setText("«" if panel_w else "»")
+        self._fit_button.move(max(panel_w + 26, (w - self._fit_button.width()) // 2), 10)
+        tray_w = 200
+        tray_x = panel_w + 26
+        tray_y = panel_y
+        tray_x = max(panel_w + 18, min(tray_x, max(panel_w + 18, w - tray_w - 8)))
+        tray_y = max(42, min(tray_y, max(42, h - self._drive_tray.height() - 8)))
+        self._drive_tray.setGeometry(tray_x, tray_y, tray_w, self._drive_tray.sizeHint().height())
+        main = self.window()
+        if getattr(main, "_notification_panel", None) is not None:
+            QTimer.singleShot(0, main._position_notification_panel)
+
+    def _toggle_panel(self):
+        self._panel.setVisible(not self._panel.isVisible())
+        self._layout_overlays()
+        self._canvas.update()
+
+    def _toggle_drive_tray(self):
+        expanded = not self._drive_tray_body.isVisible()
+        self._drive_tray_body.setVisible(expanded)
+        self._drive_tray_toggle.setText("DRIVES  ˄" if expanded else "DRIVES  ˅")
+        self._layout_overlays()
+
+    def set_active(self, active: bool):
+        if active:
+            self._apply_theme()
+            self._canvas.request_initial_view()
+            if self._canvas.records:
+                self._canvas.fit_to_view(initial=True)
+        self._canvas.set_active(active)
+        if not active:
+            self.cancel_scan()
+
+    def cancel_scan(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+
+    def _drive_changed(self, drive: str):
+        self._drive = drive
+        self._map_root = drive
+        self._map_history.clear()
+        self._map_back.hide()
+        for box in (self._drive_box, self._tray_drive_box):
+            if box.currentText() != drive:
+                box.blockSignals(True)
+                box.setCurrentText(drive)
+                box.blockSignals(False)
+        self.scan()
+
+    def scan(self):
+        self.cancel_scan()
+        self._canvas.request_initial_view()
+        self._scan_generation += 1
+        generation = self._scan_generation
+        cached = _neural_cache_path(self._map_root)
+        try:
+            data = json.loads(cached.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
+                self._apply_records([tuple(item) for item in data], 0.0, "cached")
+        except Exception:
+            pass
+        self._progress.setText("SCANNING...")
+        self._worker = _NeuralScanWorker(
+            self._map_root, self._include_system.isChecked(), self._map_depth, self
+        )
+        self._worker.batch.connect(
+            lambda records, more, message, token=generation:
+            self._batch(records, more, message) if token == self._scan_generation else None
+        )
+        self._worker.finished_scan.connect(
+            lambda records, elapsed, error, token=generation:
+            self._scan_finished(records, elapsed, error) if token == self._scan_generation else None
+        )
+        self._worker.start()
+
+    def _batch(self, records, more, message):
+        self._apply_records(records, 0.0, message)
+
+    def _scan_finished(self, records, elapsed, error):
+        if records:
+            self._apply_records(records, elapsed, error or "ready")
+            try:
+                path = _neural_cache_path(self._map_root)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(records), encoding="utf-8")
+            except Exception:
+                pass
+        self._progress.setText(error or "READY")
+        self._worker = None
+
+    def _apply_records(self, records, elapsed, status):
+        fixed = []
+        for i, item in enumerate(records[:6000]):
+            parent, name, path, size, mtime, level, count = item
+            cat = _NEURAL_CAT_INDEX["root"] if i == 0 else _neural_category(path, bool(count), level == 1)
+            fixed.append((int(parent), str(name), str(path), int(size), float(mtime), cat, int(count)))
+        self._records = fixed
+        self._canvas.set_records(fixed)
+        folders = sum(1 for item in fixed if item[6])
+        root_name = Path(self._map_root).name or self._map_root
+        self._stats.setText(f"{root_name}: {folders} folders · {max(0, len(fixed) - folders)} files · {elapsed:.1f}s {status}")
+        self._refresh_hubs()
+        self._refresh_legend()
+        self._open_button.setEnabled(bool(self._map_root and os.path.isdir(self._map_root)))
+        self._selected = -1
+        self._secondary = -1
+        self._canvas.selected = -1
+        self._canvas.secondary = -1
+        self._canvas.path_nodes.clear()
+
+    def _refresh_legend(self):
+        counts = [0] * len(_NEURAL_CATEGORIES)
+        for record in self._records:
+            cat = record[5] if 0 <= record[5] < len(counts) else len(counts) - 1
+            counts[cat] += 1
+        for button, cat_id, label in self._legend_buttons:
+            button.setText(f"●  {label}  {counts[_NEURAL_CAT_INDEX[cat_id]]}")
+
+    def _refresh_hubs(self):
+        while self._hubs.count():
+            item = self._hubs.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        hubs = sorted(((i, r[6]) for i, r in enumerate(self._records) if r[6]), key=lambda x: x[1], reverse=True)[:7]
+        for index, count in hubs:
+            button = QPushButton(f"●  {self._records[index][1][:22]}   {max(0, count)}")
+            button.setObjectName("nmChip")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(f"color: {_NEURAL_CATEGORIES[self._records[index][5]][2]};")
+            button.clicked.connect(lambda _checked=False, i=index: self._focus(i))
+            self._hubs.addWidget(button)
+
+    def _focus(self, index: int):
+        if index < len(self._canvas.positions):
+            self._canvas.selected = index
+            point = self._canvas._screen(index)
+            target = self._canvas.pan + QPointF(
+                self._canvas.width() / 2 - point.x(),
+                self._canvas.height() / 2 - point.y())
+            if not _MOTION_ON:
+                self._canvas.pan = target
+            else:
+                animation = QVariantAnimation(self._canvas)
+                animation.setDuration(360)
+                animation.setStartValue(self._canvas.pan)
+                animation.setEndValue(target)
+                animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+                animation.valueChanged.connect(lambda value: self._canvas.pan_to(value))
+                animation.finished.connect(animation.deleteLater)
+                self._canvas._fly_animation = animation
+                animation.start()
+            self._canvas.update()
+
+    def _path_between(self, first: int, second: int = -1) -> set[int]:
+        def ancestors(index):
+            chain = []
+            seen = set()
+            while 0 <= index < len(self._records) and index not in seen:
+                seen.add(index); chain.append(index)
+                index = self._records[index][0]
+            return chain
+        first_chain = ancestors(first)
+        if second < 0:
+            return set(first_chain)
+        second_chain = ancestors(second)
+        common = set(first_chain).intersection(second_chain)
+        if not common:
+            return set(first_chain + second_chain)
+        join = next(index for index in first_chain if index in common)
+        return set(first_chain[:first_chain.index(join) + 1] + second_chain[:second_chain.index(join) + 1])
+
+    def _node_clicked(self, index: int, shift: bool):
+        if shift and self._selected >= 0:
+            self._secondary = index
+            self._canvas.secondary = index
+        else:
+            self._selected = index
+            self._secondary = -1
+            self._canvas.selected = index
+            self._canvas.secondary = -1
+        self._canvas.path_nodes = self._path_between(
+            self._selected, self._secondary)
+        record = self._records[index]
+        try:
+            modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(record[4]))
+        except Exception:
+            modified = "unknown"
+        from html import escape as _esc
+        _path = _esc(str(record[2])).replace("\\", "\\\u200b").replace("/", "/\u200b")
+        self._inspector.setText(
+            f"<div style='color:{C.WHITE};font-weight:bold'>{_esc(str(record[1]))}</div>"
+            f"<div style='color:{C.TEXT_DIM}'>{_path}</div>"
+            f"<div style='color:{C.PRI};margin-top:4px'>{_fmt_size(record[3])} · {max(0, record[6])} items</div>"
+            f"<div style='color:{C.TEXT_DIM}'>modified {modified}</div>")
+        self._open_button.setEnabled(True)
+        self._canvas.update()
+        if not shift and record[6] and index != 0:
+            QTimer.singleShot(0, lambda path=record[2]: self._enter_folder(path))
+
+    def _enter_folder(self, path: str):
+        if not path or not os.path.isdir(path) or path == self._map_root:
+            return
+        self.cancel_scan()
+        self._map_history.append(self._map_root)
+        self._map_root = os.path.abspath(path)
+        self._map_back.show()
+        self.scan()
+
+    def _go_back_map(self):
+        if not self._map_history:
+            self._map_back.hide()
+            return
+        self.cancel_scan()
+        self._map_root = self._map_history.pop()
+        self._map_back.setVisible(bool(self._map_history))
+        self.scan()
+
+    def open_folder_command(self, text: str) -> bool:
+        match = re.search(
+            r"\b(?:show|open|display)\s+(?:the\s+)?(?:neural\s+)?map\s+of\s+(?:folder\s+)?[\"']?(.+?)[\"']?\s*$",
+            (text or "").strip(), re.IGNORECASE,
+        )
+        if not match:
+            return False
+        wanted = match.group(1).strip().rstrip(".?!")
+        wanted_lower = wanted.casefold()
+        candidates = [
+            record[2] for record in self._records
+            if record[6] and record[1].casefold() == wanted_lower
+        ]
+        if not candidates:
+            candidates = [
+                record[2] for record in self._records
+                if record[6] and wanted_lower in record[1].casefold()
+            ]
+        if candidates:
+            self._enter_folder(candidates[0])
+            return True
+        self._progress.setText(f"Folder not found: {wanted[:40]}")
+        return True
+
+    def _node_double_clicked(self, index: int):
+        if index >= len(self._records) or not self._records[index][6]:
+            return
+        children = {i for i, record in enumerate(self._records) if record[0] == index}
+        if children and children.issubset(self._canvas.visible):
+            self._canvas.visible.difference_update(children)
+        else:
+            room = max(0, self._canvas._MAX_RENDER_NODES - len(self._canvas.visible))
+            self._canvas.visible.update(sorted(children)[:room])
+        self._canvas._render_nodes = sorted(self._canvas.visible)
+        self._canvas._rebuild_spatial()
+        self._canvas.path_nodes.intersection_update(self._canvas.visible)
+        self._canvas.update()
+
+    def _search_changed(self, text: str):
+        needle = text.strip().lower()
+        self._canvas.filtered = None if not needle else {i for i, r in enumerate(self._records) if needle in r[1].lower() or needle in r[2].lower()}
+        self._progress.setText(f"{len(self._canvas.filtered or [])} matches" if needle else "READY")
+        self._canvas.update()
+
+    def _filter_category(self, category: str):
+        cat = _NEURAL_CAT_INDEX.get(category, -1)
+        if cat < 0:
+            return
+        current = self._canvas.filtered
+        selected = {i for i, record in enumerate(self._records) if record[5] == cat}
+        self._canvas.filtered = None if current == selected else selected
+        self._canvas.update()
+
+    def open_selected(self):
+        path = self._map_root
+        if not path or not os.path.exists(path):
+            return
+        try:
+            if _OS == "Windows":
+                if os.path.isdir(path):
+                    os.startfile(path)  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["explorer.exe", f"/select,{os.path.abspath(path)}"], **_WIN_HIDE)
+            elif _OS == "Darwin":
+                if os.path.isdir(path):
+                    subprocess.Popen(["open", path], **_WIN_HIDE)
+                else:
+                    subprocess.Popen(["open", "-R", path], **_WIN_HIDE)
+            else:
+                target = path if os.path.isdir(path) else os.path.dirname(path)
+                subprocess.Popen(["xdg-open", target], **_WIN_HIDE)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        self.cancel_scan()
+        self._canvas.set_active(False)
+        super().closeEvent(event)
+
+
+# ═══════ NEURAL MAP MODE – END ═══════
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -5613,10 +10932,19 @@ class MainWindow(QMainWindow):
     _notification_command_sig = pyqtSignal(str)
     _system_panel_sig = pyqtSignal(str)
     _system_state_sig = pyqtSignal(str, object)
+    _browser_cmd_sig = pyqtSignal(str, str, str, str)   # (action, url, fallback, label)
 
     def __init__(self, face_path: str):
         super().__init__()
         self._face_path = face_path
+        self._news_video_panel = None
+        self._news_shutting_down = False
+        self._fx_graph_panel = None
+        self._fx_graph_request_id = 0
+        self._fx_graph_cancel = None
+        self._fx_graph_saw_speaking = False
+        self._fx_pending = None                 # (request_id, data) waiting for the panel
+        self._open_seq = _OpenSequencer(parent=self)
         self._system_controls_config = get_system_controls_config()
         self.system_controls_manager = create_system_controls_manager(
             self._system_controls_config
@@ -5628,7 +10956,10 @@ class MainWindow(QMainWindow):
 
         # Load customization from config
         _cfg = _read_full_config()
+        # NEURAL: restore the selected HUD page and drive before widgets are built.
         self._assistant_name: str = (_cfg.get("assistant_name") or "AURA").strip()
+        self._hud_mode = "neural" if _cfg.get("hud_mode") == "neural" else "standard"
+        self._neural_drive = str(_cfg.get("neural_drive") or (_neural_drives()[0] if _neural_drives() else ""))
         _display = self._assistant_name.upper()
 
         # Kayıtlı UI rengini panel/stylesheet'ler kurulmadan ÖNCE uygula
@@ -5686,6 +11017,7 @@ class MainWindow(QMainWindow):
         self.hud = HudCanvas(face_path, _display)
         self.hud.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._content_panel = self._build_content_panel()
+        self._content_panel.installEventFilter(self)
         self._quiz_panel = self._build_quiz_panel()
 
         # Live camera container — replaces HUD when camera stream is active
@@ -5726,6 +11058,15 @@ class MainWindow(QMainWindow):
         # centre of the HUD for a while and then gives it back.
         self._video_split = False        # is the sound a separate stream?
         self._video_auto_muted = False   # did the app close the mic, or the user?
+        self._browser_win = None         # in-app browser window, created on first use
+        self._edge_win = None            # Edge-engine browser window (optional, Windows)
+        self._edge_broken = False        # the Edge engine failed to start once
+        self._edge_last = None           # what the Edge window was asked to open
+        self._browser_auto_muted = False # did the browser close the mic, or the user?
+        self._br_last_cmd = None         # de-duplicates an echoed command
+        self._br_last_t = 0.0
+        self._br_buf = ""                # spoken command arriving in pieces
+        self._br_buf_t = 0.0
         self._video_on = False           # plain flag: safe to read from plugin threads
         self._video_cont = self._build_video_surface()
 
@@ -5734,6 +11075,11 @@ class MainWindow(QMainWindow):
         self._hud_cam_stack.addWidget(self.hud)
         self._hud_cam_stack.addWidget(_cam_cont)
         self._hud_cam_stack.addWidget(self._video_cont)
+        # NEURAL: append page 3 without shifting standard/camera/video indexes.
+        self._neural_view = NeuralMapView(self.hud, _display, self._neural_drive)
+        self._neural_view.mode_back.connect(lambda: self._set_hud_mode("standard"))
+        self._neural_view._drive_box.currentTextChanged.connect(self._save_neural_drive)
+        self._hud_cam_stack.addWidget(self._neural_view)
 
         self._center_split = QSplitter(Qt.Orientation.Vertical)
         self._center_split.setStyleSheet(f"""
@@ -5757,6 +11103,11 @@ class MainWindow(QMainWindow):
 
         root.addLayout(body, stretch=1)
 
+        # NEURAL: window-wide layer for the map — created before the floating
+        # widgets below so they stay on top of it.
+        self._neural_overlay = _NeuralMapOverlay(central, self._neural_view)
+        self._neural_view.attach_overlay(self._neural_overlay)
+
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
         self._update_autostart_btn(self._check_autostart())
@@ -5775,6 +11126,11 @@ class MainWindow(QMainWindow):
         self._update_metrics()
 
         self._log_sig.connect(self._log.append_log)
+        self._log_sig.connect(self._browser_log_tap)       # spoken "… in you" commands
+        self._browser_cmd_sig.connect(self._on_browser_cmd)
+        _install_browser_guard()
+        _set_browser_swallow_cb(
+            lambda _u: self._log_sig.emit("SYS: Kept the page inside the in-app browser."))
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -5834,6 +11190,7 @@ class MainWindow(QMainWindow):
         self._face_samples      = []
         self._face_new          = []
         self._face_streak       = 0
+        self._face_verified     = False
         self._face_last         = 0.0
         self._face_last_sample  = 0.0
         self._face_prev_enabled = {}
@@ -5899,6 +11256,10 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+        sc_neural = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
+        sc_neural.activated.connect(self._toggle_hud_mode)
+
+        self._set_hud_mode(self._hud_mode, persist=False)
 
         # Floating always-on-top orb: appears only while this window is minimised.
         self._mini_orb = MiniOrbWidget(self)
@@ -5922,7 +11283,8 @@ class MainWindow(QMainWindow):
         else:
             self._cam_live_lbl.clear()
             if not self._video_on:      # a playing video keeps the centre
-                self._hud_cam_stack.setCurrentIndex(0)
+                # NEURAL: return to the user's selected HUD home page.
+                self._hud_cam_stack.setCurrentIndex(self._hud_home_index())
 
     def _on_cam_frame(self, data: bytes) -> None:
         px = QPixmap()
@@ -6336,6 +11698,7 @@ class MainWindow(QMainWindow):
                     if msg:
                         self._face_overlay.set_status(msg, C.PRI)
             elif kind == "unlock":
+                self._face_verified = True
                 self._log.append_log("SYS: Face recognised — unlocked.")
                 self._face_unlock_ui("ACCESS GRANTED")
             elif kind == "enrolled":
@@ -6375,6 +11738,18 @@ class MainWindow(QMainWindow):
                 stored = self._face_stored
                 if stored is None or len(stored) == 0:
                     return
+                if n != 1:
+                    self._face_streak = 0
+                    emit("warn", 0, "ONLY ONE PERSON IN FRAME, PLEASE")
+                    return
+                if fw < _FACE_MIN_WIDTH:
+                    self._face_streak = 0
+                    emit("warn", 0, "MOVE CLOSER — FACE MUST BE WITHIN 3 METRES")
+                    return
+                if fw > _FACE_MAX_WIDTH:
+                    self._face_streak = 0
+                    emit("warn", 0, "MOVE BACK — FACE MUST BE AT LEAST 1 METRE AWAY")
+                    return
                 score = float(np.max(stored @ feat))
                 if score >= _FACE_THRESH:
                     self._face_streak += 1
@@ -6391,8 +11766,11 @@ class MainWindow(QMainWindow):
             if n > 1:
                 emit("warn", 0, "ONLY ONE PERSON IN FRAME, PLEASE")
                 return
-            if fw < 90:
-                emit("warn", 0, "MOVE A LITTLE CLOSER TO THE CAMERA")
+            if fw < _FACE_MIN_WIDTH:
+                emit("warn", 0, "MOVE CLOSER — FACE MUST BE WITHIN 3 METRES")
+                return
+            if fw > _FACE_MAX_WIDTH:
+                emit("warn", 0, "MOVE BACK — FACE MUST BE AT LEAST 1 METRE AWAY")
                 return
             if now - self._face_last_sample < 0.6:
                 return
@@ -6483,8 +11861,18 @@ class MainWindow(QMainWindow):
             return
         width = min(470, max(360, cw.width() - 24))
         height = min(470, max(300, cw.height() - 24))
-        x = min(max(0, weather.x()), max(0, cw.width() - width))
-        y = weather.y() + weather.height() + 8
+        anchor = weather
+        if (getattr(self, "_hud_mode", "standard") == "neural"
+                and getattr(self, "_neural_view", None) is not None):
+            neural = self._neural_view
+            anchor = neural._panel if neural._panel.isVisible() else neural._drive_tray
+            top_left = anchor.mapToGlobal(QPoint(0, anchor.height() + 8))
+            local = cw.mapFromGlobal(top_left)
+            x, y = local.x(), local.y()
+        else:
+            x = weather.x()
+            y = weather.y() + weather.height() + 8
+        x = min(max(0, x), max(0, cw.width() - width))
         if y + height > cw.height():
             y = max(0, cw.height() - height - 8)
         panel.setGeometry(x, y, width, height)
@@ -6666,10 +12054,29 @@ class MainWindow(QMainWindow):
                 # Windows' own minimise button -> orb appears; restore -> it goes.
                 if self.isMinimized():
                     mini.show_mini()
+                    news_video = getattr(self, "_news_video_panel", None)
+                    if news_video is not None:
+                        news_video.pause_for_minimize()
                 else:
                     mini.hide_mini()
+                    news_video = getattr(self, "_news_video_panel", None)
+                    if news_video is not None:
+                        news_video.resume_after_minimize()
 
     def closeEvent(self, e):
+        if _Motion.main_out(self, e):       # first pass: fade everything out, then re-enter
+            return
+        _Motion.quitting = True             # really closing: no more deferred fades
+        self._news_shutting_down = True
+        self._open_seq.cancel()
+        self._close_news_video()
+        self._close_fx_graph(force=True)
+        for _bw in (self._browser_win, self._edge_win):
+            try:
+                if _bw is not None:
+                    _bw.shutdown()
+            except Exception as exc:
+                print(f"[Browser] Shutdown failed: {exc}")
         try:
             if callable(self.on_notification_stop):
                 self.on_notification_stop()
@@ -6694,7 +12101,171 @@ class MainWindow(QMainWindow):
             self._room_halt(1.0)
         except Exception:
             pass
+        # NEURAL: cancel and join the scanner before Qt destroys its parent.
+        try:
+            self._neural_view.cancel_scan()
+            worker = getattr(self._neural_view, "_worker", None)
+            if worker is not None and worker.isRunning():
+                worker.wait(1500)
+        except Exception as exc:
+            print(f"[Neural] Shutdown cleanup failed: {exc}")
         super().closeEvent(e)
+
+    # --- In-app browser ("Run <site> in you") ------------------------------
+    #
+    # Typed commands are caught in _send(); spoken ones arrive as "You: …" log
+    # lines (the same lines the log panel shows) and are caught by
+    # _browser_log_tap(). Both end in _on_browser_cmd(), which runs on the Qt
+    # thread. Plugins and worker threads can use AuraUI.open_in_browser() etc.,
+    # which go through _browser_cmd_sig like every other panel.
+    def _ensure_browser(self, backend: str = "qt"):
+        """The browser window for an engine: "qt" = built-in Chromium (always
+        there), "edge" = Windows' Edge engine (only when it is installed)."""
+        if not HAVE_WEB:
+            self._log.append_log("ERR: The in-app browser needs the QtWebEngine "
+                                 "package — run: pip install PyQt6-WebEngine")
+            return None
+        if backend == "edge":
+            if self._edge_win is None:
+                w = AuraBrowserWindow(self, backend="edge")
+                w.audible_changed.connect(self._on_browser_audible)
+                w.closed.connect(self._on_browser_closed)
+                w.backend_failed.connect(self._on_edge_failed)
+                self._edge_win = w
+            return self._edge_win
+        if self._browser_win is None:
+            w = AuraBrowserWindow(self)
+            w.audible_changed.connect(self._on_browser_audible)
+            w.closed.connect(self._on_browser_closed)
+            w.edge_requested.connect(self._on_edge_requested)
+            self._browser_win = w
+        return self._browser_win
+
+    def _wants_edge(self, url: str) -> bool:
+        """Sites this build of Chromium cannot play go to the Edge engine."""
+        if self._edge_broken or not _edge_available():
+            return False
+        if _BR_PREFER_EDGE:
+            return True
+        host = QUrl(url).host()
+        return _br_hit(host, _BR_DRM_HOSTS) or _br_hit(host, _BR_H264_HOSTS)
+
+    def _open_in(self, backend: str, url: str, fallback: str, label: str) -> None:
+        win = self._ensure_browser(backend)
+        if win is None:
+            return
+        other = self._browser_win if backend == "edge" else self._edge_win
+        if other is not None and other.isVisible():     # one window at a time: take its place
+            win._placed = True
+            win.setGeometry(other.geometry())
+            other.close()
+        if backend == "edge":
+            self._edge_last = (url, fallback, label)
+        win.open_url(url, fallback)
+        engine = " (Edge engine)" if backend == "edge" else ""
+        self._log.append_log(f"SYS: Opening {label} inside {self._assistant_name}{engine}.")
+
+    def _on_edge_failed(self, why: str) -> None:
+        """The Edge engine would not start: say why and carry on in the built-in one."""
+        self._edge_broken = True
+        self._log.append_log(f"ERR: Edge engine could not start ({why}). "
+                             "Using the built-in browser instead.")
+        last = self._edge_last
+        if self._edge_win is not None:
+            self._edge_win.close()
+        if last:
+            self._open_in("qt", *last)
+
+    def _on_edge_requested(self, url: str) -> None:
+        """'PLAY HERE · EDGE ENGINE' pressed in the built-in browser's notice."""
+        if self._edge_broken or not _edge_available():
+            return
+        self._open_in("edge", url, "", url)
+
+    def _browser_handle_text(self, text: str, voice: bool = False) -> bool:
+        """True when `text` was an in-app browser command and has been handled
+        here, so the caller must not pass it on to the assistant."""
+        if not HAVE_WEB or not getattr(self, "_ready", True):
+            return False
+        if getattr(self, "_face_mode", None) in _FACE_COVER:
+            return False
+        cmd = _parse_browser_command(text, self._assistant_name)
+        if cmd is None:
+            return False
+        now = time.monotonic()
+        if cmd == self._br_last_cmd and now - self._br_last_t < 4.0:
+            return True                         # the same command echoed twice
+        self._br_last_cmd, self._br_last_t = cmd, now
+        if voice:
+            _arm_browser_guard(10.0)            # keep the PC's browser shut
+        self._on_browser_cmd(*cmd)
+        return True
+
+    def _browser_log_tap(self, text: str) -> None:
+        """Spoken commands: watch the 'You: …' lines the voice pipeline logs."""
+        try:
+            lines = (text or "").strip().splitlines()
+            line = lines[0].strip() if lines else ""
+            if line[:4].lower() != "you:":
+                return
+            spoken = line[4:].strip()
+            if not spoken:
+                return
+            now = time.monotonic()
+            joined = spoken
+            if self._br_buf and now - self._br_buf_t < 2.5:
+                joined = f"{self._br_buf} {spoken}"      # transcript in pieces
+            self._br_buf, self._br_buf_t = joined, now
+            for cand in (spoken, joined):
+                if self._handle_neural_map_command(cand):
+                    self._br_buf = ""
+                    return
+                if self._browser_handle_text(cand, voice=True):
+                    self._br_buf = ""
+                    return
+        except Exception as exc:                          # never break the log
+            print(f"[Browser] voice tap failed: {exc}")
+
+    def _handle_neural_map_command(self, text: str) -> bool:
+        neural = getattr(self, "_neural_view", None)
+        if neural is None:
+            return False
+        if not re.search(r"\b(?:show|open|display)\s+(?:the\s+)?(?:neural\s+)?map\s+of\b",
+                         text or "", re.IGNORECASE):
+            return False
+        if self._hud_mode != "neural":
+            self._set_hud_mode("neural")
+        return neural.open_folder_command(text)
+
+    def _on_browser_cmd(self, action: str, url: str, fallback: str, label: str) -> None:
+        if action == "close":
+            shut = False
+            for w in (self._browser_win, self._edge_win):
+                if w is not None and w.isVisible():
+                    w.close()
+                    shut = True
+            self._log.append_log("SYS: Browser closed." if shut else "SYS: The browser is not open.")
+            return
+        self._open_in("edge" if self._wants_edge(url) else "qt", url, fallback, label)
+
+    def _on_browser_audible(self, audible: bool) -> None:
+        """Close the microphone while a page is making sound.
+
+        Same reasoning as the HUD video: the page plays through its own output,
+        so the assistant would otherwise answer it. Only if the app closed the
+        mic — a mic the user muted stays muted, and F4 hands control back."""
+        if audible and not self._muted:
+            self._browser_auto_muted = True
+            self._set_muted(True, "The browser is playing sound — close it, silence "
+                                  "it, or press F4 to talk. Typing still works.")
+        elif not audible and self._browser_auto_muted:
+            self._browser_auto_muted = False
+            self._set_muted(False, "The browser is quiet again.")
+
+    def _on_browser_closed(self) -> None:
+        if self._browser_auto_muted:                    # give the mic back
+            self._browser_auto_muted = False
+            self._set_muted(False, "The browser was closed.")
 
     # --- Video in the HUD area ---------------------------------------------
     #
@@ -6856,7 +12427,7 @@ class MainWindow(QMainWindow):
         was_on = self._video_on
         self._video_on = False
         if was_on or self._hud_cam_stack.currentIndex() == 2:
-            self._hud_cam_stack.setCurrentIndex(0)
+            self._hud_cam_stack.setCurrentIndex(self._hud_home_index())
         self._sync_mic_for_video()      # gives the microphone back
 
     def _set_video_muted(self, muted: bool) -> None:
@@ -7385,6 +12956,19 @@ class MainWindow(QMainWindow):
         tl.addWidget(self._title_lbl)
         lay.addWidget(title_bar)
 
+        # NEURAL: compact mode selector lives in the existing title bar row.
+        self._standard_mode_btn = QPushButton("STANDARD")
+        self._neural_mode_btn = QPushButton("NEURAL")
+        self._hud_mode_buttons = (self._standard_mode_btn, self._neural_mode_btn)
+        for button in self._hud_mode_buttons:
+            button.setCheckable(True)
+            button.setFixedHeight(24)
+            button.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            lay.addWidget(button)
+        self._standard_mode_btn.clicked.connect(lambda: self._set_hud_mode("standard"))
+        self._neural_mode_btn.clicked.connect(lambda: self._set_hud_mode("neural"))
+
         # Subtitle / clock / date are no longer shown in the header, but the
         # labels are kept (hidden) because other code updates them.
         _sub_text = ("Autonomous User Responsive Agent"
@@ -7461,6 +13045,53 @@ class MainWindow(QMainWindow):
         except Exception as _exc:  # noqa: BLE001 — never fatal
             print(f"[Updater] Controller init failed: {_exc}")
 
+    # NEURAL: page 3 is the only new stack page; standard remains page 0.
+    def _hud_home_index(self) -> int:
+        return 3 if getattr(self, "_hud_mode", "standard") == "neural" else 0
+
+    def _save_neural_drive(self, drive: str):
+        self._neural_drive = str(drive or self._neural_drive)
+        try:
+            data = _read_full_config()
+            data["neural_drive"] = self._neural_drive
+            API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        except Exception as exc:
+            print(f"[Neural] Drive preference could not be saved: {exc}")
+
+    def _refresh_hud_mode_buttons(self):
+        active = self._hud_mode
+        for button, mode in ((self._standard_mode_btn, "standard"),
+                             (self._neural_mode_btn, "neural")):
+            on = mode == active
+            button.setChecked(on)
+            button.setStyleSheet(
+                f"QPushButton {{ background: {C.PRI_GHO if on else C.PANEL2}; "
+                f"color: {C.PRI if on else C.TEXT_DIM}; border: 1px solid "
+                f"{C.PRI if on else C.BORDER}; border-radius: 3px; padding: 2px 5px; }}"
+                f"QPushButton:hover {{ color: {C.TEXT}; border-color: {C.PRI}; }}"
+            )
+
+    def _set_hud_mode(self, mode: str, persist: bool = True):
+        # NEURAL: never disturb camera/video pages while changing the preference.
+        self._hud_mode = "neural" if mode == "neural" else "standard"
+        self._refresh_hud_mode_buttons()
+        current = self._hud_cam_stack.currentIndex() if hasattr(self, "_hud_cam_stack") else -1
+        if current in (0, 3) or current < 0:
+            self._hud_cam_stack.setCurrentIndex(self._hud_home_index())
+        if hasattr(self, "_neural_view"):
+            self._neural_view.set_active(self._hud_mode == "neural")
+        if persist:
+            try:
+                data = _read_full_config()
+                data["hud_mode"] = self._hud_mode
+                data["neural_drive"] = getattr(self, "_neural_drive", "")
+                API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+            except Exception as exc:
+                print(f"[Neural] Mode preference could not be saved: {exc}")
+
+    def _toggle_hud_mode(self):
+        self._set_hud_mode("standard" if self._hud_mode == "neural" else "neural")
+
 
 
     def show_system_controls(self, page: str = "main") -> None:
@@ -7481,6 +13112,7 @@ class MainWindow(QMainWindow):
         if self._system_panel is None:
             from dashboard.system_panel import SystemControlsPanel
 
+            _motion_window(SystemControlsPanel, close_anim=False, rise=10)
             self._system_panel = SystemControlsPanel(
                 self.system_controls_manager,
                 current_palette(),
@@ -7580,7 +13212,7 @@ class MainWindow(QMainWindow):
             QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}
         """
 
-        w = QWidget(self.centralWidget())
+        w = _MoPanel(self.centralWidget())
         w.setObjectName("QuickDrawer")
         w.setStyleSheet(f"""
             QWidget#QuickDrawer {{
@@ -7831,7 +13463,7 @@ class MainWindow(QMainWindow):
         in the top-right corner, positioned over the bottom of the HUD area.
         Hidden by default; appears when show_content() is called.
         """
-        w = QWidget(self.centralWidget())
+        w = _MoPanel(self.centralWidget())
         w.setObjectName("ContentPanel")
         w.setStyleSheet(f"""
             QWidget#ContentPanel {{
@@ -7946,8 +13578,351 @@ class MainWindow(QMainWindow):
             self._content_display.textCursor().MoveOperation.Start
         )
         self._position_content_panel()
+        first_open = not self._content_panel.isVisible()
         self._content_panel.show()
         self._content_panel.raise_()
+        if first_open:
+            self._open_seq.hold()       # briefing text goes first; the rest follow
+        if self._is_news_briefing(title):
+            self._start_news_video()
+            if self._is_morning_news_briefing(title):
+                self._start_fx_graph()
+            else:
+                print(f"[FX] graph not shown, title not recognised: {title!r}")
+                self._close_fx_graph()
+        else:
+            self._close_fx_graph()
+
+    @staticmethod
+    def _is_news_briefing(title: str) -> bool:
+        normalized = str(title or "").casefold()
+        return "news" in normalized or "brief" in normalized
+
+    @staticmethod
+    def _is_morning_news_briefing(title: str) -> bool:
+        # Was an exact compare against one specific title, so any other news
+        # briefing title (the video panel appeared, the graph did not) never
+        # got a graph. Every news briefing gets it now.
+        return MainWindow._is_news_briefing(title)
+
+    def _start_news_video(self) -> None:
+        """Queue the live news player; it opens right after the briefing text."""
+        if self._news_shutting_down:
+            return
+        existing = self._news_video_panel
+        if existing is not None and not existing._closed:
+            return
+        if self._open_seq.pending("video"):
+            return
+        self._open_seq.submit("video", self._open_news_video)
+
+    def _open_news_video(self) -> None:
+        if self._news_shutting_down:
+            return
+        existing = self._news_video_panel
+        if existing is not None and not existing._closed:
+            return
+        if not HAVE_WEB and not _edge_available():
+            print("[YouTube] Cannot start the in-app news player: no embedded browser is available.")
+            return
+        try:
+            panel = NewsVideoPanel(
+                self, self._content_panel, NewsVideoPanel.CHANNEL_ID
+            )
+            panel.closed.connect(
+                lambda video_panel=panel: self._news_video_closed(video_panel)
+            )
+            self._news_video_panel = panel
+        except Exception as exc:
+            print(f"[YouTube] Could not create the in-app news player: {exc!r}")
+
+    def _news_video_closed(self, panel: NewsVideoPanel) -> None:
+        if self._news_video_panel is panel:
+            self._news_video_panel = None
+
+    def _close_news_video(self) -> None:
+        self._open_seq.cancel("video")
+        panel = self._news_video_panel
+        self._news_video_panel = None
+        if panel is not None:
+            try:
+                panel.close()
+            except RuntimeError:
+                pass
+
+    def _start_fx_graph(self) -> None:
+        existing = self._fx_graph_panel
+        if existing is not None and not existing._closed and existing.has_data:
+            return                      # already showing data for this briefing
+        self._close_fx_graph()
+        if self._news_shutting_down:
+            return
+        try:
+            self._fx_graph_request_id += 1
+            request_id = self._fx_graph_request_id
+            cancelled = threading.Event()
+            self._fx_graph_cancel = cancelled
+            worker = _FxRateWorker(request_id, cancelled)
+            worker.online.connect(
+                self._on_fx_graph_online,
+                Qt.ConnectionType.QueuedConnection,
+            )
+            worker.result.connect(
+                self._on_fx_graph_result,
+                Qt.ConnectionType.QueuedConnection,
+            )
+            worker.finished.connect(lambda job=worker: _FX_WORKERS.discard(job))
+            worker.finished.connect(worker.deleteLater)
+            _FX_WORKERS.add(worker)
+            worker.start()
+        except Exception as e:
+            print(f"[FX] could not start graph worker: {e}")
+            self._close_fx_graph()
+
+    def _on_fx_graph_online(self, request_id: int) -> None:
+        if (self._news_shutting_down
+                or request_id != self._fx_graph_request_id
+                or not self._content_panel.isVisible()
+                or not self._is_morning_news_briefing(
+                    self._content_title_lbl.text()
+                )):
+            return
+        # The rate worker already runs in the background, so the data is
+        # usually ready by the time this slot's turn comes round.
+        self._open_seq.submit(
+            "fx", lambda rid=request_id: self._open_fx_graph_panel(rid))
+
+    def _open_fx_graph_panel(self, request_id: int) -> None:
+        if (self._news_shutting_down
+                or request_id != self._fx_graph_request_id
+                or not self._content_panel.isVisible()
+                or self._fx_graph_panel is not None):
+            return
+        try:
+            # as large as the news video panel; the corner grip resizes it
+            panel = FxGraphPanel(self, QSize(
+                NewsVideoPanel._DEFAULT_W, NewsVideoPanel._DEFAULT_H))
+            placement = self._fx_graph_placement(panel.size())
+            if placement is None:
+                panel.close()
+                self._close_fx_graph()
+                return
+            panel.setGeometry(placement)
+            panel.closed.connect(
+                lambda graph=panel: self._fx_graph_closed(graph)
+            )
+            self._fx_graph_panel = panel
+            self._fx_graph_saw_speaking = False
+            panel._data_ok = False
+            panel.show()
+            panel.raise_()
+            # Feed the chart only once the window has finished gliding in, so
+            # the line-draw animation never competes with the open animation.
+            settle = (_MO_WIN_IN_MS + 60) if _MOTION_ON else 0
+            QTimer.singleShot(settle, lambda p=panel: self._fx_panel_settled(p))
+        except Exception:
+            self._close_fx_graph()
+
+    def _fx_panel_settled(self, panel) -> None:
+        if panel is not self._fx_graph_panel or panel._closed:
+            return
+        panel._data_ok = True
+        self._flush_fx_data()
+
+    def _fx_graph_placement(self, size: QSize) -> QRect | None:
+        try:
+            news = self._content_panel
+            origin = news.mapToGlobal(QPoint(0, 0))
+            news_rect = QRect(origin, news.size())
+            screen = QApplication.screenAt(news_rect.center())
+            if screen is None:
+                screen = QApplication.primaryScreen()
+            if screen is None:
+                return None
+            area = screen.availableGeometry()
+            width = min(size.width(), area.width())
+            height = min(size.height(), area.height())
+            if width <= 0 or height <= 0:
+                return None
+
+            obstacles = [news_rect]
+            video = getattr(self, "_news_video_panel", None)
+            if video is not None and video.isVisible():
+                video_origin = video.mapToGlobal(QPoint(0, 0))
+                obstacles.append(QRect(video_origin, video.size()))
+            else:
+                weather = getattr(self, "_weather_widget", None)
+                if weather is not None and weather.isVisible():
+                    video_anchor = weather.mapToGlobal(
+                        QPoint(weather.width() + 10, 0)
+                    )
+                else:
+                    video_anchor = self.mapToGlobal(QPoint(12, 64))
+                video_screen = QApplication.screenAt(video_anchor)
+                if video_screen is None:
+                    video_screen = QApplication.primaryScreen()
+                if video_screen is not None:
+                    video_area = video_screen.availableGeometry()
+                    video_width = min(NewsVideoPanel._DEFAULT_W, video_area.width())
+                    video_height = min(NewsVideoPanel._DEFAULT_H, video_area.height())
+                    video_x = max(
+                        video_area.left(),
+                        min(video_anchor.x(), video_area.right() - video_width + 1),
+                    )
+                    video_y = max(
+                        video_area.top(),
+                        min(video_anchor.y(), video_area.bottom() - video_height + 1),
+                    )
+                    obstacles.append(QRect(
+                        video_x, video_y, video_width, video_height
+                    ))
+            for name in (
+                "_weather_widget", "_right_panel", "_quick_drawer", "_quiz_panel",
+                "_browser_win", "_edge_win", "_room_box", "_earth_box",
+            ):
+                widget = getattr(self, name, None)
+                try:
+                    if widget is not None and widget.isVisible():
+                        widget_origin = widget.mapToGlobal(QPoint(0, 0))
+                        obstacles.append(QRect(widget_origin, widget.size()))
+                except RuntimeError:
+                    continue
+
+            hud = getattr(self, "hud", None)
+            try:
+                if hud is not None and hud.isVisible():
+                    hud_origin = hud.mapToGlobal(QPoint(0, 0))
+                    radius = min(hud.width(), hud.height()) * 0.53
+                    center = QPoint(
+                        hud_origin.x() + hud.width() // 2,
+                        hud_origin.y() + hud.height() // 2,
+                    )
+                    obstacles.append(QRect(
+                        round(center.x() - radius), round(center.y() - radius),
+                        round(radius * 2), round(radius * 2),
+                    ))
+            except RuntimeError:
+                pass
+
+            dpi = screen.logicalDotsPerInch() / 96.0
+            step = max(12, round(24 * dpi))
+
+            def search(w: int, h: int, gap: int):
+                right_x = news_rect.right() + 1 + gap
+                left_x = news_rect.left() - w - gap
+                ideal = ((right_x, news_rect.top()), (left_x, news_rect.top()))
+                # Fast path: the spots right beside the news panel are almost
+                # always free, so check them directly instead of scanning.
+                for tx, ty in ideal:
+                    for dy in (0, step * 3, -step * 3, step * 6):
+                        quick = QRect(tx, ty + dy, w, h)
+                        if (area.contains(quick)
+                                and not any(quick.intersects(o) for o in obstacles)):
+                            return quick
+                best = None
+                for y in range(area.top(), area.bottom() - h + 2, step):
+                    for x in range(area.left(), area.right() - w + 2, step):
+                        rect = QRect(x, y, w, h)
+                        if any(rect.intersects(o) for o in obstacles):
+                            continue
+                        score = min(
+                            abs(x - tx) + 2 * abs(y - ty) for tx, ty in ideal
+                        )
+                        if best is None or score < best[0]:
+                            best = (score, rect)
+                return None if best is None else best[1]
+
+            # Used to give up (and silently close the graph) when the first
+            # pass found no free spot. Now: try smaller gaps, then a smaller
+            # panel, then the least-overlapping spot, so it always appears.
+            for scale in (1.0, 0.9, 0.8):
+                w = min(area.width(), max(280, round(width * scale)))
+                h = min(area.height(), max(160, round(height * scale)))
+                for gap_px in (120, 48, 0):
+                    found = search(w, h, round(gap_px * dpi))
+                    if found is not None:
+                        return found
+
+            w = min(area.width(), max(280, round(width * 0.8)))
+            h = min(area.height(), max(160, round(height * 0.8)))
+            best_rect, best_cost = None, None
+            for y in range(area.top(), area.bottom() - h + 2, step):
+                for x in range(area.left(), area.right() - w + 2, step):
+                    rect = QRect(x, y, w, h)
+                    cost = 0
+                    for o in obstacles:
+                        hit = rect.intersected(o)
+                        if hit.isValid() and not hit.isEmpty():
+                            weight = 6 if o == news_rect else 1
+                            cost += hit.width() * hit.height() * weight
+                    if best_cost is None or cost < best_cost:
+                        best_rect, best_cost = rect, cost
+            return best_rect
+        except Exception as e:
+            print(f"[FX] placement failed: {e}")
+            return None
+
+    def _on_fx_graph_result(self, request_id: int, data) -> None:
+        if (self._news_shutting_down
+                or request_id != self._fx_graph_request_id):
+            return
+        # Keep the result: it can arrive before the staggered panel exists.
+        self._fx_pending = (request_id, data)
+        self._flush_fx_data()
+
+    def _flush_fx_data(self) -> None:
+        pending = self._fx_pending
+        panel = self._fx_graph_panel
+        if (pending is None or panel is None or panel._closed
+                or not getattr(panel, "_data_ok", False)):
+            return
+        request_id, data = pending
+        self._fx_pending = None
+        if request_id != self._fx_graph_request_id:
+            return
+        if data is None:
+            panel.set_unavailable()
+            return
+        panel.set_rates(data)
+
+    def _fx_graph_closed(self, panel: FxGraphPanel) -> None:
+        if self._fx_graph_panel is panel:
+            self._fx_graph_panel = None
+            self._fx_pending = None
+            self._fx_graph_request_id += 1
+            if self._fx_graph_cancel is not None:
+                self._fx_graph_cancel.set()
+                self._fx_graph_cancel = None
+
+    def _close_fx_graph(self, force: bool = False) -> None:
+        # Once the graph is showing data it is pinned: briefing changes, the
+        # news panel hiding or AURA finishing speaking no longer close it.
+        # Only the panel's own close button (or the app quitting, force=True)
+        # removes it.
+        panel = self._fx_graph_panel
+        if (not force and panel is not None and not panel._closed
+                and panel.has_data):
+            return
+        self._open_seq.cancel("fx")
+        self._fx_pending = None
+        self._fx_graph_request_id += 1
+        if self._fx_graph_cancel is not None:
+            self._fx_graph_cancel.set()
+            self._fx_graph_cancel = None
+        panel = self._fx_graph_panel
+        self._fx_graph_panel = None
+        self._fx_graph_saw_speaking = False
+        if panel is not None:
+            try:
+                panel.close()
+            except RuntimeError:
+                pass
+
+    def eventFilter(self, watched, event):
+        if (watched is getattr(self, "_content_panel", None)
+                and event.type() == QEvent.Type.Hide):
+            self._close_fx_graph()
+        return super().eventFilter(watched, event)
 
     # ── document review ──────────────────────────────────────────────────────
     # Rendered as rich text into the content panel that already exists, rather
@@ -8607,8 +14582,25 @@ class MainWindow(QMainWindow):
         ov.on_preview = self._preview_ui_color
         ov.saved.connect(self._apply_name_update)
         ov.configure_local_ai.connect(self._open_local_ai_settings)
+        ov.open_permissions.connect(self._open_permissions)
         ov.show()
         self._customize_overlay = ov
+
+    def _open_permissions(self):
+        broker = getattr(self, "_access_broker", None)
+        if broker is None:
+            QMessageBox.warning(
+                self, "Permissions unavailable",
+                "The confirmation service has not been initialized.",
+            )
+            return
+        existing = getattr(self, "_permissions_overlay", None)
+        if existing is not None:
+            existing.hide()
+            existing.deleteLater()
+        overlay = PermissionsOverlay(broker, parent=self.centralWidget())
+        self._centre_overlay(overlay)
+        self._permissions_overlay = overlay
 
     def _open_local_ai_settings(self):
         if self._customize_overlay:
@@ -8833,6 +14825,7 @@ class MainWindow(QMainWindow):
         # A deliberate press settles the question: whatever the video did, or is
         # about to do, the user has now said what they want.
         self._video_auto_muted = False
+        self._browser_auto_muted = False
         self._set_muted(not self._muted)
 
     def _set_muted(self, muted: bool, note: str = ""):
@@ -8860,12 +14853,21 @@ class MainWindow(QMainWindow):
         if not txt: return
         self._input.clear()
         self._log.append_log(f"You: {txt}")
+        if self._handle_neural_map_command(txt):
+            return
+        if self._browser_handle_text(txt):      # "Run <site> in you" → in-app browser
+            return
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
     def _apply_state(self, state: str):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
+        panel = self._news_video_panel
+        if panel is not None:
+            panel.set_speaking(self.hud.speaking)
+        # The USD/INR graph deliberately ignores speaking/listening changes:
+        # once it has data it stays until the user presses its close button.
 
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False
@@ -8941,6 +14943,17 @@ class MainWindow(QMainWindow):
             self._overlay.deleteLater()
             self._overlay = None
 
+# ── motion wiring: top-level windows ─────────────────────────────────────────
+# (floating panels are decorated where they are defined; see "MOTION ENGINE")
+_motion_window(MainWindow, close_anim=False, rise=18)   # close handled in closeEvent
+_motion_window(AuraBrowserWindow,
+               skip=lambda w: getattr(w, "_backend", "qt") == "edge")  # native Edge view
+_motion_window(_BrowserPopup)
+_motion_window(FxGraphPanel)
+_motion_window(NewsVideoPanel)
+_motion_window(_MiniBar, close_anim=False, rise=0)      # orb buttons: pure fade
+
+
 class _RootShim:
     def __init__(self, app: QApplication):
         self._app = app
@@ -8962,7 +14975,12 @@ class AuraUI:
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags)
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        _Motion.install_app_hooks(self._app)
         self._win = MainWindow(face_path)
+        from core.confirmation import configure_confirmation_broker
+        self._win._access_broker = configure_confirmation_broker(
+            parent=self._win, accent_provider=lambda: C.PRI
+        )
         self.on_system_control_action = None
         self._win.show()
         self.root = _RootShim(self._app)
@@ -8970,6 +14988,10 @@ class AuraUI:
     @property
     def muted(self) -> bool:
         return self._win._muted
+
+    @property
+    def face_unlock_verified(self) -> bool:
+        return bool(getattr(self._win, "_face_verified", False))
 
     @muted.setter
     def muted(self, v: bool):
@@ -9036,6 +15058,24 @@ class AuraUI:
     def hide_confirm(self) -> None:
         """Thread-safe: take the gate down."""
         self._win._confirm_hide_sig.emit()
+
+    def open_in_browser(self, target: str) -> None:
+        """Thread-safe: open a website (name, domain or URL) in the floating
+        in-app browser instead of the PC's browser."""
+        url, fallback, _kind = _resolve_site(target or "")
+        if url:
+            self._win._browser_cmd_sig.emit("open", url, fallback, str(target)[:60])
+
+    def search_in_browser(self, query: str, site: str = "google") -> None:
+        """Thread-safe: run a web search in the in-app browser."""
+        key = (site or "google").strip().lower()
+        tpl = _BR_SEARCH_URLS.get(key, _BR_SEARCH_URLS["google"])
+        self._win._browser_cmd_sig.emit(
+            "search", tpl.format(q=quote_plus(query or "")), "", f"{query} ({key})"[:80])
+
+    def close_browser(self) -> None:
+        """Thread-safe: close the in-app browser (this also stops playback)."""
+        self._win._browser_cmd_sig.emit("close", "", "", "")
 
     def request_earth_command(self, command: str, origin: str = "",
                               destination: str = "") -> None:

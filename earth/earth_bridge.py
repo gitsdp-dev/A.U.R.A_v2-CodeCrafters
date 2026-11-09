@@ -13,6 +13,12 @@ class EarthBridge(QObject):
     requestCompleted = pyqtSignal(str, str)
 
     _ALLOWED_HOSTS = {
+        "earthquake.usgs.gov",
+        "eonet.gsfc.nasa.gov",
+        "celestrak.org",
+        "api.tfl.gov.uk",
+        "data.wsdot.wa.gov",
+        "api.data.gov.sg",
         "api.open-meteo.com",
         "geocoding-api.open-meteo.com",
         "nominatim.openstreetmap.org",

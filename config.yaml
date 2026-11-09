@@ -25,3 +25,11 @@ agent:
   history_length: 6
   tool_calling: auto
   scratchpad_file: .aura-task.json
+  general_tools_enabled: true
+  verifier_enabled: true
+  verifier_timeout_ms: 20000
+  parallelism: 2
+  background_workers: 2
+  plan_memory_file: memory/agent_plans.json
+  schedule_file: memory/agent_schedule.json
+  workspace_dir: workspace
