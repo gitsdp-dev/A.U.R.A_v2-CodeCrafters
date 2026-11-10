@@ -83,7 +83,26 @@ the original memory data remains on this device.
 | **Room Checking** | Monitor the room through the camera with a draggable preview window. |
 | **Assistant Customization** | Configure AI, voice, audio devices, and assistant preferences. |
 | **Modular Architecture** | Separates core logic, actions, memory, plugins, configuration, UI, and voice components. |
-| **GOD'S EYE (Earth View)** | Advanced Earth View Feature which allows you to track air routes and inspect locations inside A.U.R.A itself |
+| **GOD'S EYE (OSIRIS)** | Embedded view of OSIRIS, loaded from [osirisai.live](https://osirisai.live) inside A.U.R.A. |
+
+---
+
+## GOD'S EYE — OSIRIS
+
+GOD'S EYE opens [osirisai.live](https://osirisai.live) in a floating panel
+inside A.U.R.A. The panel can be moved, resized, minimized, or expanded to fill
+the A.U.R.A. window. Its browser profile is stored locally so supported site
+data can persist between sessions. An internet connection and working WebGL2
+support are required for the OSIRIS experience; when the embedded renderer
+cannot provide WebGL2, A.U.R.A. can use its optional Edge browser engine.
+
+GOD'S EYE displays the OSIRIS website; it does not provide A.U.R.A.-specific
+route plotting or location controls. External links are handled in A.U.R.A.'s
+in-app browser rather than opening the system browser.
+
+**Credit:** GOD'S EYE uses the OSIRIS project by
+[Simplifai Soul](https://github.com/simplifaisoul/osiris), served from
+[osirisai.live](https://osirisai.live).
 
 ---
 
@@ -533,7 +552,7 @@ A.U.R.A v2
 ├── core/             # Core assistant and voice logic
 │   └── agent/         # Typed registry, planning, verification, safety, scheduling
 ├── dashboard/        # Dashboard components
-|-- earth/            # Earth View Assets
+|-- earth/            # GOD'S EYE OSIRIS panel and compatibility services
 ├── memory/           # Persistent memory system
 ├── plugins/          # Plugin architecture
 │   ├── ide_agent/     # IDE-independent coding tools and adapters
