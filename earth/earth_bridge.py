@@ -1,74 +1,35 @@
 from __future__ import annotations
 
-import json
-import threading
-from urllib.parse import urlparse
+import logging
 
-import requests
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class EarthBridge(QObject):
+    """Compatibility bridge for callers retained from the local globe."""
+
     maximizeRequested = pyqtSignal()
     requestCompleted = pyqtSignal(str, str)
-
-    _ALLOWED_HOSTS = {
-        "earthquake.usgs.gov",
-        "eonet.gsfc.nasa.gov",
-        "celestrak.org",
-        "api.tfl.gov.uk",
-        "data.wsdot.wa.gov",
-        "api.data.gov.sg",
-        "api.open-meteo.com",
-        "geocoding-api.open-meteo.com",
-        "nominatim.openstreetmap.org",
-        "restcountries.com",
-        "router.project-osrm.org",
-        "www.wikidata.org",
-    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
     @pyqtSlot()
     def maximize(self):
-        self.maximizeRequested.emit()
+        try:
+            self.maximizeRequested.emit()
+        except Exception:
+            _LOGGER.exception("Could not forward the legacy God's Eye maximize request")
 
     @pyqtSlot(str, str)
     def requestJson(self, request_id: str, url: str):
-        thread = threading.Thread(
-            target=self._fetch_json,
-            args=(request_id, url),
-            name="earth-json-request",
-            daemon=True,
-        )
-        thread.start()
-
-    def _fetch_json(self, request_id: str, url: str):
         try:
-            parsed = urlparse(url)
-            if (
-                parsed.scheme != "https"
-                or parsed.hostname not in self._ALLOWED_HOSTS
-                or parsed.username is not None
-                or parsed.password is not None
-            ):
-                raise ValueError("Earth data source is not permitted.")
-
-            response = requests.get(
+            _LOGGER.debug(
+                "Ignored legacy Earth JSON request %s for %s; OSIRIS loads its own data",
+                request_id,
                 url,
-                headers={"User-Agent": "AURA-Earth/1.0", "Accept": "application/json"},
-                timeout=12,
-                allow_redirects=False,
             )
-            response.raise_for_status()
-            if len(response.content) > 12 * 1024 * 1024:
-                raise ValueError("Earth data response exceeded the size limit.")
-            result = {
-                "ok": True,
-                "status": response.status_code,
-                "body": response.text,
-            }
-        except (requests.RequestException, ValueError) as exc:
-            result = {"ok": False, "error": str(exc)}
-        self.requestCompleted.emit(request_id, json.dumps(result))
+        except Exception:
+            _LOGGER.exception("Could not handle a legacy God's Eye JSON request")

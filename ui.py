@@ -111,7 +111,7 @@ def _read_full_config() -> dict:
         return {}
 
 
-_DEFAULT_W, _DEFAULT_H = 980, 700
+_DEFAULT_W, _DEFAULT_H = 1080, 700
 _MIN_W,     _MIN_H     = 820, 580
 _LEFT_W  = 206
 _RIGHT_W = 340
@@ -12041,10 +12041,7 @@ class MainWindow(QMainWindow):
         if b.user_moved:
             b.move_clamped(b.pos())
         else:
-            room = getattr(self, "_room_box", None)
-            room_x = cw.width() - b.width() - 16 if room is None or not room.isVisible() else room.x()
-            room_y = 54 + 10 if room is None or not room.isVisible() else room.y() + room.height() + 8
-            b.move(max(0, room_x), max(0, room_y))
+            b._position_compact()
 
     def changeEvent(self, e):
         super().changeEvent(e)

@@ -12,6 +12,9 @@ config/*.jsonl
 **/*client_secret*.json
 **/*credentials*.json
 **/*credential*.json
+earth/_legacy/
+earth/osiris/node_modules/
+config/aura_godseye/
 .env
 .env.*
 !.env.example

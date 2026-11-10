@@ -1,13 +1,13 @@
-"""Gemini tool for the in-app Earth widget and route finder."""
+"""Gemini tool for A.U.R.A.'s in-app OSIRIS panel and route summaries."""
 
 import requests
 
 TOOL = {
     "name": "earth_control",
     "description": (
-        "Control A.U.R.A.'s in-app interactive Earth map. Use route with origin "
-        "and destination for place-distance or route questions; this opens the "
-        "Earth map, plots the route, and displays distance and travel estimates."
+        "Control A.U.R.A.'s in-app OSIRIS global intelligence panel. Use route "
+        "with origin and destination for a place-distance summary; OSIRIS does "
+        "not currently expose a documented URL parameter for plotting routes."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -50,11 +50,16 @@ def earth_control(parameters: dict, player=None, **_ctx):
         from earth.earth_services import route_summary
 
         try:
-            return route_summary(origin, destination)
+            return (
+                f"{route_summary(origin, destination)} "
+                "The OSIRIS panel is open; it does not support route plotting "
+                "through a documented URL parameter."
+            )
         except (requests.RequestException, ValueError) as exc:
             return (
-                f"The Earth route finder opened for {origin} to {destination}, "
-                f"but place data is currently unavailable: {exc}"
+                f"The OSIRIS panel opened, but a route summary for {origin} "
+                f"to {destination} is currently unavailable: "
+                f"{exc}"
             )
     return f"Earth widget command sent: {command}."
 
