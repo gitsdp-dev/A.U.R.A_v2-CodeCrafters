@@ -33,7 +33,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QCursor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
+    QFontDatabase, QFontMetricsF, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 # Video playback for the HUD. Part of PyQt6, so it costs no new dependency —
@@ -111,7 +111,7 @@ def _read_full_config() -> dict:
         return {}
 
 
-_DEFAULT_W, _DEFAULT_H = 1080, 700
+_DEFAULT_W, _DEFAULT_H = 1919 , 1079
 _MIN_W,     _MIN_H     = 820, 580
 _LEFT_W  = 206
 _RIGHT_W = 340
@@ -5105,8 +5105,8 @@ class WeatherWidget(_HudOverlay):
     thread through a signal, so the UI never blocks."""
 
     _W          = 244
-    _MARGIN     = 12                # gap from the left edge
-    _TOP        = 54 + 10           # just below the 54 px header bar
+    _MARGIN     = 16                # gap from the left edge (aligned with the title)
+    _TOP        = 38 + 54 + 12      # below the title bar and the big A.U.R.A header
     _REFRESH_MS = 10 * 60 * 1000    # auto-refresh while visible
 
     _result_sig = pyqtSignal(object)
@@ -10574,6 +10574,10 @@ class NeuralMapView(QWidget):
         if self._overlay is not None:
             self._overlay.show()
             self._overlay.invalidate()
+        # Lay the side panels out as soon as the page is on screen, so they
+        # start expanded instead of waiting for a later resize.
+        self._layout_overlays()
+        QTimer.singleShot(0, self._layout_overlays)
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -10586,7 +10590,7 @@ class NeuralMapView(QWidget):
 
     def _layout_overlays(self):
         w, h = self.width(), self.height()
-        panel_w = min(228, max(190, int(w * 0.24))) if self._panel.isVisible() else 0
+        panel_w = min(228, max(190, int(w * 0.24))) if not self._panel.isHidden() else 0
         weather = getattr(self.window(), "_weather_widget", None)
         panel_y = 10
         if weather is not None and weather.isVisible():
@@ -10616,12 +10620,12 @@ class NeuralMapView(QWidget):
             QTimer.singleShot(0, main._position_notification_panel)
 
     def _toggle_panel(self):
-        self._panel.setVisible(not self._panel.isVisible())
+        self._panel.setVisible(self._panel.isHidden())
         self._layout_overlays()
         self._canvas.update()
 
     def _toggle_drive_tray(self):
-        expanded = not self._drive_tray_body.isVisible()
+        expanded = self._drive_tray_body.isHidden()
         self._drive_tray_body.setVisible(expanded)
         self._drive_tray_toggle.setText("DRIVES  ˄" if expanded else "DRIVES  ˅")
         self._layout_overlays()
@@ -10902,6 +10906,338 @@ class NeuralMapView(QWidget):
 # ═══════ NEURAL MAP MODE – END ═══════
 
 
+class _WinCtl(QPushButton):
+    """Window-control button (minimise / maximise-restore / close).
+
+    The glyph is vector-drawn and every colour is read from the live palette at
+    paint time, so accent re-theming and DPI scaling both just work."""
+
+    def __init__(self, kind: str, tip: str, parent=None):
+        super().__init__(parent)
+        self._kind = kind                # "min" | "max" | "close"
+        self._restored_icon = False      # True → draw the "restore" glyph
+        self.setFixedSize(46, 38)
+        self.setToolTip(tip)
+        self.setAccessibleName(tip)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def set_restore_icon(self, on: bool) -> None:
+        on = bool(on)
+        if on != self._restored_icon:
+            self._restored_icon = on
+            self.setToolTip("Restore" if on else "Maximise")
+            self.setAccessibleName(self.toolTip())
+            self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        W, H = float(self.width()), float(self.height())
+        close = self._kind == "close"
+        hot = self.underMouse() or self.isDown()
+
+        if hot:
+            if close:
+                bg = qcol(C.RED, 255 if self.isDown() else 225)
+            else:
+                bg = qcol(C.PRI, 70 if self.isDown() else 42)
+            p.fillRect(QRectF(0, 0, W, H), bg)
+            # slim accent edge along the bottom of a hovered button
+            p.fillRect(QRectF(0, H - 2, W, 2), qcol(C.WHITE if close else C.PRI))
+
+        if hot and close:
+            col = qcol("#ffffff")
+        elif hot:
+            col = qcol(C.WHITE)
+        else:
+            col = qcol(C.TEXT_MED)
+        pen = QPen(col, 1.4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        cx, cy = W / 2.0, H / 2.0
+        s = 5.0
+        if self._kind == "min":
+            p.drawLine(QPointF(cx - s, cy + 0.5), QPointF(cx + s, cy + 0.5))
+        elif self._kind == "max":
+            if self._restored_icon:
+                o = 2.0
+                p.drawRect(QRectF(cx - s, cy - s + o, 2 * s - o, 2 * s - o))
+                p.drawPolyline(_NmPolygonF([
+                    QPointF(cx - s + o, cy - s + o), QPointF(cx - s + o, cy - s),
+                    QPointF(cx + s, cy - s), QPointF(cx + s, cy + s - o),
+                    QPointF(cx + s - o, cy + s - o)]))
+            else:
+                p.drawRect(QRectF(cx - s, cy - s, 2 * s, 2 * s))
+        else:
+            p.drawLine(QPointF(cx - s, cy - s), QPointF(cx + s, cy + s))
+            p.drawLine(QPointF(cx - s, cy + s), QPointF(cx + s, cy - s))
+        p.end()
+
+
+class AuraTitleBar(QWidget):
+    """Frameless-window title bar: brand mark, title, and vector window controls.
+
+    Drag to move (native system move, so Windows snap works), double-click to
+    maximise / restore. All colours come from the live palette."""
+
+    HEIGHT = 38
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._window = parent
+        self._drag_pos = None
+        self._active = True
+        self._title = "A.U.R.A"
+        self._subtitle = "AUTONOMOUS USER RESPONSIVE AGENT"
+
+        self.setFixedHeight(self.HEIGHT)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addStretch(1)
+
+        self.min_btn = _WinCtl("min", "Minimise")
+        self.max_btn = _WinCtl("max", "Maximise")
+        self.close_btn = _WinCtl("close", "Close")
+        layout.addWidget(self.min_btn)
+        layout.addWidget(self.max_btn)
+        layout.addWidget(self.close_btn)
+
+        self.min_btn.clicked.connect(self._window.showMinimized)
+        self.max_btn.clicked.connect(self._toggle_maximize)
+        self.close_btn.clicked.connect(self._window.close)
+
+        self._window.installEventFilter(self)
+        self._sync_state()
+
+    # ── public ──────────────────────────────────────────────────────────────
+    def set_title(self, title: str) -> None:
+        self._title = str(title or "A.U.R.A")
+        self.update()
+
+    # ── state ───────────────────────────────────────────────────────────────
+    def _sync_state(self) -> None:
+        w = self._window
+        self.max_btn.set_restore_icon(w.isMaximized() or w.isFullScreen())
+        self._active = w.isActiveWindow()
+        self.update()
+
+    def _toggle_maximize(self):
+        if self._window.isFullScreen():
+            self._window.showNormal()
+        elif self._window.isMaximized():
+            self._window.showNormal()
+        else:
+            self._window.showMaximized()
+
+    def eventFilter(self, obj, event):
+        if obj is self._window and event.type() in (
+                QEvent.Type.WindowStateChange, QEvent.Type.ActivationChange):
+            self._sync_state()
+        return False
+
+    # ── painting ────────────────────────────────────────────────────────────
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        W, H = float(self.width()), float(self.height())
+
+        bg = QLinearGradient(0, 0, 0, H)
+        bg.setColorAt(0.0, qcol(C.PRI_GHO, 255))
+        bg.setColorAt(1.0, qcol(C.BG, 255))
+        p.fillRect(QRectF(0, 0, W, H), QBrush(bg))
+
+        # hairline along the bottom: accent on the left fading to the border colour
+        rule = QLinearGradient(0, 0, W, 0)
+        rule.setColorAt(0.0, qcol(C.PRI, 230 if self._active else 110))
+        rule.setColorAt(0.35, qcol(C.BORDER_A, 200))
+        rule.setColorAt(1.0, qcol(C.BORDER, 150))
+        p.fillRect(QRectF(0, H - 1, W, 1), QBrush(rule))
+
+        # brand mark: ring with a core
+        mx, my = 24.0, H / 2.0 - 0.5
+        accent = qcol(C.PRI, 255 if self._active else 140)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(accent, 1.4))
+        p.drawEllipse(QPointF(mx, my), 8.0, 8.0)
+        p.setPen(QPen(qcol(C.PRI, 110 if self._active else 60), 1.0))
+        p.drawArc(QRectF(mx - 11.5, my - 11.5, 23.0, 23.0), 30 * 16, 100 * 16)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(accent))
+        p.drawEllipse(QPointF(mx, my), 2.6, 2.6)
+
+        # title + subtitle
+        tf = QFont("Consolas", 11, QFont.Weight.Bold)
+        tf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
+        p.setFont(tf)
+        p.setPen(qcol(C.PRI if self._active else C.TEXT_DIM))
+        p.drawText(QRectF(44, 0, 160, H),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   self._title)
+        tw = QFontMetricsF(tf).horizontalAdvance(self._title) + 3 * len(self._title)
+
+        sx = 44 + tw + 14
+        p.setPen(QPen(qcol(C.BORDER_A, 200), 1))
+        p.drawLine(QPointF(sx - 7, H / 2 - 7), QPointF(sx - 7, H / 2 + 7))
+        sf = QFont("Consolas", 7)
+        sf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
+        p.setFont(sf)
+        p.setPen(qcol(C.TEXT_DIM))
+        avail = max(0.0, W - self.min_btn.width() * 3 - sx - 12)
+        if avail > 120:
+            p.drawText(QRectF(sx, 0, avail, H),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       self._subtitle)
+        p.end()
+
+    # ── drag / double-click ─────────────────────────────────────────────────
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            h = self._window.windowHandle()
+            if h is not None and not self._window.isFullScreen():
+                try:
+                    if h.startSystemMove():
+                        event.accept()
+                        return
+                except Exception:
+                    pass
+            self._drag_pos = event.globalPosition().toPoint()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and not self._window.isMaximized():
+            delta = event.globalPosition().toPoint() - self._drag_pos
+            self._window.move(self._window.pos() + delta)
+            self._drag_pos = event.globalPosition().toPoint()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._toggle_maximize()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class _EdgeResizer(QObject):
+    """Resize a frameless top-level window from every edge and corner.
+
+    The window is fully covered by child widgets, so it never sees the mouse
+    itself; this watches the application's mouse events instead, shows the
+    right resize cursor near the border and hands the drag to the system
+    (startSystemResize), which gives native behaviour including snap."""
+
+    MARGIN = 6
+
+    def __init__(self, window: QWidget):
+        super().__init__(window)
+        self._w = window
+        self._cursor_on = False
+        self._shape = None
+        QApplication.instance().installEventFilter(self)
+
+    def detach(self) -> None:
+        self._clear()
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
+
+    def _active(self) -> bool:
+        w = self._w
+        return (w.isVisible() and not w.isMaximized()
+                and not w.isFullScreen() and not w.isMinimized())
+
+    def _edges_at(self, gp: QPoint):
+        g = self._w.frameGeometry()
+        if not g.contains(gp):
+            return Qt.Edge(0)
+        m = self.MARGIN
+        ed = Qt.Edge(0)
+        if gp.x() < g.left() + m:
+            ed |= Qt.Edge.LeftEdge
+        if gp.x() > g.right() - m:
+            ed |= Qt.Edge.RightEdge
+        if gp.y() < g.top() + m:
+            ed |= Qt.Edge.TopEdge
+        if gp.y() > g.bottom() - m:
+            ed |= Qt.Edge.BottomEdge
+        return ed
+
+    @staticmethod
+    def _cursor_for(ed):
+        L, R = Qt.Edge.LeftEdge, Qt.Edge.RightEdge
+        T, B = Qt.Edge.TopEdge, Qt.Edge.BottomEdge
+        if (ed & L and ed & T) or (ed & R and ed & B):
+            return Qt.CursorShape.SizeFDiagCursor
+        if (ed & R and ed & T) or (ed & L and ed & B):
+            return Qt.CursorShape.SizeBDiagCursor
+        if ed & L or ed & R:
+            return Qt.CursorShape.SizeHorCursor
+        return Qt.CursorShape.SizeVerCursor
+
+    def _set(self, shape) -> None:
+        if shape == self._shape and self._cursor_on:
+            return
+        if self._cursor_on:
+            QApplication.changeOverrideCursor(QCursor(shape))
+        else:
+            QApplication.setOverrideCursor(QCursor(shape))
+            self._cursor_on = True
+        self._shape = shape
+
+    def _clear(self) -> None:
+        if self._cursor_on:
+            QApplication.restoreOverrideCursor()
+            self._cursor_on = False
+            self._shape = None
+
+    def eventFilter(self, obj, event):
+        try:
+            t = event.type()
+            if t not in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress):
+                return False
+            if not isinstance(obj, QWidget) or obj.window() is not self._w:
+                self._clear()
+                return False
+            if not self._active():
+                self._clear()
+                return False
+            if QApplication.mouseButtons() & ~Qt.MouseButton.LeftButton \
+                    and t == QEvent.Type.MouseMove:
+                return False
+            ed = self._edges_at(event.globalPosition().toPoint())
+            if not ed:
+                self._clear()
+                return False
+            self._set(self._cursor_for(ed))
+            if (t == QEvent.Type.MouseButtonPress
+                    and event.button() == Qt.MouseButton.LeftButton):
+                h = self._w.windowHandle()
+                if h is not None and h.startSystemResize(ed):
+                    self._clear()
+                    return True
+        except Exception:
+            pass
+        return False
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -10969,13 +11305,17 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(f"{_display}")
         self.setMinimumSize(_MIN_W, _MIN_H)
-        self.resize(_DEFAULT_W, _DEFAULT_H)
+
+        
+        # AURA custom window frame
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.FramelessWindowHint
+        )
+
 
         screen = QApplication.primaryScreen().availableGeometry()
-        self.move(
-            (screen.width()  - _DEFAULT_W) // 2,
-            (screen.height() - _DEFAULT_H) // 2,
-        )
+        self.setGeometry(screen)
 
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
@@ -10997,6 +11337,7 @@ class MainWindow(QMainWindow):
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
 
+        
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
         self.setCentralWidget(central)
@@ -11004,7 +11345,15 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._build_header())
+
+        # Custom AURA title bar
+        self._title_bar = AuraTitleBar(self)
+        root.addWidget(self._title_bar)
+
+        # Existing AURA header
+        self._header_w = self._build_header()
+        root.addWidget(self._header_w)
+
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -11163,11 +11512,23 @@ class MainWindow(QMainWindow):
         self._room_box = _RoomWatchBox(self.centralWidget())
         self._room_box.on_close = self._room_close
         self._room_box.on_move = self._position_earth_box
+        # God's Eye cover state: while the maximised God's Eye is up, the floating
+        # panels (news video, USD/INR graph, long-response box) sit behind it.
+        self._earth_cover_on = False          # True while God's Eye is maximised + visible
+        self._earth_hidden_wins = []          # [(panel, QRect)] top-level panels parked by us
+        self._earth_content_above = False     # response box was stacked above God's Eye
         if EarthWidget is not None:
             self._earth_box = EarthWidget(self.centralWidget())
             self._earth_box.on_close = self._earth_close
             self._earth_box.show()
             self._position_earth_box()
+            # React the moment it maximises / restores / closes (resize + show/hide);
+            # the slow timer is only a safety net and costs a couple of attribute reads.
+            self._earth_box.installEventFilter(self)
+            self._earth_cover_timer = QTimer(self)
+            self._earth_cover_timer.setInterval(250)
+            self._earth_cover_timer.timeout.connect(self._earth_cover_sync)
+            self._earth_cover_timer.start()
         else:
             self._earth_box = None
         self._room_frame_sig.connect(self._on_room_frame)
@@ -11209,6 +11570,8 @@ class MainWindow(QMainWindow):
 
         # Weather pop-up: draggable + closable, spawns top-left. F9 toggles it.
         self._weather_widget = WeatherWidget(self.centralWidget())
+        self._weather_widget._TOP = (self._title_bar.height()
+                                     + self._header_w.height() + 12)
         self._weather_widget.open_widget()
         self._notification_center = NotificationCenter()
         self._notification_toasts = NotificationToastManager(
@@ -11263,6 +11626,9 @@ class MainWindow(QMainWindow):
 
         # Floating always-on-top orb: appears only while this window is minimised.
         self._mini_orb = MiniOrbWidget(self)
+
+        # Resize from any edge / corner (the window is frameless).
+        self._edge_resizer = _EdgeResizer(self)
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -11994,7 +12360,8 @@ class MainWindow(QMainWindow):
         else:
             # Top-right corner, just below the mic / stop / settings buttons
             # (the header is 54 px tall).
-            b.move(max(0, cw.width() - b.width() - 16), 54 + 10)
+            top = (self._title_bar.height() + self._header_w.height() + 10)
+            b.move(max(0, cw.width() - b.width() - 16), top)
 
     def _earth_close(self) -> None:
         b = getattr(self, "_earth_box", None)
@@ -12064,6 +12431,10 @@ class MainWindow(QMainWindow):
         if _Motion.main_out(self, e):       # first pass: fade everything out, then re-enter
             return
         _Motion.quitting = True             # really closing: no more deferred fades
+        try:
+            self._edge_resizer.detach()
+        except Exception:
+            pass
         self._news_shutting_down = True
         self._open_seq.cancel()
         self._close_news_video()
@@ -13072,6 +13443,8 @@ class MainWindow(QMainWindow):
         # NEURAL: never disturb camera/video pages while changing the preference.
         self._hud_mode = "neural" if mode == "neural" else "standard"
         self._refresh_hud_mode_buttons()
+        if self._hud_mode == "neural":
+            self._ensure_maximised()
         current = self._hud_cam_stack.currentIndex() if hasattr(self, "_hud_cam_stack") else -1
         if current in (0, 3) or current < 0:
             self._hud_cam_stack.setCurrentIndex(self._hud_home_index())
@@ -13085,6 +13458,15 @@ class MainWindow(QMainWindow):
                 API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
             except Exception as exc:
                 print(f"[Neural] Mode preference could not be saved: {exc}")
+
+    def _ensure_maximised(self):
+        """The neural map needs the whole screen: keep the window maximised."""
+        if self.isMinimized() or self.isFullScreen() or self.isMaximized():
+            return
+        if self.isVisible():
+            self.showMaximized()
+        else:
+            self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
 
     def _toggle_hud_mode(self):
         self._set_hud_mode("standard" if self._hud_mode == "neural" else "neural")
@@ -13916,10 +14298,122 @@ class MainWindow(QMainWindow):
                 pass
 
     def eventFilter(self, watched, event):
+        if (watched is getattr(self, "_earth_box", None)
+                and watched is not None
+                and event.type() in (QEvent.Type.Resize, QEvent.Type.Show,
+                                     QEvent.Type.Hide)):
+            QTimer.singleShot(0, self._earth_cover_sync)
         if (watched is getattr(self, "_content_panel", None)
                 and event.type() == QEvent.Type.Hide):
             self._close_fx_graph()
         return super().eventFilter(watched, event)
+
+    # ── God's Eye cover ──────────────────────────────────────────────────────
+    # While God's Eye is maximised the floating panels fall behind it but stay
+    # open; when it is restored or closed they come back exactly where the user
+    # left them. A panel the user closed by hand is never brought back.
+    #   • long-response / news-text box: a child of the central widget, so it is
+    #     simply stacked under God's Eye (no hide, no animation, nothing closes).
+    #   • news video + USD/INR graph: separate top-level windows, which the OS
+    #     always draws above any child widget — so they are parked (hidden, not
+    #     closed) with their geometry remembered, then restored.
+    def _earth_is_covering(self) -> bool:
+        b = getattr(self, "_earth_box", None)
+        if b is None:
+            return False
+        try:
+            return bool(b.isVisible() and getattr(b, "_maximized", False))
+        except RuntimeError:
+            return False
+
+    def _earth_float_panels(self):
+        out = []
+        for p in (self._news_video_panel, self._fx_graph_panel):
+            if p is not None and _mo_alive(p) and not getattr(p, "_closed", False):
+                out.append(p)
+        return out
+
+    def _earth_cover_sync(self) -> None:
+        if getattr(self, "_news_shutting_down", False):
+            return
+        covering = self._earth_is_covering()
+        if covering:
+            if not self._earth_cover_on:
+                self._earth_cover_on = True
+                self._earth_enter_cover()
+            else:
+                self._earth_hold_cover()
+        elif self._earth_cover_on:
+            if self.isMinimized():
+                return                      # restore once AURA is back on screen
+            self._earth_cover_on = False
+            self._earth_leave_cover()
+
+    def _earth_push_content_under(self) -> None:
+        b = self._earth_box
+        cp = getattr(self, "_content_panel", None)
+        cw = self.centralWidget()
+        if b is None or cp is None or cw is None or not cp.isVisible():
+            return
+        try:
+            kids = cw.children()
+            if kids.index(cp) > kids.index(b):
+                cp.stackUnder(b)
+                self._earth_content_above = True
+        except (ValueError, RuntimeError):
+            pass
+
+    def _earth_enter_cover(self) -> None:
+        self._earth_content_above = False
+        self._earth_hidden_wins = []
+        self._earth_hold_cover()
+
+    def _earth_hold_cover(self) -> None:
+        # Also catches panels that open (or re-show) while God's Eye is up.
+        self._earth_push_content_under()
+        for p in self._earth_float_panels():
+            if not p.isVisible() or getattr(p, "_mo_fading", False):
+                continue
+            rect = QRect(p.geometry())
+            off = (getattr(p, "_mo_state", None) or {}).get("off", 0)
+            if off:
+                rect.translate(0, -off)     # undo a glide still in flight
+            self._earth_hidden_wins = [
+                (q, r) for (q, r) in self._earth_hidden_wins if q is not p]
+            self._earth_hidden_wins.append((p, rect))
+            try:
+                _Motion.win_fade(p, p.hide)
+            except RuntimeError:
+                pass
+
+    def _earth_leave_cover(self) -> None:
+        b = self._earth_box
+        cp = getattr(self, "_content_panel", None)
+        if (self._earth_content_above and b is not None and cp is not None
+                and cp.isVisible()):
+            try:
+                b.stackUnder(cp)            # response box back on top, as before
+            except RuntimeError:
+                pass
+        self._earth_content_above = False
+        parked = self._earth_hidden_wins
+        self._earth_hidden_wins = []
+        for i, (p, rect) in enumerate(parked):      # one by one: no hitch
+            QTimer.singleShot(
+                i * 150, lambda p=p, r=rect: self._earth_restore_panel(p, r))
+
+    def _earth_restore_panel(self, p, rect) -> None:
+        if (not _mo_alive(p) or getattr(p, "_closed", True)
+                or p not in (self._news_video_panel, self._fx_graph_panel)):
+            return                          # closed by the user / replaced meanwhile
+        if self._earth_cover_on:
+            self._earth_hidden_wins.append((p, rect))   # covered again: keep parked
+            return
+        if p.isVisible():
+            return
+        p.setGeometry(rect)                 # exactly where the user left it
+        p.show()
+        p.raise_()
 
     # ── document review ──────────────────────────────────────────────────────
     # Rendered as rich text into the content panel that already exists, rather
@@ -14979,7 +15473,7 @@ class AuraUI:
             parent=self._win, accent_provider=lambda: C.PRI
         )
         self.on_system_control_action = None
-        self._win.show()
+        self._win.showMaximized()
         self.root = _RootShim(self._app)
 
     @property
