@@ -10,9 +10,12 @@ from __future__ import annotations
 import asyncio
 import os
 import queue as _queue
+import sys
 import threading
 import time
 from pathlib import Path
+
+from compat import get_python_executable
 from typing import Callable, Optional
 
 import numpy as np
@@ -155,6 +158,12 @@ def _import_kokoro_pipeline():
     """
     import sys
 
+    if sys.version_info >= (3, 13):
+        raise RuntimeError(
+            "The torch-based Kokoro engine is not installed on Python 3.13+. "
+            "Select another TTS engine or use the Kokoro ONNX voice path."
+        )
+
     def _try_import():
         from kokoro import KPipeline  # noqa: PLC0415
         return KPipeline
@@ -173,8 +182,13 @@ def _import_kokoro_pipeline():
         # ── Version mismatch: upgrade kokoro silently and retry ──────────
         print("[TTS] Kokoro/transformers version mismatch detected — upgrading kokoro…")
         import subprocess
+        python_exe = get_python_executable()
+        if not python_exe:
+            raise RuntimeError(
+                "Kokoro cannot be upgraded in this frozen build because Python is unavailable."
+            ) from first_err
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "kokoro>=0.9",
+            [python_exe, "-m", "pip", "install", "kokoro>=0.9",
              "--upgrade", "--quiet", "--disable-pip-version-check"],
             capture_output=True,
         )
@@ -407,7 +421,12 @@ class KokoroONNXTTSEngine:
                         "Kokoro ONNX assets are missing. Run "
                         "scripts/download_models.py."
                     )
-                from kokoro_onnx import Kokoro
+                try:
+                    from kokoro_onnx import Kokoro
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Kokoro ONNX is unavailable; reinstall A.U.R.A's core requirements."
+                    ) from exc
 
                 print("[TTS] Loading Kokoro ONNX model on CPU…")
                 model = Kokoro(str(self.model_path), str(self.voices_path))
@@ -539,6 +558,11 @@ class TTSPlayer:
 def create_tts_player(config: dict) -> TTSPlayer:
     engine_name = config.get("tts_engine", "edgetts").lower()
     if engine_name == "kokoro":
+        if sys.version_info >= (3, 13):
+            raise RuntimeError(
+                "The torch-based Kokoro engine is unsupported on Python 3.13+; "
+                "choose Edge TTS or another available engine."
+            )
         voice  = config.get("tts_voice", "af_heart")
         speed  = float(config.get("tts_speed", 1.0))
         engine = KokoroTTSEngine(voice=voice, speed=speed)

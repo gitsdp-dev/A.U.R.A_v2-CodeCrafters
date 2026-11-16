@@ -124,8 +124,8 @@ def _open_file(path: Path) -> bool:
 
 
 def _locate(image, query: str, api_key: str) -> dict:
-    from google import genai
     from google.genai import types as gtypes
+    from core import gemini
 
     w, h = image.size
     upload_img = image
@@ -160,14 +160,17 @@ def _locate(image, query: str, api_key: str) -> dict:
         "Keep steps short (max 6)."
     )
 
-    client = genai.Client(api_key=api_key)
-    resp = client.models.generate_content(
-        model=_MODEL,
-        contents=[
+    resp = gemini.call(
+        [
             gtypes.Part.from_bytes(data=jpg_bytes, mime_type="image/jpeg"),
             prompt,
         ],
+        tier=_MODEL,
+        task_type="file_task",
+        key=api_key,
     )
+    if resp is None:
+        raise RuntimeError("Gemini returned no screen annotation.")
     text = (resp.text or "").strip()
     if "{" in text and "}" in text:
         text = text[text.find("{"): text.rfind("}") + 1]
@@ -214,13 +217,16 @@ def _refine_box(image_full, approx_px_box: tuple, instruction: str, api_key: str
     )
 
     try:
-        from google import genai
         from google.genai import types as gtypes
-        client = genai.Client(api_key=api_key)
-        resp = client.models.generate_content(
-            model=_MODEL,
-            contents=[gtypes.Part.from_bytes(data=jpg_bytes, mime_type="image/jpeg"), prompt],
+        from core import gemini
+        resp = gemini.call(
+            [gtypes.Part.from_bytes(data=jpg_bytes, mime_type="image/jpeg"), prompt],
+            tier=_MODEL,
+            task_type="file_task",
+            key=api_key,
         )
+        if resp is None:
+            return approx_px_box
         text = (resp.text or "").strip()
         if "{" in text and "}" in text:
             text = text[text.find("{"): text.rfind("}") + 1]

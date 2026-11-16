@@ -6,13 +6,16 @@ packages in requirements.txt carry `sys_platform` markers, so a macOS or Linux
 user never pulls Windows-only libraries (and vice-versa). It also downloads
 the offline voice models and configures the selected local LLM provider.
 
-One thing it deliberately does NOT install:
-  * the optional local wake word ("Hey Aura") — one-click, opt-in, from
-    ⚙ → WAKE WORD inside the app;
+One thing it deliberately does NOT enable:
+  * the optional local wake word ("Hey Aura") — its Vosk and pynput runtime
+    dependencies are installed with the core requirements, and listening can
+    be changed from ⚙ → WAKE WORD inside the app;
   * anything for the avatar — its holographic head renders in software.
 """
 import json
+import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,13 +24,136 @@ from pathlib import Path
 OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 HERE = Path(__file__).resolve().parent
 
-MIN_PY = (3, 11)        # hard floor: below this the syntax used here won't parse
-MAX_PY = (3, 13)        # highest version this is actually tested on
+MIN_PY = (3, 10)
+MAX_PY = (3, 14)        # highest version covered by the compatibility matrix
+
+
+def _python_version(executable: str) -> tuple[int, int] | None:
+    try:
+        result = subprocess.run(
+            [
+                executable, "-c",
+                "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        major, minor = result.stdout.strip().split(".")
+        return int(major), int(minor)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _find_python312() -> str | None:
+    """Find an installed Python 3.12 without relying on the current PATH alias."""
+    if sys.version_info[:2] == (3, 12):
+        return sys.executable
+
+    if os.name == "nt" and shutil.which("py"):
+        try:
+            result = subprocess.run(
+                ["py", "-3.12", "-c", "import sys; print(sys.executable)"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            candidate = result.stdout.strip()
+            if result.returncode == 0 and candidate and _python_version(candidate) == (3, 12):
+                return candidate
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    for name in ("python3.12", "python3.12.exe"):
+        candidate = shutil.which(name)
+        if candidate and _python_version(candidate) == (3, 12):
+            return candidate
+    return None
+
+
+def _venv_python(root: Path) -> Path:
+    if os.name == "nt":
+        return root / ".venv" / "Scripts" / "python.exe"
+    return root / ".venv" / "bin" / "python"
+
+
+def _setup_python(
+    root: Path = HERE,
+    current_version: tuple[int, int] | None = None,
+    current_executable: str | None = None,
+) -> str:
+    """Use the current 3.12 environment, or prepare/reuse a Python 3.12 venv."""
+    version = current_version or sys.version_info[:2]
+    if version == (3, 12):
+        return current_executable or sys.executable
+
+    base_python = _find_python312()
+    if not base_python:
+        raise RuntimeError(
+            "Python 3.12 is required when setup.py is run with another Python. "
+            "Install Python 3.12 and rerun setup.py."
+        )
+
+    interpreter = _venv_python(root)
+    venv_dir = root / ".venv"
+    if interpreter.is_file():
+        existing_version = _python_version(str(interpreter))
+        if existing_version != (3, 12):
+            found = (
+                f"{existing_version[0]}.{existing_version[1]}"
+                if existing_version
+                else "an unknown version"
+            )
+            raise RuntimeError(
+                f"{venv_dir} already contains {found}; refusing to replace it. "
+                "Use a Python 3.12 .venv or move the existing environment first."
+            )
+        return str(interpreter)
+    if venv_dir.exists():
+        raise RuntimeError(
+            f"{venv_dir} exists but has no usable Python interpreter; "
+            "move or repair it before running setup.py."
+        )
+
+    _run(
+        "Creating a Python 3.12 virtual environment…",
+        [base_python, "-m", "venv", str(venv_dir)],
+    )
+    if not interpreter.is_file() or _python_version(str(interpreter)) != (3, 12):
+        raise RuntimeError("Could not create a working Python 3.12 virtual environment.")
+    return str(interpreter)
 
 
 def _run(label: str, args: list[str]) -> None:
     print(f"\n▶ {label}")
     subprocess.run(args, check=True, cwd=HERE)
+
+
+def _install_requirements(python_exe: str) -> None:
+    """Install core (including background assistant), optional, and CAD requirements."""
+    _run(
+        "Installing core and background assistant dependencies…",
+        [python_exe, "-m", "pip", "install", "-r", str(HERE / "requirements.txt")],
+    )
+    for filename, label, feature in (
+        ("requirements-optional.txt", "optional integrations", "optional integrations"),
+        ("requirements-cad.txt", "CAD design support", "CAD design"),
+    ):
+        try:
+            _run(
+                f"Installing {label}…",
+                [python_exe, "-m", "pip", "install", "-r", str(HERE / filename)],
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(
+                f"\n⚠️  Could not install {feature} requirements ({exc}). "
+                f"Retry with:\n    \"{python_exe}\" -m pip install -r "
+                f"\"{HERE / filename}\""
+            )
 
 
 def _check_python() -> None:
@@ -114,11 +240,11 @@ def _save_voice_provider(provider: str) -> None:
     )
 
 
-def _prepare_voice_models() -> None:
+def _prepare_voice_models(python_exe: str) -> None:
     """Download Vosk and Kokoro assets using the project's resumable installer."""
     _run(
         "Downloading offline Vosk and Kokoro voice models…",
-        [sys.executable, str(HERE / "scripts" / "download_models.py")],
+        [python_exe, str(HERE / "scripts" / "download_models.py")],
     )
 
 
@@ -142,8 +268,13 @@ def _prepare_ollama(model: str) -> None:
         )
 
 
-def _show_voice_command(provider: str) -> None:
-    command = f"python main.py --voice --provider {provider}"
+def _show_voice_command(provider: str, python_exe: str) -> None:
+    interpreter = (
+        subprocess.list2cmdline([python_exe])
+        if os.name == "nt"
+        else shlex.quote(python_exe)
+    )
+    command = f"{interpreter} main.py --voice --provider {provider}"
     print(f"\nVoice mode is configured for {provider}.")
     if provider == "lmstudio":
         print(
@@ -155,16 +286,29 @@ def _show_voice_command(provider: str) -> None:
     print(f"Run this command from the project folder:\n    {command}")
 
 
+def _gui_executable(python_exe: str) -> str:
+    """Prefer pythonw on Windows so launching the GUI does not create a console."""
+    if OS == "Windows":
+        pythonw = Path(python_exe).with_name("pythonw.exe")
+        if pythonw.is_file():
+            return str(pythonw)
+    return python_exe
+
+
 def main() -> None:
     print(f"⚙  A.U.R.A v2 setup — detected OS: {OS or 'unknown'}, "
           f"Python {sys.version_info[0]}.{sys.version_info[1]}")
     _check_python()
+    try:
+        python_exe = _setup_python()
+    except RuntimeError as exc:
+        print(f"\n❌ {exc}")
+        raise SystemExit(1) from exc
 
-    # requirements.txt filters OS-specific extras by itself via pip markers.
-    _run("Installing Python dependencies (OS-specific extras auto-filtered)…",
-         [sys.executable, "-m", "pip", "install", "-r", str(HERE / "requirements.txt")])
+    # Each requirements file filters OS/Python-specific packages with markers.
+    _install_requirements(python_exe)
 
-    _prepare_voice_models()
+    _prepare_voice_models(python_exe)
     provider = _choose_provider()
     _save_voice_provider(provider)
     if provider == "ollama":
@@ -178,11 +322,11 @@ def main() -> None:
     # a user away from a working app.
     try:
         _run("Installing Playwright browsers (chromium + firefox)…",
-             [sys.executable, "-m", "playwright", "install", "chromium", "firefox"])
+             [python_exe, "-m", "playwright", "install", "chromium", "firefox"])
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"\n⚠️  Playwright browsers were not installed ({e}).")
         print("    Everything except browser automation works. Retry later with:")
-        print(f'    {sys.executable} -m playwright install chromium firefox')
+        print(f'    {python_exe} -m playwright install chromium firefox')
 
     _check_assets()
 
@@ -191,12 +335,15 @@ def main() -> None:
         try:
             import win32com.client  # noqa: F401
         except ImportError:
-            postinstall = Path(sys.executable).parent / "Scripts" / "pywin32_postinstall.py"
+            scripts_dir = Path(python_exe).parent
+            if scripts_dir.name.casefold() != "scripts":
+                scripts_dir /= "Scripts"
+            postinstall = scripts_dir / "pywin32_postinstall.py"
             print(
                 "\n⚠️  pywin32 did not register correctly — desktop-shortcut "
                 "creation will use a slower fallback. To fix it, run:\n"
-                f'    "{sys.executable}" -m pip install --force-reinstall pywin32\n'
-                f'    "{sys.executable}" "{postinstall}" -install'
+                f'    "{python_exe}" -m pip install --force-reinstall pywin32\n'
+                f'    "{python_exe}" "{postinstall}" -install'
             )
     elif OS == "Linux":
         print(
@@ -215,8 +362,15 @@ def main() -> None:
         )
 
     print("\n✅ Setup complete!")
-    print("   Text/UI mode: python main.py")
-    _show_voice_command(provider)
+    print("   Background wake-word support is installed; its setting defaults to on.")
+    print("   Change wake-word listening in Customize settings.")
+    interpreter = (
+        subprocess.list2cmdline([_gui_executable(python_exe)])
+        if os.name == "nt"
+        else shlex.quote(_gui_executable(python_exe))
+    )
+    print(f"   Text/UI mode: {interpreter} main.py")
+    _show_voice_command(provider, python_exe)
     print("   Voice model paths and wake-word settings: config.yaml")
 
 

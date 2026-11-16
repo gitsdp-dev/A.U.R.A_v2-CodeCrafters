@@ -178,7 +178,8 @@ class YouTubeNotesWorkflow:
             response = gemini.text([
                 types.Part.from_bytes(data=audio.read_bytes(), mime_type=f'audio/{mime}'),
                 'Transcribe this audio accurately. Return only the spoken words.',
-            ], tier=gemini.SMART, timeout_ms=180_000)
+            ], tier=gemini.SMART, timeout_ms=180_000,
+                task_type="long_reasoning")
             if not response:
                 raise RuntimeError('audio transcription returned no text')
             return [TranscriptSegment(0.0, float(info.get('duration') or 0), response)]
@@ -216,6 +217,7 @@ class YouTubeNotesWorkflow:
             response = gemini.text(
                 'Summarize this transcript chunk with factual key points and definitions.\n' + text,
                 tier=gemini.SMART, timeout_ms=90_000,
+                task_type="short_summary",
             )
             if not response:
                 raise RuntimeError(f'Gemini returned no summary for chunk {index}')
@@ -223,6 +225,7 @@ class YouTubeNotesWorkflow:
         merged = gemini.text(
             'Merge these transcript summaries into a factual structured note. Include TL;DR, key points, definitions, action items, and short quotes.\n' +
             '\n\n'.join(partials), tier=gemini.SMART, timeout_ms=90_000,
+            task_type="long_document_generation", critical=True,
         )
         if not merged:
             raise RuntimeError('Gemini returned no final note')

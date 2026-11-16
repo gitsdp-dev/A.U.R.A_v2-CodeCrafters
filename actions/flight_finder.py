@@ -66,6 +66,7 @@ def _parse_date(raw: str) -> str:
             f"Convert this date expression to YYYY-MM-DD: '{raw}'. "
             f"Return ONLY the date string, nothing else.",
             tier=gemini.FAST,
+            task_type="intent_parsing",
         )
         if re.match(r"\d{4}-\d{2}-\d{2}", result):
             return result
@@ -173,6 +174,7 @@ def _parse_flights_with_gemini(
                     "Return ONLY valid JSON — no markdown, no explanation."
                 )
             ),
+            task_type="file_task",
         )
         text     = re.sub(r"```(?:json)?", "", response.text).strip().rstrip("`").strip()
         flights  = json.loads(text)

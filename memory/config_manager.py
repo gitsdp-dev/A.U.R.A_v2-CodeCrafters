@@ -2,6 +2,7 @@ import json
 import sys
 from pathlib import Path
 
+
 def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
@@ -74,11 +75,18 @@ def get_local_llm_config() -> dict:
     engine_voices = raw.get("tts_voice_by_engine", {})
     if not isinstance(engine_voices, dict):
         engine_voices = {}
+    try:
+        deep_daily_budget = int(raw.get("deep_daily_budget", 50))
+    except (TypeError, ValueError):
+        deep_daily_budget = 50
+    deep_daily_budget = max(1, min(10000, deep_daily_budget))
     return {
         "mode": mode,
         "provider": provider,
         "base_url": base_url,
         "model": str(raw.get("model", "")).strip(),
+        "auto_model_switching": bool(raw.get("auto_model_switching", True)),
+        "deep_daily_budget": deep_daily_budget,
         "voice_id": str(raw.get("voice_id", "")).strip(),
         "voice_by_model": {
             str(model): str(voice) for model, voice in voices.items()
@@ -128,6 +136,16 @@ def save_local_llm_config(settings: dict) -> None:
             or current.get("mode") not in {"gemini", "local", "fallback"}):
         raise ValueError("mode must be 'gemini', 'local', or 'fallback'")
     current["base_url"] = str(current.get("base_url", "")).strip().rstrip("/")
+    current["auto_model_switching"] = bool(
+        current.get("auto_model_switching", True)
+    )
+    try:
+        deep_daily_budget = int(current.get("deep_daily_budget", 50))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("deep_daily_budget must be an integer from 1 to 10000") from exc
+    if not 1 <= deep_daily_budget <= 10000:
+        raise ValueError("deep_daily_budget must be an integer from 1 to 10000")
+    current["deep_daily_budget"] = deep_daily_budget
     if not current["base_url"]:
         current["base_url"] = (
             "http://127.0.0.1:11434" if provider == "ollama"
@@ -209,20 +227,136 @@ def save_voice(voice_name: str) -> None:
 
 
 def get_wake_word_enabled() -> bool:
-    """Whether local wake-word gating is on (assistant sleeps until 'Hey Jarvis')."""
-    return load_api_keys().get("wake_word_enabled", False)
+    """Whether the offline background wake-word listener is enabled."""
+    return bool(load_api_keys().get("wake_word_enabled", True))
 
 
 def save_wake_word_enabled(enabled: bool) -> None:
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
+    _save_flag("wake_word_enabled", bool(enabled))
+
+
+def get_wake_word_sensitivity() -> float:
+    """Return wake-listener sensitivity, clamped to the supported 0.1–1.0 range."""
+    try:
+        value = float(load_api_keys().get("wake_word_sensitivity", 0.65))
+    except (TypeError, ValueError):
+        value = 0.65
+    return max(0.1, min(1.0, value))
+
+
+def save_wake_word_sensitivity(sensitivity: float) -> None:
+    try:
+        value = float(sensitivity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Wake-word sensitivity must be between 0.1 and 1.0") from exc
+    if not 0.1 <= value <= 1.0:
+        raise ValueError("Wake-word sensitivity must be between 0.1 and 1.0")
+    _save_flag("wake_word_sensitivity", round(value, 2))
+
+
+_BACKGROUND_ASSISTANT_DEFAULTS = {
+    "end_of_speech_ms": 1800,
+    "max_utterance_seconds": 120,
+    "response_timeout_seconds": 120,
+    "vad_sensitivity": 0.65,
+    "auto_hide_enabled": False,
+    "auto_hide_minutes": 10,
+    "speak_responses": True,
+    "conversation_mode": True,
+    "voice_interrupt_enabled": True,
+}
+
+
+def get_background_assistant_config() -> dict:
+    """Return bounded background-assistant preferences with safe defaults."""
+    raw = load_api_keys().get("background_assistant", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    values = dict(_BACKGROUND_ASSISTANT_DEFAULTS)
+    values.update(raw)
+    for key, default, minimum, maximum in (
+        ("end_of_speech_ms", 1800, 500, 5000),
+        ("max_utterance_seconds", 120, 10, 600),
+        ("response_timeout_seconds", 120, 10, 600),
+        ("auto_hide_minutes", 10, 1, 120),
+    ):
         try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    data["wake_word_enabled"] = bool(enabled)
+            values[key] = max(minimum, min(maximum, int(values[key])))
+        except (TypeError, ValueError):
+            values[key] = default
+    try:
+        values["vad_sensitivity"] = max(
+            0.1, min(1.0, float(values["vad_sensitivity"]))
+        )
+    except (TypeError, ValueError):
+        values["vad_sensitivity"] = _BACKGROUND_ASSISTANT_DEFAULTS[
+            "vad_sensitivity"
+        ]
+    for key in (
+        "auto_hide_enabled", "speak_responses", "conversation_mode",
+        "voice_interrupt_enabled",
+    ):
+        values[key] = (
+            values[key]
+            if isinstance(values[key], bool)
+            else _BACKGROUND_ASSISTANT_DEFAULTS[key]
+        )
+    return values
+
+
+def save_background_assistant_config(values: dict) -> None:
+    """Merge validated background-assistant preferences into existing config."""
+    if not isinstance(values, dict):
+        raise TypeError("Background assistant settings must be a dictionary")
+    current = get_background_assistant_config()
+    current.update(values)
+    for key, minimum, maximum in (
+        ("end_of_speech_ms", 500, 5000),
+        ("max_utterance_seconds", 10, 600),
+        ("response_timeout_seconds", 10, 600),
+        ("auto_hide_minutes", 1, 120),
+    ):
+        try:
+            current[key] = int(current[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be an integer") from exc
+        if not minimum <= current[key] <= maximum:
+            raise ValueError(f"{key} must be between {minimum} and {maximum}")
+    try:
+        current["vad_sensitivity"] = float(current["vad_sensitivity"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("vad_sensitivity must be between 0.1 and 1.0") from exc
+    if not 0.1 <= current["vad_sensitivity"] <= 1.0:
+        raise ValueError("vad_sensitivity must be between 0.1 and 1.0")
+    for key in (
+        "auto_hide_enabled", "speak_responses", "conversation_mode",
+        "voice_interrupt_enabled",
+    ):
+        current[key] = bool(current[key])
+
+    ensure_config_dir()
+    data = load_api_keys()
+    data["background_assistant"] = current
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_start_with_windows_enabled() -> bool:
+    """Whether A.U.R.A. should be started at login (legacy API name)."""
+    return bool(load_api_keys().get("start_with_windows", False))
+
+
+def save_start_with_windows_enabled(enabled: bool) -> None:
+    _save_flag("start_with_windows", bool(enabled))
+
+
+def get_start_at_login_enabled() -> bool:
+    """Whether A.U.R.A.'s platform-specific login startup is enabled."""
+    return get_start_with_windows_enabled()
+
+
+def save_start_at_login_enabled(enabled: bool) -> None:
+    """Persist the login-startup preference using the backwards-compatible key."""
+    save_start_with_windows_enabled(enabled)
 
 
 def get_push_to_talk_enabled() -> bool:

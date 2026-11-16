@@ -35,6 +35,7 @@ for _stream in ("stdout", "stderr"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import builtins
 import queue as _queue
 import threading
 import time
@@ -44,6 +45,10 @@ import traceback
 import re
 from datetime import datetime
 from pathlib import Path
+
+from compat import TaskGroup, check_python_version
+
+check_python_version()
 
 import sounddevice as sd
 import numpy as np
@@ -72,7 +77,7 @@ from actions.background_monitor import (
 )
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
-    get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
+    get_background_assistant_config, get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_input_device, get_output_device,
     get_local_llm_config, get_notifications_config, get_system_controls_config,
@@ -100,6 +105,30 @@ from core.agent.registry       import AgentToolRegistry
 from screen_agent.config import settings_section as screen_agent_settings_section
 from screen_agent.fastpath import is_screen_agent_request
 
+_OPEN_AURA_COMMAND = re.compile(
+    r"^\s*(?:(?:hey|hi)\s+(?:aura|ora|aurora)[, ]+)?"
+    r"(?:please\s+)?(?:open|show|launch|bring up|display)\s+"
+    r"(?:the\s+)?(?:aura(?:'s)?|a\.u\.r\.a\.?)"
+    r"(?:\s+(?:(?:main\s+)?(?:window|app|application)))?[.!? ]*\s*$",
+    re.IGNORECASE,
+)
+_WAKE_GREETING = "Hey, how can I help you today?"
+_CLOSE_BACKGROUND_COMMAND = re.compile(
+    r"^\s*(?:(?:hey|hi)\s+aura[, ]+)?"
+    r"(?:please\s+)?(?:close|dismiss|bye(?:\s+aura)?|that's\s+all|"
+    r"thats\s+all|we're\s+done|we\s+are\s+done)[.!? ]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_open_aura_command(text: str) -> bool:
+    return bool(_OPEN_AURA_COMMAND.fullmatch(text or ""))
+
+
+def _is_close_background_command(text: str) -> bool:
+    return bool(_CLOSE_BACKGROUND_COMMAND.fullmatch(text or ""))
+
+
 def _capture_camera_shared(ui):
     """Grab a webcam frame while the always-on room watch briefly lets go of the device."""
     _pause  = getattr(ui, "pause_room_watch", None)
@@ -124,6 +153,38 @@ def get_base_dir():
     return Path(__file__).resolve().parent
 
 BASE_DIR        = get_base_dir()
+
+# ── Startup log: the console is detached on Windows, so a crash or a silent
+# "another instance is running" exit would otherwise leave NO trace at all.
+STARTUP_LOG = BASE_DIR / "aura_startup.log"
+
+
+def _startup_log(msg: str) -> None:
+    try:
+        with open(STARTUP_LOG, "a", encoding="utf-8") as _f:
+            _f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except Exception:
+        pass
+
+
+def _hard_exit_watchdog(delay: float = 6.0) -> None:
+    """Used ONLY for a real Quit (tray menu -> Quit). "close yourself" / "Hey
+    AURA" dismissal never reaches this: that just hides to the background and
+    keeps the process alive. After a real Quit, make sure the process really
+    dies instead of lingering invisibly."""
+    def _kill():
+        time.sleep(delay)
+        _startup_log("watchdog: process still alive after shutdown, forcing exit")
+        import os as _os
+        _os._exit(0)
+    threading.Thread(target=_kill, daemon=True, name="aura-exit-watchdog").start()
+
+
+def _install_crash_logging() -> None:
+    def _hook(exc_type, exc, tb):
+        _startup_log("UNCAUGHT: " + "".join(traceback.format_exception(exc_type, exc, tb)))
+    sys.excepthook = _hook
+
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 # The conversation's model. A NAME, not a decision: the ladder lives in
@@ -206,7 +267,6 @@ def _open_input_stream(callback, device=None):
 _LEVEL_FLOOR = 60.0
 _LEVEL_FULL  = 2600.0
 _LOCAL_VOICE_FLOOR = 18.0
-_LOCAL_VOICE_NOISE_RATIO = 2.2
 
 
 def _is_gemini_quota_error(error: BaseException) -> bool:
@@ -235,9 +295,10 @@ def _pcm_level(samples) -> float:
     return min(1.0, (rms - _LEVEL_FLOOR) / (_LEVEL_FULL - _LEVEL_FLOOR))
 
 
-def _voice_threshold(noise_rms: float) -> float:
-    """Return a conservative raw-PCM VAD threshold adapted to mic noise."""
-    return max(_LOCAL_VOICE_FLOOR, noise_rms * _LOCAL_VOICE_NOISE_RATIO)
+def _background_vad_threshold(noise_rms: float, sensitivity: float) -> float:
+    """Adapt the local VAD energy threshold to the configured sensitivity."""
+    sensitivity = max(0.1, min(1.0, float(sensitivity)))
+    return max(_LOCAL_VOICE_FLOOR, noise_rms * (3.5 - 2.0 * sensitivity))
 
 
 # ── Viseme extraction ─────────────────────────────────────────────────────────
@@ -511,7 +572,9 @@ TOOL_DECLARATIONS = [
     {
         "name": "shutdown_aura",
         "description": (
-            "Shuts down the assistant completely. "
+            "Closes the assistant's window and sends it back to the background, "
+            "where it keeps listening for the wake word 'Hey AURA' (it does NOT "
+            "quit the app). "
             "Call this when the user expresses intent to end the conversation, "
             "close the assistant, say goodbye, or stop AURA. "
             "The user can say this in ANY language."
@@ -677,12 +740,34 @@ class _ReconnectSignal(Exception):
         self.keep_context = keep_context
 
 
+class _BackgroundSessionEnded(Exception):
+    """Unwind the current voice session after dismissal or background timeout."""
+
+
+class _BackgroundSessionPaused(Exception):
+    """Unwind the current voice session so its microphone is released."""
+
+
+class _ApplicationShutdown(Exception):
+    """Unwind all session tasks before the application exits."""
+
+
+def _contains_exception(exc: BaseException, expected: type[BaseException]) -> bool:
+    if isinstance(exc, expected):
+        return True
+    group_type = getattr(builtins, "BaseExceptionGroup", ())
+    if isinstance(exc, group_type):
+        return any(_contains_exception(item, expected) for item in exc.exceptions)
+    return False
+
+
 def _is_reconnect_signal(exc: BaseException) -> bool:
     """True if `exc` is a _ReconnectSignal, or a(n) (Base)ExceptionGroup that
     wraps one — TaskGroup bundles child exceptions into a group."""
     if isinstance(exc, _ReconnectSignal):
         return True
-    if isinstance(exc, BaseExceptionGroup):
+    group_type = getattr(builtins, "BaseExceptionGroup", ())
+    if isinstance(exc, group_type):
         return any(_is_reconnect_signal(sub) for sub in exc.exceptions)
     return False
 
@@ -693,7 +778,8 @@ def _keep_context_of(exc: BaseException) -> bool:
     wipe the conversation."""
     if isinstance(exc, _ReconnectSignal):
         return getattr(exc, "keep_context", True)
-    if isinstance(exc, BaseExceptionGroup):
+    group_type = getattr(builtins, "BaseExceptionGroup", ())
+    if isinstance(exc, group_type):
         for sub in exc.exceptions:
             if _is_reconnect_signal(sub):
                 return _keep_context_of(sub)
@@ -701,8 +787,19 @@ def _keep_context_of(exc: BaseException) -> bool:
 
 
 class AuraLive:
-    def __init__(self, ui: AuraUI):
+    def __init__(self, ui: AuraUI, background_mode: bool = False):
         self.ui             = ui
+        self._background_mode = bool(background_mode)
+        self._shutdown_event = threading.Event()
+        self._manual_pause_event = threading.Event()
+        self._wake_requested_event = threading.Event()
+        self._wake_greeting_pending = threading.Event()
+        self._session_end_event = threading.Event()
+        self._session_active_event = threading.Event()
+        self._session_end_reason = ""
+        self._session_control_lock = threading.Lock()
+        self._sleep_until_wake = self._background_mode
+        self._background_idle_mode = self._background_mode
         self._memory_service = MemoryService()
         self._asst_name     = "AURA"   # updated each session from config
         self._face_welcome_pending = bool(getattr(ui, "face_unlock_verified", False))
@@ -744,6 +841,7 @@ class AuraLive:
         self.ui.on_push_to_talk   = self.set_push_to_talk
         self.ui.ptt_hold          = self._on_ptt
         self.ui.on_text_command   = self._on_text_command
+        self.ui.on_voice_text     = self._on_voice_text
         self.ui.on_system_control_action = self.handle_system_control_action
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
@@ -797,6 +895,11 @@ class AuraLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._background_state = None
+        self._background_assistant_config = get_background_assistant_config()
+        self._background_response_started: asyncio.Event | None = None
+        self._background_response_watch: asyncio.Task | None = None
+        self._background_retrying = False
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -812,6 +915,10 @@ class AuraLive:
             reserved_names=_inline_names,
             logger=lambda msg: print(f"[Actions] {msg}"),
         )
+        from aura_cad.integration.hooks import register_cad_hooks
+
+        self._cad_hooks = register_cad_hooks(self.ui)
+        self.ui.on_cad_cancel = self._cad_hooks.service.cancel
 
         # Plugins must not collide with either an inline tool or a discovered action.
         _core_names = _inline_names | self._action_registry.names()
@@ -833,18 +940,186 @@ class AuraLive:
         )
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.get_plugin_settings = lambda: (
-            self._plugin_registry.settings_schemas() + [screen_agent_settings_section()]
+            self._plugin_registry.settings_schemas()
+            + [screen_agent_settings_section()]
+            + [self._cad_hooks.part_cache_settings_section()]
         )
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
-
-        # Restore the saved push-to-talk preference. Doing it here rather than
-        # in __init__ means the hotkey thread only exists once there is a
-        # session to talk to.
-        if get_push_to_talk_enabled():
+        # Restore the saved push-to-talk preference after its handlers exist.
+        if not self._background_mode and get_push_to_talk_enabled():
             try:
                 self.set_push_to_talk(True)
             except Exception as e:
                 print(f"[AURA] ⚠ Push-to-talk unavailable: {e}")
+
+    def is_session_active(self) -> bool:
+        return self._session_active_event.is_set()
+
+    def is_waiting_for_wake(self) -> bool:
+        return self._sleep_until_wake
+
+    def wake_from_word(self, greeting: bool = False) -> None:
+        if not self._shutdown_event.is_set() and not self._manual_pause_event.is_set():
+            if greeting:
+                self._wake_greeting_pending.set()
+            self._wake_requested_event.set()
+
+    def _take_wake_greeting(self) -> bool:
+        if not self._wake_greeting_pending.is_set():
+            return False
+        self._wake_greeting_pending.clear()
+        return True
+
+    def _show_background_feedback(self, message: str) -> None:
+        if self._background_idle_mode:
+            self.ui.show_background_reply(str(message or "")[:400])
+
+    def _set_background_state(self, state: str, reason: str) -> None:
+        if (
+            not getattr(self, "_background_idle_mode", False)
+            or state == getattr(self, "_background_state", None)
+        ):
+            return
+        self._background_state = state
+        self.ui.write_log(f"SYS: Background assistant {state}: {reason}")
+        self.ui.set_state(state)
+
+    async def _deliver_wake_greeting(self) -> None:
+        session = self.session
+        if session is None or self._session_end_event.is_set():
+            return
+        if self._turn_done_event is not None:
+            self._turn_done_event.clear()
+        self.set_speaking(True)
+        try:
+            await session.send_client_content(
+                turns={
+                    "role": "user",
+                    "parts": [{
+                        "text": (
+                            f'Say exactly this and nothing else: "{_WAKE_GREETING}" '
+                            "Then listen for the user's request."
+                        )
+                    }],
+                },
+                turn_complete=True,
+            )
+            if self._turn_done_event is not None:
+                await asyncio.wait_for(self._turn_done_event.wait(), timeout=25.0)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            self.ui.write_log("SYS: Timed out waiting for the wake greeting audio.")
+            self._show_background_feedback(
+                "AURA connected, but the greeting timed out. Try speaking a command."
+            )
+            if self._turn_done_event is not None:
+                self._turn_done_event.set()
+            self.set_speaking(False)
+        except Exception as exc:
+            self.ui.write_log(f"SYS: Wake greeting unavailable: {exc}")
+            self._show_background_feedback(
+                f"Connected, but couldn't play the greeting: {str(exc)[:180]}"
+            )
+            if self._turn_done_event is not None:
+                self._turn_done_event.set()
+            self.set_speaking(False)
+
+    def set_listening_paused(self, paused: bool) -> None:
+        if paused:
+            self._manual_pause_event.set()
+            self._end_active_session("pause")
+        else:
+            self._manual_pause_event.clear()
+
+    def set_background_idle_mode(self, enabled: bool) -> None:
+        self._background_idle_mode = bool(enabled)
+
+    def dismiss_active_session(self) -> None:
+        self._sleep_until_wake = True
+        self._wake_requested_event.clear()
+        self._wake_greeting_pending.clear()
+        self._end_active_session("dismiss")
+
+    def request_shutdown(self) -> None:
+        self._shutdown_event.set()
+        self._wake_requested_event.set()
+        self._wake_greeting_pending.clear()
+        self._end_active_session("shutdown")
+
+    def _end_active_session(self, reason: str) -> None:
+        with self._session_control_lock:
+            self._session_end_reason = reason
+        self._session_end_event.set()
+
+    async def _wait_to_open_session(self) -> bool:
+        while not self._shutdown_event.is_set():
+            if self._manual_pause_event.is_set():
+                await asyncio.sleep(0.15)
+                continue
+            if not self._sleep_until_wake:
+                self._session_end_event.clear()
+                with self._session_control_lock:
+                    self._session_end_reason = ""
+                self._background_state = None
+                return True
+            if self._wake_requested_event.wait(0.0):
+                self._wake_requested_event.clear()
+                self._session_end_event.clear()
+                with self._session_control_lock:
+                    self._session_end_reason = ""
+                self._sleep_until_wake = False
+                self._background_state = None
+                return True
+            await asyncio.sleep(0.15)
+        return False
+
+    async def _watch_session_lifecycle(self) -> None:
+        while True:
+            if self._shutdown_event.is_set():
+                raise _ApplicationShutdown()
+            if self._manual_pause_event.is_set():
+                raise _BackgroundSessionPaused()
+            if self._session_end_event.is_set():
+                with self._session_control_lock:
+                    reason = self._session_end_reason
+                if reason == "shutdown":
+                    raise _ApplicationShutdown()
+                if reason == "pause":
+                    raise _BackgroundSessionPaused()
+                raise _BackgroundSessionEnded()
+            await asyncio.sleep(0.15)
+
+    def _close_to_background(self) -> None:
+        """Hide the window and return to wake-word standby WITHOUT quitting.
+
+        This is the same path as clicking the window's X while tray-resident:
+        MainWindow.closeEvent hides the window, BackgroundController ends the
+        live session and restarts the offline wake-word listener. Only a real
+        tray "Quit" terminates the process. If there is no system tray, hiding
+        would leave an invisible, unreachable process, so we really quit then.
+        """
+        try:
+            from PyQt6.QtCore import QMetaObject, Qt
+            from PyQt6.QtWidgets import QApplication
+
+            app = QApplication.instance()
+            if app is not None and app.property("_aura_tray_resident"):
+                # Called from the asyncio thread -> queue onto the Qt thread.
+                QMetaObject.invokeMethod(
+                    self.ui._win, "close", Qt.ConnectionType.QueuedConnection
+                )
+                return
+        except Exception as exc:
+            print(f"[AURA] Could not hide to background: {exc}")
+        self.ui.request_quit()
+
+    def close(self) -> None:
+        self.request_shutdown()
+        if self._ptt is not None:
+            self._ptt.stop()
+            self._ptt = None
+        self.stop_notification_readout()
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -918,6 +1193,9 @@ class AuraLive:
         except Exception as exc:
             self.ui.write_log(f"SYS: Local voice unavailable: {exc}")
             self._local_tts_failed = True
+            self._show_background_feedback(
+                f"Selected voice is unavailable: {str(exc)[:180]}"
+            )
 
     async def _speak_face_welcome(self) -> None:
         if not self._face_welcome_pending:
@@ -1004,7 +1282,13 @@ class AuraLive:
             return decode_audio_pcm24(generated)
         raise RuntimeError("The selected TTS engine cannot synthesise PCM audio.")
 
-    async def _local_speak_sentence(self, sentence: str):
+    async def _local_speak_sentence(self, sentence: str) -> bool:
+        if self._background_idle_mode:
+            self._local_reply_parts.append(sentence.strip())
+            self.ui.show_background_reply(" ".join(self._local_reply_parts))
+            self._set_background_state("STREAMING", "a response sentence arrived")
+            if not self._background_assistant_config["speak_responses"]:
+                return True
         self._visemes.feed_text(sentence)
         synthesis_started = time.perf_counter()
         try:
@@ -1015,7 +1299,7 @@ class AuraLive:
                     )
                 await self._local_tts_init_task
                 if self._local_tts_engine is None:
-                    return
+                        return False
             audio = await asyncio.to_thread(self._synthesise_local_sentence, sentence)
             if not self._local_tts_timing_reported:
                 self.ui.write_log(
@@ -1027,10 +1311,15 @@ class AuraLive:
                 if self._interrupted:
                     break
                 await self.audio_in_queue.put(audio[offset:offset + 2400])
+            return bool(audio) and not self._interrupted
         except Exception as exc:
             if not self._local_tts_failed:
                 self.ui.write_log(f"SYS: Local voice unavailable: {exc}")
                 self._local_tts_failed = True
+            self._show_background_feedback(
+                f"Selected voice is unavailable: {str(exc)[:180]}"
+            )
+            return False
 
     async def _speak_gemini_reply_with_local_voice(self, text: str) -> bool:
         if self._local_tts_init_task is None:
@@ -1063,10 +1352,128 @@ class AuraLive:
                 await self.audio_in_queue.put(audio[offset:offset + 2400])
         return bool(sentences)
 
+    async def _watch_background_live_response(self, request_text: str) -> None:
+        """Bound a Live response wait and retry one text turn if it never starts."""
+        started = self._background_response_started
+        if started is None:
+            return
+        try:
+            endpoint_delay = (
+                self._background_assistant_config["end_of_speech_ms"] / 1000.0
+                + 0.25
+            )
+            await asyncio.sleep(endpoint_delay)
+            if started.is_set() or self._interrupted:
+                return
+            timeout = self._background_assistant_config[
+                "response_timeout_seconds"
+            ]
+            for attempt in range(2):
+                try:
+                    await asyncio.wait_for(started.wait(), timeout=timeout)
+                    return
+                except asyncio.TimeoutError:
+                    if attempt == 0 and request_text.strip() and self.session:
+                        self.ui.show_background_reply(
+                            "AURA is taking longer than expected; retrying once…"
+                        )
+                        self._set_background_state(
+                            "PROCESSING", "response timed out; retrying once"
+                        )
+                        started.clear()
+                        self._background_retrying = True
+                        await self.session.send_client_content(
+                            turns={
+                                "role": "user",
+                                "parts": [{"text": request_text.strip()}],
+                            },
+                            turn_complete=True,
+                        )
+                        continue
+                    self.ui.show_background_reply(
+                        "AURA could not complete that response after retrying. "
+                        "Please try again."
+                    )
+                    self._background_retrying = False
+                    self._set_background_state(
+                        "IDLE_ACTIVE", "response timed out after retry"
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ui.write_log(
+                f"SYS: Background response retry failed: {exc}"
+            )
+            self.ui.show_background_reply(
+                f"AURA couldn't complete that response: {str(exc)[:180]}"
+            )
+            self._background_retrying = False
+            self._set_background_state(
+                "IDLE_ACTIVE", "response retry failed"
+            )
+
+    def _finish_background_response_watch(self) -> None:
+        if self._background_response_started is not None:
+            self._background_response_started.set()
+        watch = self._background_response_watch
+        self._background_response_watch = None
+        self._background_retrying = False
+        if watch is not None and not watch.done():
+            watch.cancel()
+
+    async def _send_background_text(self, text: str) -> None:
+        if self.session is None:
+            self.ui.show_background_reply(
+                "AURA is reconnecting and can't accept a text request yet."
+            )
+            return
+        self._set_background_state(
+            "PROCESSING", "typed follow-up was submitted"
+        )
+        if self._background_response_started is not None:
+            if (
+                self._background_response_watch is not None
+                and not self._background_response_watch.done()
+            ):
+                self._background_response_watch.cancel()
+            self._background_response_started.clear()
+            self._background_retrying = False
+            self._background_response_watch = asyncio.create_task(
+                self._watch_background_live_response(text)
+            )
+        try:
+            await self.session.send_client_content(
+                turns={"role": "user", "parts": [{"text": text}]},
+                turn_complete=True,
+            )
+        except Exception as exc:
+            self._finish_background_response_watch()
+            self.ui.write_log(f"SYS: Background text request failed: {exc}")
+            self.ui.show_background_reply(
+                f"AURA couldn't send that request: {str(exc)[:180]}"
+            )
+            self._set_background_state(
+                "IDLE_ACTIVE", "text request could not be sent"
+            )
+
+    def _open_aura_window(self) -> None:
+        self.ui.show_main_window()
+
     async def _local_turn(
         self, text: str, log_user: bool = True, record_user: bool = True,
         started_at: float | None = None,
     ):
+        background_idle = getattr(self, "_background_idle_mode", False)
+        background_settings = getattr(
+            self, "_background_assistant_config", None
+        ) or get_background_assistant_config()
+        if background_idle and _is_close_background_command(text):
+            self.ui.dismiss_background_orb("voice command")
+            return
+        if _is_open_aura_command(text):
+            self._open_aura_window()
+            return
         if self._local_brain is None:
             self.ui.write_log("SYS: Local brain is not ready.")
             return
@@ -1109,21 +1516,51 @@ class AuraLive:
             self._local_turn_started_at = started_at or time.perf_counter()
             self._local_first_audio_pending = True
             self._local_tts_timing_reported = False
-            self.ui.set_state("THINKING")
+            self._local_reply_parts = []
+            self._set_background_state("PROCESSING", "the utterance endpoint was confirmed")
+            if not background_idle:
+                self.ui.set_state("THINKING")
             if log_user:
                 self.ui.write_log(f"You: {text}")
             self._last_user_speech = time.monotonic()
             try:
-                reply = await self._local_brain.ask(text)
+                timeout = background_settings["response_timeout_seconds"]
+                reply = ""
+                for attempt in range(2):
+                    try:
+                        reply = await asyncio.wait_for(
+                            self._local_brain.ask(text), timeout=timeout
+                        )
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        self.ui.write_log(
+                            f"SYS: Local AI request attempt {attempt + 1}/2 failed: {exc}"
+                        )
+                        if attempt == 1:
+                            raise
+                        await asyncio.sleep(0.5)
                 if reply:
                     self.ui.write_log(f"{self._asst_name}: {reply}")
+                    self.ui.show_background_reply(reply)
                     if record_user:
                         self._session_log.append(f"User: {text}")
                     self._session_log.append(f"{self._asst_name}: {reply}")
+                else:
+                    self.ui.show_background_reply(
+                        "AURA couldn't produce a response. Please try again."
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.ui.write_log(f"SYS: Local AI request failed: {exc}")
+                self.ui.write_log(
+                    f"SYS: Local AI request failed after retry: {exc}"
+                )
+                self.ui.show_background_reply(
+                    "AURA couldn't complete that response after retrying. "
+                    f"Details: {str(exc)[:180]}"
+                )
             finally:
                 self.ui.write_log(
                     "SYS: Local turn processing completed in "
@@ -1135,7 +1572,13 @@ class AuraLive:
                 if self._turn_done_event is not None:
                     self._turn_done_event.set()
                 if not self._is_speaking and not self.ui.muted:
-                    self.ui.set_state("LISTENING")
+                    if background_idle:
+                        self._set_background_state(
+                            "IDLE_ACTIVE",
+                            "response finished; follow-up listening is active",
+                        )
+                    else:
+                        self.ui.set_state("LISTENING")
 
     async def _listen_local_audio(self):
         """Endpoint mic speech locally; raw audio never leaves the device."""
@@ -1160,6 +1603,9 @@ class AuraLive:
                 )
         except Exception as exc:
             self.ui.write_log(f"SYS: Local STT could not start: {exc}")
+            self._show_background_feedback(
+                f"Voice recognition could not start: {str(exc)[:180]}"
+            )
             if self._reconnect_event is not None:
                 await asyncio.sleep(2)
                 self._reconnect_event.set()
@@ -1219,9 +1665,15 @@ class AuraLive:
             with mic_stream:
                 preroll: list[bytes] = []
                 voiced = False
-                silence_blocks = 0
+                silence_seconds = 0.0
+                speech_seconds = 0.0
+                utterance_started = 0.0
                 noise_rms = _LOCAL_VOICE_FLOOR
                 transcript_parts: list[str] = []
+                settings = self._background_assistant_config
+                end_silence = settings["end_of_speech_ms"] / 1000.0
+                max_utterance = float(settings["max_utterance_seconds"])
+                sensitivity = settings["vad_sensitivity"]
                 while True:
                     try:
                         block = await asyncio.to_thread(frames.get, True, 0.15)
@@ -1229,19 +1681,26 @@ class AuraLive:
                         continue
                     samples = np.frombuffer(block, dtype=np.int16)
                     rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
-                    threshold = _voice_threshold(noise_rms)
+                    block_seconds = samples.size / SEND_SAMPLE_RATE
+                    threshold = _background_vad_threshold(noise_rms, sensitivity)
                     blocks_to_feed: tuple[bytes, ...] = ()
                     if rms > threshold:
                         if not voiced:
                             blocks_to_feed = (*preroll, block)
                             preroll = []
                             transcript_parts = []
+                            utterance_started = time.monotonic()
+                            speech_seconds = 0.0
+                            self._set_background_state(
+                                "USER_SPEAKING", "voice activity detected"
+                            )
                         else:
                             blocks_to_feed = (block,)
                         voiced = True
-                        silence_blocks = 0
+                        silence_seconds = 0.0
+                        speech_seconds += block_seconds
                     elif voiced:
-                        silence_blocks += 1
+                        silence_seconds += block_seconds
                         blocks_to_feed = (block,)
                     else:
                         noise_rms = noise_rms * 0.95 + rms * 0.05
@@ -1249,40 +1708,87 @@ class AuraLive:
                         if len(preroll) > 3:
                             preroll.pop(0)
                     for audio_frame in blocks_to_feed:
-                        completed_text, is_final = stt.feed_audio(audio_frame)
+                        completed_text, is_final = stt.process_chunk(audio_frame)
                         if is_final and completed_text:
                             transcript_parts.append(completed_text)
-                    if voiced and silence_blocks >= 4:
+                        elif completed_text and self._background_idle_mode:
+                            self.ui.show_background_transcript(completed_text)
+                    utterance_elapsed = (
+                        time.monotonic() - utterance_started if voiced else 0.0
+                    )
+                    if voiced and (
+                        silence_seconds >= end_silence
+                        or utterance_elapsed >= max_utterance
+                    ):
+                        self._set_background_state(
+                            "PROCESSING",
+                            "configured end-of-speech silence reached"
+                            if silence_seconds >= end_silence
+                            else "maximum utterance duration reached",
+                        )
                         preroll = []
                         voiced = False
-                        silence_blocks = 0
+                        silence_seconds = 0.0
                         turn_started_at = time.perf_counter()
-                        self.ui.write_log(
-                            "SYS: Local speech captured; finalizing transcript..."
-                        )
+                        self.ui.show_background_transcript("")
+                        if speech_seconds < 0.3:
+                            transcript_parts = []
+                            stt.finalize()
+                            self._set_background_state(
+                                "IDLE_ACTIVE",
+                                "speech was shorter than the minimum duration",
+                            )
+                            continue
+                        self.ui.write_log("SYS: Local utterance endpoint confirmed.")
                         final_text = stt.finalize()
                         if final_text:
                             transcript_parts.append(final_text)
                         transcript = " ".join(transcript_parts).strip()
                         transcript_parts = []
                         if transcript.strip():
+                            if re.search(
+                                r"\bhey\s+(?:aura|ora|aurora)\b",
+                                transcript,
+                                re.IGNORECASE,
+                            ):
+                                self.ui.show_background_orb()
                             self.ui.write_log(
                                 "SYS: Local STT recognized "
                                 f"'{transcript.strip()}' in "
                                 f"{time.perf_counter() - turn_started_at:.2f}s."
                             )
-                            await self._local_turn(
+                            turn_task = asyncio.create_task(self._local_turn(
                                 transcript.strip(), started_at=turn_started_at
-                            )
+                            ))
+                            try:
+                                await turn_task
+                            except asyncio.CancelledError:
+                                self._interrupted = False
+                                if (
+                                    self._shutdown_event.is_set()
+                                    or self._manual_pause_event.is_set()
+                                    or self._session_end_event.is_set()
+                                ):
+                                    return
+                                self.ui.show_background_reply("Response stopped.")
+                                self._set_background_state(
+                                    "IDLE_ACTIVE", "request cancelled by the user"
+                                )
                         else:
                             self.ui.write_log(
-                                "SYS: Speech was detected, but STT returned no words. "
-                                "Check the selected microphone, input level, and STT language/model."
+                                "SYS: No words recognized; remaining active without prompting."
+                            )
+                            self._set_background_state(
+                                "IDLE_ACTIVE",
+                                "speech contained no recognized words",
                             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.ui.write_log(f"SYS: Local microphone stopped: {exc}")
+            self._show_background_feedback(
+                f"Local microphone stopped: {str(exc)[:180]}"
+            )
             if self._reconnect_event is not None:
                 await asyncio.sleep(2)
                 self._reconnect_event.set()
@@ -1294,10 +1800,16 @@ class AuraLive:
         self.out_queue = None
         self._turn_done_event = asyncio.Event()
         self._turn_done_event.set()
+        self._background_response_started = None
+        self._background_retrying = False
         self._local_mode_active = True
         self._interrupted = False
         self._local_tts_failed = False
-        self.ui.set_state("LISTENING")
+        self._set_background_state(
+            "IDLE_ACTIVE", "microphone is active and waiting for speech"
+        )
+        if not self._background_idle_mode:
+            self.ui.set_state("LISTENING")
         try:
             local_config = self._build_config()
             declarations = (
@@ -1316,12 +1828,22 @@ class AuraLive:
                     str(getattr(local_config, "system_instruction", "") or "")
                     + "\n\nVision is unavailable in this local session."
                     + "\nFor spoken replies, be concise: usually one or two short sentences."
+                    + (
+                        "\nTreat each request independently; do not rely on "
+                        "earlier conversation turns."
+                        if not self._background_assistant_config[
+                            "conversation_mode"
+                        ] else ""
+                    )
                 ),
                 declarations=declarations,
                 execute_tool=self._local_tool_execute,
                 on_sentence=self._local_speak_sentence,
                 notify=self.ui.write_log,
                 on_timing=self.ui.write_log,
+                request_timeout=self._background_assistant_config[
+                    "response_timeout_seconds"
+                ],
             )
             if retry_after is not None:
                 self.ui.write_log("SYS: Gemini unavailable — switching to local brain.")
@@ -1334,25 +1856,46 @@ class AuraLive:
                 )
             if self._dashboard:
                 await self._dashboard.broadcast({"type": "status", "state": "active"})
+            self._last_user_speech = time.monotonic()
+            wake_greeting = self._take_wake_greeting()
+            if wake_greeting:
+                self._face_welcome_pending = False
+            self._session_active_event.set()
             started_at = asyncio.get_running_loop().time()
             tasks = {
                 asyncio.create_task(self._listen_local_audio()),
                 asyncio.create_task(self._play_audio()),
             }
-            if self._face_welcome_pending:
+            if self._face_welcome_pending and not wake_greeting:
                 tasks.add(asyncio.create_task(self._speak_face_welcome()))
             reconnect = asyncio.create_task(self._reconnect_event.wait())
+            lifecycle = asyncio.create_task(self._watch_session_lifecycle())
             try:
-                done, pending = await asyncio.wait(
-                    tasks | {reconnect},
+                if wake_greeting:
+                    self.ui.show_background_reply(_WAKE_GREETING)
+                    self._local_first_audio_pending = False
+                    if self._turn_done_event is not None:
+                        self._turn_done_event.clear()
+                    self.set_speaking(True)
+                    greeting_spoken = await self._local_speak_sentence(
+                        _WAKE_GREETING
+                    )
+                    if self._turn_done_event is not None:
+                        self._turn_done_event.set()
+                    if not greeting_spoken:
+                        self.set_speaking(False)
+                done, _ = await asyncio.wait(
+                    tasks | {reconnect, lifecycle},
                     timeout=retry_after,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                if lifecycle in done:
+                    lifecycle.result()
                 if reconnect in done:
                     reconnect.result()
                     self._reconnect_event.clear()
                 for task in done:
-                    if task is not reconnect:
+                    if task is not reconnect and task is not lifecycle:
                         try:
                             task.result()
                         except asyncio.CancelledError:
@@ -1360,6 +1903,9 @@ class AuraLive:
                         except Exception as exc:
                             self.ui.write_log(
                                 f"SYS: Local audio task stopped: {exc}; restarting voice session."
+                            )
+                            self._show_background_feedback(
+                                f"Local audio stopped: {str(exc)[:180]}"
                             )
                             self._reconnect_event.set()
                 if retry_after is not None and not done.intersection({reconnect}):
@@ -1369,11 +1915,14 @@ class AuraLive:
                 if retry_after is not None and not done:
                     self.ui.write_log("SYS: Retrying Gemini connection.")
             finally:
-                for task in tasks | {reconnect}:
+                for task in tasks | {reconnect, lifecycle}:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*tasks, reconnect, return_exceptions=True)
+                await asyncio.gather(
+                    *tasks, reconnect, lifecycle, return_exceptions=True
+                )
         finally:
+            self._session_active_event.clear()
             if self._local_tts_init_task is not None:
                 if not self._local_tts_init_task.done():
                     self._local_tts_init_task.cancel()
@@ -1415,6 +1964,9 @@ class AuraLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
+        if _is_open_aura_command(text):
+            self._open_aura_window()
+            return
         system_intent = match_system_control_intent(text)
         if system_intent:
             threading.Thread(
@@ -1427,6 +1979,8 @@ class AuraLive:
         intent = match_notification_intent(text)
         if intent and (intent not in {"stop", "skip"} or self._notification_read_active()):
             self.ui.handle_notification_command(intent)
+            return
+        if self._cad_hooks.handle_text(text, speak=self.speak):
             return
         if is_screen_agent_request(text):
             threading.Thread(
@@ -1449,20 +2003,79 @@ class AuraLive:
                 self._execute_protocol(protocol), self._loop
             )
             return
+        if self._try_route_project_build(text):
+            return
         if self._local_mode_active and self._local_brain is not None:
             asyncio.run_coroutine_threadsafe(
                 self._local_turn(text, log_user=False), self._loop
             )
             return
         if not self.session:
+            if self._background_idle_mode:
+                self.ui.show_background_reply(
+                    "AURA is reconnecting and can't accept a text request yet."
+                )
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
+        request = (
+            self._send_background_text(text)
+            if self._background_idle_mode
+            else self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
+                turn_complete=True,
+            )
         )
+        asyncio.run_coroutine_threadsafe(request, self._loop)
+
+    def _on_voice_text(self, text: str) -> bool:
+        return self._cad_hooks.handle_voice_text(text)
+
+    def _try_route_project_build(self, text: str) -> bool:
+        """Send explicit runnable-project requests through the deep-tier agent."""
+        from actions.dev_agent import is_project_build_request
+
+        if (
+            not is_project_build_request(text)
+            or self._local_mode_active
+            or not self._action_registry.has("dev_agent")
+        ):
+            return False
+
+        local_config = get_local_llm_config()
+        if (
+            not local_config.get("auto_model_switching", True)
+            or local_config.get("mode") == "local"
+        ):
+            return False
+
+        threading.Thread(
+            target=self._run_project_build,
+            args=(text,),
+            name="aura-project-build",
+            daemon=True,
+        ).start()
+        return True
+
+    def _run_project_build(self, text: str) -> None:
+        context = {
+            "player": self.ui,
+            "speak": self.speak,
+            "response": None,
+            "session_memory": None,
+        }
+        try:
+            result = self._action_registry.run(
+                "dev_agent", {"description": text}, context
+            )
+            self.ui.show_content("PROJECT BUILD", str(result or "No result was returned."))
+        except Exception as error:
+            traceback.print_exc()
+            self.ui.write_log(
+                f"ERR: Project build failed ({type(error).__name__})."
+            )
+            self.ui.show_content(
+                "PROJECT BUILD",
+                "The project could not be completed. Please try again in a moment.",
+            )
 
     async def _execute_protocol_task(self, task: str) -> str:
         """Execute one protocol task through existing action or AI routing."""
@@ -1747,7 +2360,16 @@ class AuraLive:
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
+            was_speaking = self._is_speaking
             self._is_speaking = value
+            if value and not was_speaking:
+                self._speaking_started = time.monotonic()
+        if (
+            was_speaking
+            and not value
+            and self._background_idle_mode
+        ):
+            self._last_user_speech = time.monotonic()
         if value:
             self._tail_until = 0.0
         else:
@@ -1762,9 +2384,19 @@ class AuraLive:
             # tail expires. What the guard learned about the room always stays.
             self._out_level = 0.0
         if value:
-            self.ui.set_state("SPEAKING")
+            if self._background_idle_mode:
+                self._set_background_state("SPEAKING", "audio playback started")
+            else:
+                self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
-            self.ui.set_state("LISTENING")
+            if self._background_idle_mode:
+                if not self._session_end_event.is_set():
+                    self._set_background_state(
+                        "IDLE_ACTIVE",
+                        "audio playback stopped; microphone remains active",
+                    )
+            else:
+                self.ui.set_state("LISTENING")
 
     def set_push_to_talk(self, enabled: bool) -> str:
         """Turn hold-to-talk on or off. Returns the scope actually achieved."""
@@ -1803,13 +2435,30 @@ class AuraLive:
         except Exception:
             pass
 
-    def interrupt(self) -> None:
+    def interrupt(self, log_message: bool = True) -> None:
         """Stop AURA mid-speech: drain queued audio and open mic immediately."""
         from screen_agent import request_stop
 
         request_stop()
         self.stop_notification_readout()
         self._interrupted = True
+        if (
+            self._background_idle_mode
+            and not self._local_mode_active
+            and not self._session_end_event.is_set()
+            and self._background_state in {
+                "USER_SPEAKING", "PROCESSING", "STREAMING", "SPEAKING"
+            }
+        ):
+            self.ui.show_background_reply("Stopping the response…")
+            self._set_background_state(
+                "PROCESSING", "user cancelled the live response"
+            )
+            self._end_active_session("cancel")
+        if self._loop and self._background_response_started is not None:
+            self._loop.call_soon_threadsafe(
+                self._finish_background_response_watch
+            )
         if self._local_turn_task and self._loop:
             self._loop.call_soon_threadsafe(self._local_turn_task.cancel)
         q = self.audio_in_queue
@@ -1829,7 +2478,8 @@ class AuraLive:
         self._play_cursor = 0.0     # next batch starts a fresh timeline
         if self._turn_done_event:
             self._turn_done_event.clear()
-        self.ui.write_log("SYS: Interrupted — listening...")
+        if log_message:
+            self.ui.write_log("SYS: Interrupted — listening...")
 
     def _notification_read_active(self) -> bool:
         thread = self._notification_thread
@@ -1948,6 +2598,8 @@ class AuraLive:
             for notification in items:
                 if self._notification_stop.is_set():
                     break
+                if notification.category == "model_router":
+                    continue
                 if notification.priority < 40:
                     low_items.append(notification)
                     continue
@@ -2052,10 +2704,27 @@ class AuraLive:
                       + self._plugin_registry.get_tool_declarations())
         _names = {(d.get("name") if isinstance(d, dict) else getattr(d, "name", ""))
                   for d in _all_decls}
+        local_settings = get_local_llm_config()
+        coding_task_routing = ""
+        if (
+            local_settings.get("auto_model_switching", True)
+            and local_settings.get("mode") != "local"
+        ):
+            coding_task_routing = (
+                "[CODING TASKS]\n"
+                "For a request to create a runnable application, game, website, "
+                "or complete project, call dev_agent, even when the result may "
+                "fit in one file. For a snippet, an edit to an existing file, "
+                "or debugging a specific file, use code_helper. Wait for the "
+                "tool result before reporting completion. Never claim that "
+                "code was created or tested unless the tool confirms it. Do "
+                "not mention internal model selection or switching to the user."
+            )
         sys_prompt = _render_prompt(sys_prompt, {
             "assistant_name": self._asst_name,
             "platform": f"{_platform.system()} {_platform.release()}".strip(),
             "capabilities": _describe_tools(_all_decls),
+            "coding_task_routing": coding_task_routing,
             "limits": _describe_limits(
                 has_vision="screen_process" in _names,
                 has_mic=True,
@@ -2063,6 +2732,12 @@ class AuraLive:
         })
 
         parts = [time_ctx, identity_ctx]
+        if not self._background_assistant_config["conversation_mode"]:
+            parts.append(
+                "[CONVERSATION MODE]\n"
+                "Treat each new request independently and do not rely on earlier "
+                "conversation turns."
+            )
         protocol_catalog = self._memory_service.protocol_catalog()
         if protocol_catalog:
             parts.append(
@@ -2129,6 +2804,13 @@ class AuraLive:
         # before a reply actually is, and the default has to suit everybody, so
         # it is necessarily cautious.
         turn = get_turn_tuning()
+        if self._background_idle_mode:
+            turn = dict(turn)
+            turn.update(
+                enabled=True,
+                silence_ms=self._background_assistant_config["end_of_speech_ms"],
+                end_sensitivity="low",
+            )
         if turn.get("enabled", True):
             detect = types.AutomaticActivityDetection(
                 silence_duration_ms=turn["silence_ms"],
@@ -2194,7 +2876,7 @@ class AuraLive:
                 response={"result": "ok", "silent": True}
             )
 
-        loop   = asyncio.get_event_loop()
+        loop   = asyncio.get_running_loop()
         result = "Done."
 
         try:
@@ -2335,14 +3017,30 @@ class AuraLive:
                                 turns={"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]},
                                 turn_complete=True,
                             )
-                        except Exception:
-                            pass
-                    await asyncio.sleep(1.5)
-                    import os as _os
-                    _os._exit(0)
+                        except Exception as exc:
+                            self.ui.write_log(
+                                f"SYS: Could not send the shutdown goodbye: {exc}"
+                            )
+                    # Let the goodbye finish before the window hides (hiding
+                    # ends the session and would cut the speech off).
+                    await asyncio.sleep(2.0)
+                    _waited = 0.0
+                    while self._is_speaking and _waited < 8.0:
+                        await asyncio.sleep(0.2)
+                        _waited += 0.2
+                    # Like "Hey Google" on Android: close the window and go back
+                    # to waiting for the wake word. The background process, tray
+                    # icon and wake-word listener keep running.
+                    self._close_to_background()
                 asyncio.create_task(_do_shutdown())
+                result = (
+                    "A.U.R.A. is closing its window and going back to the "
+                    "background; it will wake again on 'Hey AURA'. Say a brief goodbye."
+                )
 
             elif self._action_registry.has(name):
+                if name == "cad_design":
+                    self.ui.show_main_window()
                 # file_processor: fall back to the currently-uploaded file when none is given
                 if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
@@ -2416,9 +3114,21 @@ class AuraLive:
 
     async def _listen_audio(self):
         print("[AURA] 🎤 Mic started")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+        background_noise_rms = _LOCAL_VOICE_FLOOR
+        background_candidate_seconds = 0.0
+        background_voice_active = False
+        background_last_voice = 0.0
+        background_utterance_started = 0.0
+        background_force_silence_until = 0.0
 
         def callback(indata, frames, time_info, status):
+            nonlocal background_noise_rms
+            nonlocal background_candidate_seconds
+            nonlocal background_voice_active
+            nonlocal background_last_voice
+            nonlocal background_utterance_started
+            nonlocal background_force_silence_until
             with self._speaking_lock:
                 aura_speaking = self._is_speaking
 
@@ -2467,7 +3177,86 @@ class AuraLive:
                 return
 
             if not self.ui.muted and not self._phone_active:
-                data = indata.tobytes()
+                if self._background_idle_mode:
+                    samples = np.asarray(indata, dtype=np.float32).reshape(-1)
+                    block_seconds = samples.size / SEND_SAMPLE_RATE
+                    rms = (
+                        float(np.sqrt(np.mean(samples * samples)))
+                        if samples.size else 0.0
+                    )
+                    threshold = _background_vad_threshold(
+                        background_noise_rms,
+                        self._background_assistant_config["vad_sensitivity"],
+                    )
+                    now = time.monotonic()
+                    if rms > threshold:
+                        background_candidate_seconds += block_seconds
+                        background_last_voice = now
+                        if (
+                            not background_voice_active
+                            and background_candidate_seconds >= 0.3
+                        ):
+                            background_voice_active = True
+                            background_utterance_started = (
+                                now - background_candidate_seconds
+                            )
+                            loop.call_soon_threadsafe(
+                                self._set_background_state,
+                                "USER_SPEAKING",
+                                "microphone VAD detected speech",
+                            )
+                    if (
+                        background_voice_active
+                        and now - background_utterance_started
+                        >= self._background_assistant_config[
+                            "max_utterance_seconds"
+                        ]
+                    ):
+                        background_voice_active = False
+                        background_candidate_seconds = 0.0
+                        background_utterance_started = 0.0
+                        background_force_silence_until = now + (
+                            self._background_assistant_config[
+                                "end_of_speech_ms"
+                            ] / 1000.0
+                        )
+                        loop.call_soon_threadsafe(
+                            self._set_background_state,
+                            "PROCESSING",
+                            "maximum utterance duration reached",
+                        )
+                    else:
+                        if rms <= threshold:
+                            background_candidate_seconds = max(
+                                0.0, background_candidate_seconds - block_seconds * 2
+                            )
+                            if background_voice_active:
+                                if (
+                                    now - background_last_voice
+                                    >= self._background_assistant_config[
+                                        "end_of_speech_ms"
+                                    ] / 1000.0
+                                ):
+                                    background_voice_active = False
+                                    background_candidate_seconds = 0.0
+                                    background_utterance_started = 0.0
+                                    loop.call_soon_threadsafe(
+                                        self._set_background_state,
+                                        "PROCESSING",
+                                        "configured end-of-speech silence reached",
+                                    )
+                            else:
+                                background_noise_rms = (
+                                    background_noise_rms * 0.95 + rms * 0.05
+                                )
+                force_silence = (
+                    self._background_idle_mode
+                    and time.monotonic() < background_force_silence_until
+                )
+                data = (
+                    bytes(np.asarray(indata).nbytes)
+                    if force_silence else indata.tobytes()
+                )
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
                     {
@@ -2525,6 +3314,9 @@ class AuraLive:
             self.ui.write_log(
                 "SYS: Gemini is still connected, but voice input is unavailable. "
                 "Check the selected microphone in Audio Settings."
+            )
+            self._show_background_feedback(
+                f"Voice input unavailable: {str(e)[:180]}. Check Audio Settings."
             )
 
     async def _flush_pending_vision(self) -> bool:
@@ -2593,8 +3385,18 @@ class AuraLive:
                             self._resume_handle = _sru.new_handle
 
                     if response.data:
+                        if self._background_response_started is not None:
+                            self._background_response_started.set()
+                            self._background_retrying = False
                         if self._interrupted:
                             pass  # discard: interrupted
+                        elif (
+                            self._background_idle_mode
+                            and not self._background_assistant_config[
+                                "speak_responses"
+                            ]
+                        ):
+                            pass
                         else:
                             if self._turn_done_event and self._turn_done_event.is_set():
                                 self._turn_done_event.clear()
@@ -2612,7 +3414,11 @@ class AuraLive:
                     if response.server_content:
                         sc = response.server_content
 
-                        if sc.output_transcription and sc.output_transcription.text:
+                        if (
+                            not self._interrupted
+                            and sc.output_transcription
+                            and sc.output_transcription.text
+                        ):
                             txt = _clean_transcript(sc.output_transcription.text)
                             # A turn that involves a tool call passes through
                             # several turn_completes, and the API re-sends the
@@ -2623,6 +3429,14 @@ class AuraLive:
                             # twice AND made the avatar mouth it twice.
                             if txt and not _is_repeat_chunk(txt, out_buf):
                                 out_buf.append(txt)
+                                if self._background_response_started is not None:
+                                    self._background_response_started.set()
+                                    self._background_retrying = False
+                                self._set_background_state(
+                                    "STREAMING", "response text arrived"
+                                )
+                                if self._background_idle_mode:
+                                    self.ui.show_background_reply(" ".join(out_buf))
                                 # Hand the words to the mouth as they arrive, so
                                 # the avatar can form the consonants the audio
                                 # alone cannot show. Pure string work — it adds
@@ -2638,8 +3452,35 @@ class AuraLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+                                self._set_background_state(
+                                    "USER_SPEAKING", "live transcription detected speech"
+                                )
+                                if self._background_idle_mode:
+                                    self.ui.show_background_transcript(" ".join(in_buf))
+                                    if (
+                                        self._background_response_started is not None
+                                        and not self._background_retrying
+                                    ):
+                                        if (
+                                            self._background_response_watch is not None
+                                            and not self._background_response_watch.done()
+                                        ):
+                                            self._background_response_watch.cancel()
+                                        self._background_response_started.clear()
+                                        self._background_response_watch = asyncio.create_task(
+                                            self._watch_background_live_response(
+                                                " ".join(in_buf)
+                                            )
+                                        )
+                                if re.search(
+                                    r"\bhey\s+(?:aura|ora|aurora)\b",
+                                    txt,
+                                    re.IGNORECASE,
+                                ):
+                                    self.ui.show_background_orb()
 
                         if sc.turn_complete:
+                            self._finish_background_response_watch()
                             # If this turn_complete ends an interrupted response, clear the
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
@@ -2654,6 +3495,18 @@ class AuraLive:
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
+                                if (
+                                    self._background_idle_mode
+                                    and _is_close_background_command(full_in)
+                                ):
+                                    self.ui.dismiss_background_orb("voice command")
+                                    in_buf = []
+                                    out_buf = []
+                                    if self._turn_done_event:
+                                        self._turn_done_event.set()
+                                    continue
+                                if _is_open_aura_command(full_in):
+                                    self._open_aura_window()
                                 notification_intent = match_notification_intent(full_in)
                                 if (notification_intent in {"stop", "skip"}
                                         and self._notification_read_active()):
@@ -2682,6 +3535,8 @@ class AuraLive:
                                         "ts": datetime.now().isoformat(),
                                     }))
                             in_buf = []
+                            if self._background_idle_mode:
+                                self.ui.show_background_transcript("")
 
                             full_out = " ".join(out_buf).strip()
                             # Second line of defence: even if a repeat slips
@@ -2693,6 +3548,7 @@ class AuraLive:
                             if full_out:
                                 self._last_out_logged = full_out
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
+                                self.ui.show_background_reply(full_out)
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
@@ -2704,9 +3560,17 @@ class AuraLive:
                                 used_local_voice = False
                                 if full_out:
                                     self._local_tts_timing_reported = False
-                                    used_local_voice = (
-                                        await self._speak_gemini_reply_with_local_voice(full_out)
-                                    )
+                                    if (
+                                        not self._background_idle_mode
+                                        or self._background_assistant_config[
+                                            "speak_responses"
+                                        ]
+                                    ):
+                                        used_local_voice = (
+                                            await self._speak_gemini_reply_with_local_voice(
+                                                full_out
+                                            )
+                                        )
                                 if (
                                     not used_local_voice
                                     and not self._interrupted
@@ -2736,6 +3600,11 @@ class AuraLive:
                                     await asyncio.sleep(2.0)
                                     self.ui.stop_camera_stream()
                                 asyncio.create_task(_cam_close())
+                            if self._background_idle_mode and not self._is_speaking:
+                                self._set_background_state(
+                                    "IDLE_ACTIVE",
+                                    "model turn completed; follow-up listening remains active",
+                                )
 
                     if response.tool_call:
                         fn_responses = []
@@ -2751,6 +3620,8 @@ class AuraLive:
             print(f"[AURA] ❌ Recv: {e}")
             traceback.print_exc()
             raise
+        finally:
+            self._finish_background_response_watch()
 
     async def _play_audio(self):
         print("[AURA] 🔊 Play started")
@@ -2796,6 +3667,7 @@ class AuraLive:
         except Exception:
             pass
 
+        last_chunk_at = time.monotonic()
         try:
             while True:
                 try:
@@ -2803,7 +3675,26 @@ class AuraLive:
                         self.audio_in_queue.get(),
                         timeout=0.1
                     )
+                    last_chunk_at = time.monotonic()
                 except asyncio.TimeoutError:
+                    # Watchdog: "speaking" with no audio arriving must not
+                    # leave the mic gated and the orb stuck on SPEAKING.
+                    if (
+                        self._is_speaking
+                        and self.audio_in_queue.empty()
+                        and time.monotonic() - max(
+                            last_chunk_at,
+                            getattr(self, "_speaking_started", 0.0),
+                        ) > 8.0
+                    ):
+                        self.ui.write_log(
+                            "SYS: No audio received while speaking; "
+                            "returning to listening."
+                        )
+                        self.set_speaking(False)
+                        if self._turn_done_event:
+                            self._turn_done_event.set()
+                        continue
                     if (
                         self._turn_done_event
                         and self._turn_done_event.is_set()
@@ -2917,7 +3808,7 @@ class AuraLive:
         time_str = datetime.now().strftime("%H:%M")
 
         # Start fetching news immediately — runs in parallel while phase 1 plays
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
 
         await asyncio.sleep(0.3)
@@ -3054,6 +3945,7 @@ class AuraLive:
             from core import gemini
             summary = await asyncio.to_thread(
                 gemini.text, prompt, gemini.SMART, None, 30_000,
+                task_type="short_summary",
             )
             if summary:
                 save_session_summary(summary, lang)
@@ -3216,11 +4108,13 @@ class AuraLive:
     # ── main loop ───────────────────────────────────────────────────────────
 
     async def run(self):
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
         self._reconnect_event = asyncio.Event()
 
-        while not self.ui._win._ready:
+        while not self._shutdown_event.is_set() and not self.ui._win._ready:
             await asyncio.sleep(0.2)
+        if self._shutdown_event.is_set():
+            return
 
         # ── Wire the shared core services to the interface ───────────────────
         # The confirmation gate is useless without a way to ask, and a memory
@@ -3242,19 +4136,21 @@ class AuraLive:
         # for host-API enumeration on the Qt thread.
         audio_devices.prefetch()
 
-        # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
-        try:
-            from dashboard.server import DashboardServer
-            self._dashboard = DashboardServer()
-            self._dashboard.set_connect_callback(self._on_phone_connected)
-            asyncio.create_task(self._dashboard.serve())
-            # Runs for the whole lifetime, not just inside an active session
-            asyncio.create_task(self._process_dashboard_commands())
-        except Exception as e:
-            print(f"[Dashboard] Disabled: {e}")
-            self._dashboard = None
+        # A background launch stays completely offline until its wake word.
+        if not self._background_mode:
+            try:
+                from dashboard.server import DashboardServer
+                self._dashboard = DashboardServer()
+                self._dashboard.set_connect_callback(self._on_phone_connected)
+                asyncio.create_task(self._dashboard.serve())
+                asyncio.create_task(self._process_dashboard_commands())
+            except Exception as e:
+                print(f"[Dashboard] Disabled: {e}")
+                self._dashboard = None
 
         while True:
+            if not await self._wait_to_open_session():
+                return
             try:
                 local_settings = get_local_llm_config()
                 current_mode = local_settings.get("mode", "gemini")
@@ -3270,7 +4166,11 @@ class AuraLive:
                     continue
 
                 print("[AURA] Connecting...")
-                self.ui.set_state("THINKING")
+                self._set_background_state(
+                    "PROCESSING", "opening the assistant conversation"
+                )
+                if not self._background_idle_mode:
+                    self.ui.set_state("THINKING")
 
                 # Pick the rung to open the conversation on. A model resting
                 # off a quota limit is skipped; the name is published back to
@@ -3297,12 +4197,15 @@ class AuraLive:
 
                 async with (
                     client.aio.live.connect(model=live_model, config=config) as session,
-                    asyncio.TaskGroup() as tg,
+                    TaskGroup() as tg,
                 ):
                     self.session          = session
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
+                    self._background_response_started = asyncio.Event()
+                    self._background_response_watch = None
+                    self._background_retrying = False
                     self._gemini_mic_audio_confirmed = False
 
                     # Reset transient state that must not carry over from a previous session
@@ -3312,6 +4215,11 @@ class AuraLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._last_user_speech     = time.monotonic()
+                    wake_greeting = self._take_wake_greeting()
+                    if wake_greeting:
+                        self._face_welcome_pending = False
+                    self._session_active_event.set()
 
                     print("[AURA] Connected.")
                     if _resumed_with:
@@ -3320,7 +4228,12 @@ class AuraLive:
                         # is the whole point, and it is invisible otherwise.
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
 
-                    self.ui.set_state("LISTENING")
+                    self._set_background_state(
+                        "IDLE_ACTIVE",
+                        "conversation connected; microphone is waiting for speech",
+                    )
+                    if not self._background_idle_mode:
+                        self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: AURA online.")
 
                     if self._dashboard:
@@ -3328,6 +4241,7 @@ class AuraLive:
 
                     self._reconnect_event.clear()  # ignore requests from before this session
                     tg.create_task(self._watch_reconnect())
+                    tg.create_task(self._watch_session_lifecycle())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
@@ -3335,13 +4249,19 @@ class AuraLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    if wake_greeting:
+                        tg.create_task(self._deliver_wake_greeting())
                     if self._face_welcome_pending:
                         tg.create_task(self._speak_face_welcome())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
                     # Morning briefing — fires once per process launch (if enabled).
-                    if not self._briefing_sent and get_brief_enabled():
+                    if (
+                        not self._background_mode
+                        and not self._briefing_sent
+                        and get_brief_enabled()
+                    ):
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
 
@@ -3350,6 +4270,12 @@ class AuraLive:
             except SystemExit:
                 raise
             except BaseException as e:
+                if _contains_exception(e, _ApplicationShutdown):
+                    return
+                if _contains_exception(e, _BackgroundSessionPaused):
+                    continue
+                if _contains_exception(e, _BackgroundSessionEnded):
+                    continue
                 # Catches both Exception and BaseExceptionGroup (Python 3.11+
                 # TaskGroup raises BaseExceptionGroup when tasks are cancelled
                 # externally, which `except Exception` would miss, letting the
@@ -3392,11 +4318,17 @@ class AuraLive:
                     self.ui.write_log(
                         "SYS: Gemini Live disconnected — local voice fallback is listening."
                     )
+                    self._show_background_feedback(
+                        "Gemini is unavailable; switching to your configured local brain."
+                    )
                     await self._run_local_session(retry_after=60)
                     continue
 
                 print(f"[AURA] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
+                self._show_background_feedback(
+                    f"Couldn't connect to the configured AURA brain: {err_str[:180]}"
+                )
 
                 # Turn-taking / media / thinking knobs rejected by the server
                 # (preview API drift) — drop them first, because they are the
@@ -3473,10 +4405,15 @@ class AuraLive:
                     self._conn_backoff = 3
             finally:
                 self.session = None
+                self._session_active_event.clear()
                 # Only save if there was a real conversation (≥3 turns)
                 if len(self._session_log) >= 3:
                     asyncio.create_task(self._save_session_summary())
 
+            if self._shutdown_event.is_set():
+                return
+            if self._session_end_event.is_set() or self._manual_pause_event.is_set():
+                continue
             self.set_speaking(False)
             self.ui.set_state("SLEEPING")
 
@@ -3499,6 +4436,14 @@ def main():
         "--provider", choices=("ollama", "lmstudio", "auto"),
         help="Override the local LLM provider in voice mode.",
     )
+    parser.add_argument(
+        "--background", action="store_true",
+        help="Start A.U.R.A. in the system tray and wait for its offline wake word.",
+    )
+    parser.add_argument(
+        "--open", action="store_true",
+        help="Open A.U.R.A.'s main window without requesting startup elevation.",
+    )
     args = parser.parse_args()
 
     if args.voice:
@@ -3519,21 +4464,131 @@ def main():
             print(f"[Voice] {exc}")
         return
 
-    ui = AuraUI("face.png")
+    _install_crash_logging()
+    _startup_log(f"launch (background={args.background})")
+    _detach_windows_console()
+
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+
+    from background_assistant import BackgroundController, SingleInstance
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    single_instance = SingleInstance()
+    try:
+        if not single_instance.start():
+            _startup_log(
+                "another A.U.R.A. instance already holds the lock - exiting. "
+                "The existing instance can be activated by launching A.U.R.A. again."
+            )
+            return
+    except RuntimeError as exc:
+        QMessageBox.critical(None, "A.U.R.A. startup error", str(exc))
+        return
+
+    ui = None
+    aura = None
+    try:
+        ui = AuraUI(
+            "face.png",
+            show_window=not args.background,
+            background_mode=args.background,
+        )
+        aura = AuraLive(ui, background_mode=args.background)
+        runner_done = threading.Event()
+        app._aura_background_controller = BackgroundController(
+            app,
+            ui,
+            aura,
+            single_instance,
+            background_mode=args.background,
+            runner_done=runner_done,
+        )
+    except Exception as exc:
+        _startup_log("init failed:\n" + traceback.format_exc())
+        if aura is not None:
+            aura.close()
+        single_instance.close()
+        QMessageBox.critical(
+            None,
+            "A.U.R.A. startup error",
+            f"A.U.R.A. could not initialize:\n\n{exc}",
+        )
+        return
 
     def runner():
-        ui.wait_for_api_key()
-        aura = AuraLive(ui)
         try:
+            while not aura._shutdown_event.is_set():
+                if ui._win._ready and ui._win._face_gate.wait(0.1):
+                    break
+                time.sleep(0.1)
+            if aura._shutdown_event.is_set():
+                return
             asyncio.run(aura.run())
         except KeyboardInterrupt:
             print("\n🔴 Shutting down...")
+        except Exception:
+            _startup_log("runner crashed:\n" + traceback.format_exc())
+        finally:
+            aura.close()
+            runner_done.set()
+            if aura._shutdown_event.is_set():
+                _hard_exit_watchdog()
 
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
 
-if __name__ == "__main__":
-    from core.startup import ensure_windows_administrator
 
-    ensure_windows_administrator()
+def _detach_windows_console() -> None:
+    """Keep the GUI process alive and quiet when its launching console closes."""
+    if _platform.system() != "Windows":
+        return
+
+    import ctypes
+    import os
+
+    try:
+        null_stdout = open(  # noqa: SIM115 - retained as sys.stdout for process lifetime
+            os.devnull, "w", encoding="utf-8"
+        )
+        null_stderr = open(  # noqa: SIM115 - retained as sys.stderr for process lifetime
+            os.devnull, "w", encoding="utf-8"
+        )
+        null_stdin = open(  # noqa: SIM115 - retained as sys.stdin for process lifetime
+            os.devnull, "r", encoding="utf-8"
+        )
+    except OSError as exc:
+        if sys.stderr is not None:
+            print(f"[AURA] Could not redirect console streams: {exc}", file=sys.stderr)
+        return
+
+    original_streams = (
+        sys.stdin, sys.stdout, sys.stderr,
+        sys.__stdin__, sys.__stdout__, sys.__stderr__,
+    )
+    sys.stdin = sys.__stdin__ = null_stdin
+    sys.stdout = sys.__stdout__ = null_stdout
+    sys.stderr = sys.__stderr__ = null_stderr
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.FreeConsole.restype = ctypes.c_int
+        if not kernel32.FreeConsole():
+            error = ctypes.get_last_error()
+            if error not in (0, 6):  # ERROR_INVALID_HANDLE means no console is attached.
+                raise OSError(error, "Windows could not detach A.U.R.A. from its console.")
+    except (AttributeError, OSError) as exc:
+        (
+            sys.stdin, sys.stdout, sys.stderr,
+            sys.__stdin__, sys.__stdout__, sys.__stderr__,
+        ) = original_streams
+        if sys.stderr is not None:
+            print(f"[AURA] Could not detach from the console: {exc}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    if "--background" not in sys.argv and "--open" not in sys.argv:
+        from core.startup import ensure_windows_administrator
+
+        ensure_windows_administrator()
     main()

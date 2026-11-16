@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; connect-src file:; img-src 'self' data: file:; style-src 'self' 'unsafe-inline'; script-src 'self';">
+  <title>A.U.R.A. CAD Preview</title>
+  <style>
+    :root { color-scheme: dark; font: 14px "Segoe UI", sans-serif; background: #080d12; color: #dce7ed; }
+    body { margin: 0; overflow: hidden; }
+    header { height: 42px; display: flex; align-items: center; gap: 7px; padding: 0 10px; background: #101820; border-bottom: 1px solid #263744; }
+    strong { color: #69d6c6; letter-spacing: 1px; margin-right: auto; }
+    button { color: #dce7ed; background: #17232c; border: 1px solid #354956; padding: 6px 9px; cursor: pointer; }
+    button:hover { border-color: #69d6c6; }
+    #stage { position: absolute; inset: 43px 0 25px; }
+    canvas { width: 100%; height: 100%; display: block; }
+    #message { position: absolute; inset: 50% auto auto 50%; transform: translate(-50%,-50%); color: #b7c9d1; text-align: center; max-width: 430px; line-height: 1.5; }
+    footer { position: absolute; bottom: 0; height: 24px; left: 10px; right: 10px; color: #8799a3; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>CAD PREVIEW</strong>
+    <button data-command="reset">Reset</button>
+    <button data-command="wireframe">Wireframe</button>
+    <button data-command="explode">Explode</button>
+    <button data-command="grid">Grid</button>
+    <button data-command="screenshot">Screenshot</button>
+  </header>
+  <main id="stage"><canvas id="view"></canvas><div id="message">Loading local model…</div></main>
+  <footer>Drag to rotate · Scroll to zoom · Processed locally</footer>
+  <script src="viewer.js"></script>
+</body>
+</html>

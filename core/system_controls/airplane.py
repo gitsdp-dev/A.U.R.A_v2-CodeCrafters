@@ -21,7 +21,10 @@ class AirplaneModeControl(SystemControl):
         return platform.system() == "Windows"
 
     async def _radios(self):
-        from winsdk.windows.devices.radios import Radio
+        try:
+            from winrt.windows.devices.radios import Radio
+        except ImportError:
+            from winsdk.windows.devices.radios import Radio
 
         return await Radio.get_radios_async()
 
@@ -48,7 +51,10 @@ class AirplaneModeControl(SystemControl):
 
         async def apply():
             radios = await self._radios()
-            from winsdk.windows.devices.radios import RadioState
+            try:
+                from winrt.windows.devices.radios import RadioState
+            except ImportError:
+                from winsdk.windows.devices.radios import RadioState
 
             if value:
                 already_disabled = all(

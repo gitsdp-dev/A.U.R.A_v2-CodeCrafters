@@ -5,6 +5,8 @@ import re
 import time
 from pathlib import Path
 
+from compat import get_python_executable
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -26,14 +28,23 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
 
 
-def _get_gemini(tier: str = gemini.SMART):
+def _get_gemini(
+    tier: str = gemini.SMART,
+    task_type: str = "code",
+):
     """Writing and fixing code is the reasoning tier; a 60s deadline because a
     whole file can come back."""
     class _W:
         def generate_content(self, contents):
-            resp = gemini.call(contents, tier=tier, timeout_ms=60000)
+            resp = gemini.call(
+                contents,
+                tier=tier,
+                timeout_ms=60000,
+                task_type=task_type,
+                raise_errors=True,
+            )
             if resp is None:
-                raise RuntimeError("every Gemini model on the ladder failed")
+                raise RuntimeError(gemini.user_facing_error(None))
             return resp
 
     return _W()
@@ -150,7 +161,9 @@ def _detect_intent(description: str, file_path: str, code: str) -> str:
                 "  optimize     = refactor / clean up / speed up existing code\n\n"
                 "Reply with ONLY the intent word, nothing else."
             )
-            ans = _get_gemini().generate_content(prompt).text.strip().lower()
+            ans = _get_gemini(task_type="intent_parsing").generate_content(
+                prompt
+            ).text.strip().lower()
             ans = ans.strip("`'\". \n")
             if ans in _VALID_INTENTS:
                 return ans
@@ -209,8 +222,9 @@ Fixed code:"""
 
 
 def _run_file(path: Path, args: list, timeout: int) -> str:
+    python_exe = get_python_executable()
     interpreters = {
-        ".py":  [sys.executable],
+        ".py":  [python_exe] if python_exe else [],
         ".js":  ["node"],
         ".ts":  ["ts-node"],
         ".sh":  ["bash"],
@@ -220,6 +234,8 @@ def _run_file(path: Path, args: list, timeout: int) -> str:
     }
     interp = interpreters.get(path.suffix.lower())
     if not interp:
+        if path.suffix.lower() == ".py":
+            return "Python scripts are unavailable: no Python interpreter is installed."
         return f"No interpreter for {path.suffix}."
 
     try:
@@ -257,7 +273,7 @@ def _build(description, language, output_path, args, timeout, speak=None, player
         code, path = _write(description, lang, output_path, player)
         print(f"[Code] ✅ Written: {path}")
     except Exception as e:
-        msg = f"Could not write initial code: {e}"
+        msg = f"Could not write initial code. {gemini.user_facing_error(e)}"
         if speak: speak(msg)
         return msg
 
@@ -286,7 +302,10 @@ def _build(description, language, output_path, args, timeout, speak=None, player
             code = _fix_code(code, last_output, description)
             _save_file(path, code)
         except Exception as e:
-            msg = f"Could not fix code on attempt {attempt}: {e}"
+            msg = (
+                f"Could not fix code on attempt {attempt}. "
+                f"{gemini.user_facing_error(e)}"
+            )
             if speak: speak(msg)
             return msg
 
@@ -307,7 +326,7 @@ def _write_action(description, language, output_path, player) -> str:
         print(f"[Code] ✅ Written: {path}")
         return f"Code written. Saved to: {path}\n\nPreview:\n{_preview(code)}"
     except Exception as e:
-        return f"Could not generate code: {e}"
+        return f"Could not generate code. {gemini.user_facing_error(e)}"
 
 
 def _edit_action(file_path, instruction, player) -> str:
@@ -339,7 +358,7 @@ Updated code:"""
         response = model.generate_content(prompt)
         edited   = _clean_code(response.text)
     except Exception as e:
-        return f"Could not edit code: {e}"
+        return f"Could not edit code. {gemini.user_facing_error(e)}"
 
     status = _save_file(Path(file_path), edited)
     print(f"[Code] ✅ Edited: {file_path}")
@@ -371,7 +390,7 @@ Explanation:"""
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        return f"Could not explain code: {e}"
+        return f"Could not explain code. {gemini.user_facing_error(e)}"
 
 
 def _run_action(file_path, args, timeout, player) -> str:
@@ -418,7 +437,7 @@ Optimized code:"""
         response  = model.generate_content(prompt)
         optimized = _clean_code(response.text)
     except Exception as e:
-        return f"Could not optimize code: {e}"
+        return f"Could not optimize code. {gemini.user_facing_error(e)}"
 
     # Kaydet
     if file_path:
@@ -489,7 +508,12 @@ Be specific and actionable. If you see an error message, quote it exactly."""
             analysis_prompt,
         ]
 
-        response = gemini.call(contents, tier=gemini.SMART, timeout_ms=45_000)
+        response = gemini.call(
+            contents,
+            tier=gemini.SMART,
+            timeout_ms=45_000,
+            task_type="file_task",
+        )
         if response is None:
             return "Sir, I couldn't reach Gemini to analyse that screenshot."
 

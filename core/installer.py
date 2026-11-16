@@ -12,6 +12,8 @@ import subprocess
 import sys
 from typing import Callable
 
+from compat import get_python_executable
+
 # ── Package lists ─────────────────────────────────────────────────────────
 # Each entry: (import_name, pip_package_name)
 
@@ -40,7 +42,6 @@ _CORE: list[tuple[str, str]] = [
 _WINDOWS: list[tuple[str, str]] = [
     ("comtypes",   "comtypes"),
     ("pycaw",      "pycaw"),
-    ("win10toast", "win10toast"),
     ("pywinauto",  "pywinauto"),
 ]
 
@@ -71,9 +72,14 @@ def _available(module: str) -> bool:
 def _pip(package: str, log: Callable | None = None) -> bool:
     if log:
         log(f"SYS: pip install {package} …")
+    python_exe = get_python_executable()
+    if not python_exe:
+        if log:
+            log(f"ERR: Cannot install {package}; no Python interpreter is available.")
+        return False
     result = subprocess.run(
         [
-            sys.executable, "-m", "pip", "install", package,
+            python_exe, "-m", "pip", "install", package,
             "--quiet", "--disable-pip-version-check",
         ],
         capture_output=True,
@@ -99,7 +105,14 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
 
     needed: list[tuple[str, str]] = list(_CORE)
     needed += _STT.get(stt, [])
-    needed += _TTS.get(tts, [])
+    if tts == "kokoro" and sys.version_info >= (3, 13):
+        if log:
+            log(
+                "WARN: The torch-based Kokoro engine is unavailable on Python "
+                "3.13+; choose a different TTS engine."
+            )
+    else:
+        needed += _TTS.get(tts, [])
     if platform.system() == "Windows":
         needed += _WINDOWS
 
@@ -130,10 +143,14 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
         _pip("playwright", log)
         if log:
             log("SYS: Downloading Playwright browser (Chromium, ~150 MB — one-time)…")
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True,
-        )
+        python_exe = get_python_executable()
+        if python_exe:
+            subprocess.run(
+                [python_exe, "-m", "playwright", "install", "chromium"],
+                capture_output=True,
+            )
+        elif log:
+            log("ERR: Playwright browser install skipped; Python is unavailable.")
         if log:
             log("SYS: Playwright browser ready.")
 

@@ -36,6 +36,22 @@ The AI configuration can be selected during setup or changed later through:
 
 Existing Gemini configuration files remain compatible with the newer configuration system.
 
+### Automatic Gemini model routing
+
+When **Auto model switching** is enabled, A.U.R.A. routes one-shot Gemini
+generation to fast, smart, or deep free-tier model chains according to the task.
+The chains and task-type rules are defined in [`model_router.py`](./model_router.py);
+edit `TIERS` there to update model preferences. Accessible models are checked
+against the user's Gemini key, and unavailable models are skipped. Complete
+application, game, and project builds use the deep-tier `dev_agent`; individual
+code-file writing and debugging use the smart-tier `code_helper`. The Live
+conversation model itself remains unchanged. If all routed models fail, A.U.R.A.
+tries the configured local engine in Gemini + Local Fallback mode, then its
+existing one-shot Gemini fallback ladder before asking the user to retry.
+
+Gemini free-tier prompts may be used by Google to improve its products. Users
+should review Google's current terms before sending private or sensitive content.
+
 ## Memory System
 
 A.U.R.A.'s long-term memory is stored locally and is organized into four categories:
@@ -50,6 +66,68 @@ entries. Voice-created entries are marked `VOICE`. The store is migrated from
 older A.U.R.A. memory files automatically and backups are retained locally.
 Relevant entries are sent to the configured AI model as clearly delimited context;
 the original memory data remains on this device.
+
+---
+
+# Requirements
+
+| Requirement | Details |
+|---|---|
+| **Operating System** | Windows recommended; macOS and Linux may be supported |
+| **Python** | Python 3.10–3.14 supported; Python 3.15 is best-effort |
+| **Internet** | Required for Gemini, web research, Edge TTS, ElevenLabs, and other online features |
+| **Microphone** | Recommended for voice interaction |
+| **Speaker / Headset** | Recommended for voice output |
+| **Gemini API Key** | Required for Gemini Key Only and Gemini + Local Fallback |
+| **Ollama** | Required when using Ollama local AI |
+| **LM Studio** | Required when using LM Studio local AI |
+| **Local AI Model** | Required for Local AI Only and local fallback |
+| **Vosk Model** | Required for local speech recognition |
+| **Kokoro Model** | Required for offline Kokoro speech synthesis |
+
+> **Note:** The offline voice system can operate locally, but features that depend on Gemini, web research, online TTS providers, or other external services still require an internet connection.
+
+---
+
+# Recommended Local Configuration
+
+For low- to mid-range computers, A.U.R.A recommends starting with:
+
+```text
+1B–3B quantized instruct model
+Lightweight Vosk model
+Kokoro local TTS
+Concise spoken responses
+```
+
+Local generation is intentionally constrained to reduce latency and resource usage.
+
+However, local response speed depends on:
+
+- CPU performance
+- Model size
+- Model quantization
+- Prompt size
+- Tool usage
+- Conversation history
+- Cold-start time
+- Speech-processing workload
+
+Therefore, response times can vary significantly between systems.
+
+---
+
+# Known Limitations
+
+Local AI mode currently has several differences from Gemini Live:
+
+- Local mode uses endpointed speech recognition and text generation.
+- It does not provide Gemini Live's native audio turn-taking.
+- Proactive audio behavior available through Gemini Live is not provided by local models.
+- CPU inference and local speech generation can be slower than Gemini Live.
+- Vision is currently disabled for local models in this build.
+- Gemini remains available for screen and camera understanding.
+- Local tool calls are dispatched through A.U.R.A's existing tool executor and confirmation system.
 
 ---
 
@@ -147,6 +225,23 @@ A.U.R.A v2 significantly expands the original assistant architecture.
 - Added room checking.
 - Added confirmation gates for potentially sensitive agent actions.
 - Added workspace restrictions for local agent tools.
+
+### Background Assistant (v2.7.0)
+
+![AURA Background Assistant](image.png)
+
+- Keep A.U.R.A. running in the system tray or macOS menu bar after closing the main window.
+- Optionally listen for the offline **"Hey AURA"** wake phrase using Vosk; the listener runs locally and can be paused or resumed from the tray menu.
+- Open a floating voice orb for wake-word sessions, with a response panel for Markdown, scrolling, copy, text follow-ups, and Stop/Close controls.
+- Start A.U.R.A. in the background with `python main.py --background`, configure launch at login, and customize listening and response behavior.
+
+### CAD Designer (v2.7.0)
+
+- Create 3D designs from typed or spoken requests, with guided questions to collect missing design details and choices.
+- Build common Inline, Flat, and V-type engine layouts with deterministic parametric templates; other supported objects use the configured AI model route.
+- Review builds in the built-in local WebGL viewer and save versioned projects as STL, OBJ, or GLB.
+- Validate generated CAD code before running it in an isolated worker, check resulting meshes, and optionally reuse validated parametric parts from a local cache.
+- Install the optional CAD dependencies from `requirements-cad.txt`; A.U.R.A. prompts for approval if a required package is missing.
 
 ### Architecture
 
@@ -588,47 +683,47 @@ The complete voice architecture can be represented as:
                     └────────┬────────┘
                              │
                              ▼
-                    ┌───────────────
+                    ┌─────────────────┐
                     │ Wake Detection  │
-                    └────────┬──────
+                    └────────┬───────┘
                              |
                              ▼
-                    ┌──────────────
+                    ┌────────────────┐
                     │ Voice / Vosk    │
                     │ Recognition     │
-                    └────────┬─────
+                    └────────┬──────┘
                              │
                              ▼
-                 ┌─────────────────────
+                 ┌───────────────────────┐
                  │      AI Processing      │
                  │                         │
                  │ Gemini / Ollama /       │
                  │ LM Studio               │
-                 └────────────┬────────
+                 └────────────┬─────────┘
                               │
                               ▼
-                    ┌───────────────
+                    ┌─────────────────┐
                     │ Agent / Actions │
-                    └────────┬──────
+                    └────────┬───────┘
                              │
                              ▼
-                    ┌───────────────
+                    ┌─────────────────┐
                     │ Text Response   |
-                    └────────┬──────
+                    └────────┬───────┘
                              │
                              ▼
-                 ┌──────────────────────
+                 ┌────────────────────────┐
                  │       TTS Engine        │
                  │                         │
                  │ Kokoro / Edge /         │
                  │ ElevenLabs              │
-                 └────────────┬─────────
+                 └────────────┬──────────┘
                               │
                               ▼
-                    ┌───────────────
+                    ┌─────────────────┐
                     │ Selected Output │
                     │    Speaker      |
-                    └──────────────
+                    └───────────────┘
 ```
 
 ---
@@ -645,20 +740,44 @@ cd A.U.R.A_v2-CodeCrafters
 ## 2. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+python setup_env.py
 ```
 
-For the full local voice setup, the project setup script can install dependencies and download the required Vosk and Kokoro ONNX models:
+The setup script selects an installed Python 3.10–3.14 (preferring 3.12),
+creates `.venv`, and installs the core requirements. Optional audio and Windows
+integrations can be installed from `requirements-optional.txt`; failure to
+install an optional package does not block core setup.
+
+`setup.py` installs `requirements.txt`, `requirements-optional.txt`, and
+`requirements-cad.txt`. When run with Python 3.12, it installs into that
+interpreter's environment. When run with another Python version, it creates or
+uses `.venv` with Python 3.12; Python 3.12 must be installed, and any existing
+`.venv` with a different version is left untouched and reported.
+
+Run A.U.R.A using the new environment:
 
 ```powershell
-python setup.py
+.\.venv\Scripts\python.exe main.py
+```
+
+```bash
+./.venv/bin/python main.py
+```
+
+For the full local voice setup, download the required Vosk and Kokoro ONNX models:
+
+```powershell
+.\.venv\Scripts\python.exe setup.py
 ```
 
 Alternatively, download the required models manually:
 
 ```powershell
-python scripts\download_models.py
+.\.venv\Scripts\python.exe scripts\download_models.py
 ```
+
+Install the real FFmpeg distribution for your OS and ensure both `ffmpeg` and
+`ffprobe` are available on `PATH` for audio/video conversion and inspection.
 
 ---
 
@@ -669,6 +788,12 @@ Just start the program by typing:
 ```bash
 python main.py
 ```
+
+The **Create Shortcut** button writes to the operating system's real Desktop
+(including redirected OneDrive and XDG Desktop locations). It uses the project
+`.venv` interpreter when A.U.R.A is running outside that environment, otherwise
+the interpreter that launched A.U.R.A; Windows prefers `pythonw.exe` from that
+same interpreter folder. Compiled builds link directly to the application.
 
 # Configuration
 
@@ -695,66 +820,6 @@ The application also maintains its AI/API configuration separately.
 Existing Gemini configuration files remain compatible with the newer setup flow.
 
 ---
-
-# Requirements
-
-| Requirement | Details |
-|---|---|
-| **Operating System** | Windows recommended; macOS and Linux may be supported |
-| **Python** | Python 3.10–3.12 recommended for the complete local voice stack |
-| **Internet** | Required for Gemini, web research, Edge TTS, ElevenLabs, and other online features |
-| **Microphone** | Recommended for voice interaction |
-| **Speaker / Headset** | Recommended for voice output |
-| **Gemini API Key** | Required for Gemini Key Only and Gemini + Local Fallback |
-| **Ollama** | Required when using Ollama local AI |
-| **LM Studio** | Required when using LM Studio local AI |
-| **Local AI Model** | Required for Local AI Only and local fallback |
-| **Vosk Model** | Required for local speech recognition |
-| **Kokoro Model** | Required for offline Kokoro speech synthesis |
-
-> **Note:** The offline voice system can operate locally, but features that depend on Gemini, web research, online TTS providers, or other external services still require an internet connection.
-
----
-
-# Recommended Local Configuration
-
-For low- to mid-range computers, A.U.R.A recommends starting with:
-
-```text
-1B–3B quantized instruct model
-Lightweight Vosk model
-Kokoro local TTS
-Concise spoken responses
-```
-
-Local generation is intentionally constrained to reduce latency and resource usage.
-
-However, local response speed depends on:
-
-- CPU performance
-- Model size
-- Model quantization
-- Prompt size
-- Tool usage
-- Conversation history
-- Cold-start time
-- Speech-processing workload
-
-Therefore, response times can vary significantly between systems.
-
----
-
-# Known Limitations
-
-Local AI mode currently has several differences from Gemini Live:
-
-- Local mode uses endpointed speech recognition and text generation.
-- It does not provide Gemini Live's native audio turn-taking.
-- Proactive audio behavior available through Gemini Live is not provided by local models.
-- CPU inference and local speech generation can be slower than Gemini Live.
-- Vision is currently disabled for local models in this build.
-- Gemini remains available for screen and camera understanding.
-- Local tool calls are dispatched through A.U.R.A's existing tool executor and confirmation system.
 
 # Notifications
 

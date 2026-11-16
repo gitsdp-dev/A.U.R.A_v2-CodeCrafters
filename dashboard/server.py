@@ -18,6 +18,8 @@ import string
 import time
 from pathlib import Path
 
+from compat import get_python_executable
+
 _DEPS_OK = False
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -114,7 +116,10 @@ def _ensure_network_access(port: int) -> None:
 
         port_rule = f"JARVIS Dashboard Port {port}"
         prog_rule  = "JARVIS Dashboard Python"
-        py_exe     = sys.executable
+        py_exe     = get_python_executable()
+        if not py_exe:
+            print("[Dashboard] Firewall setup skipped: Python interpreter unavailable.")
+            return
 
         def _netsh_rule_exists(name: str) -> bool:
             try:
@@ -241,7 +246,10 @@ def _ensure_network_access(port: int) -> None:
             if "disabled" in r.stdout.lower():
                 return  # firewall off — nothing to do
 
-            py = sys.executable
+            py = get_python_executable()
+            if not py:
+                print("[Dashboard] Firewall setup skipped: Python interpreter unavailable.")
+                return
             listed = subprocess.run(
                 [fw_ctl, "--listapps"], capture_output=True, text=True, timeout=5,
             )
@@ -845,7 +853,7 @@ class DashboardServer:
         User types IP:8001 → Chrome tries https → self-signed cert warning → accept once → done."""
         ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
         ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
+        asyncio.get_running_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
@@ -861,7 +869,7 @@ class DashboardServer:
 
         # Firewall setup runs in a thread — uvicorn starts immediately,
         # no waiting for UAC dialogs or subprocess timeouts.
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT)
+        asyncio.get_running_loop().run_in_executor(None, _ensure_network_access, PORT)
 
         # Generate the TLS pair on first run so no private key ships in the repo.
         _ensure_certs()

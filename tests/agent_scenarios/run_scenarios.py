@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 
+from compat import get_python_executable
 
 def main() -> int:
     """Run the scenario test module and return its exit code."""
     command = [
-        sys.executable,
+        get_python_executable(),
         "-m",
         "pytest",
         "-q",

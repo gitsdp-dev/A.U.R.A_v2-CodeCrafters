@@ -37,6 +37,8 @@ not calling its tool leaves the user with nothing.
 
 {capabilities}
 
+{coding_task_routing}
+
 [WHAT YOU CANNOT DO]
 
 Know your edges as precisely as your reach. Stating a limit plainly costs you

@@ -114,8 +114,8 @@ def _emit_frame(frame_sig, frame: np.ndarray) -> None:
 # ── Gemini ───────────────────────────────────────────────────────────────────
 
 def _analyze(photo: np.ndarray, query: str, api_key: str) -> dict:
-    from google import genai
     from google.genai import types as gtypes
+    from core import gemini
 
     # match screen_processor's upload size: max 1280 wide
     h, w = photo.shape[:2]
@@ -142,14 +142,17 @@ def _analyze(photo: np.ndarray, query: str, api_key: str) -> dict:
         " If no food is visible, politely say so instead."
     )
 
-    client = genai.Client(api_key=api_key)
-    resp = client.models.generate_content(
-        model=_MODEL,
-        contents=[
+    resp = gemini.call(
+        [
             gtypes.Part.from_bytes(data=jpg.tobytes(), mime_type="image/jpeg"),
             prompt,
         ],
+        tier=_MODEL,
+        task_type="file_task",
+        key=api_key,
     )
+    if resp is None:
+        raise RuntimeError("Gemini returned no nutrition analysis.")
     text = (resp.text or "").strip()
 
     # tolerate accidental fences / prose around the JSON

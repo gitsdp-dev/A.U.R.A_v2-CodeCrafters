@@ -52,7 +52,10 @@ class NotificationCenter:
         if notification.app_name.casefold().strip() in blocked:
             LOGGER.debug("Dropped notification from blocked app %s", notification.app_name)
             return
-        score_notification(notification, self.config)
+        if notification.category == "model_router":
+            notification.priority = min(15, max(0, notification.priority))
+        else:
+            score_notification(notification, self.config)
         stored = self.store.add(notification)
         if stored is not notification:
             return

@@ -22,7 +22,187 @@ from core import vosk_models
 from memory import config_manager
 
 
+class ProjectBuildRoutingTests(unittest.TestCase):
+    def test_project_build_detection_distinguishes_builds_from_explanations(self):
+        from actions.dev_agent import is_project_build_request
+
+        self.assertTrue(is_project_build_request("Make a Tic Tac Toe game"))
+        self.assertTrue(is_project_build_request("Build me a small website"))
+        self.assertFalse(is_project_build_request(
+            "How do I make a Tic Tac Toe game?"
+        ))
+        self.assertFalse(is_project_build_request(
+            "Could you explain how to build a website?"
+        ))
+
+    def test_explicit_project_builds_are_dispatched_to_deep_agent(self):
+        from main import AuraLive
+
+        aura = object.__new__(AuraLive)
+        aura._local_mode_active = False
+        aura._action_registry = Mock()
+        aura._action_registry.has.return_value = True
+        aura.ui = Mock()
+        aura.speak = Mock()
+
+        class InlineThread:
+            def __init__(self, *, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        request = "Make a Tic Tac Toe game"
+        with patch(
+            "main.get_local_llm_config",
+            return_value={"auto_model_switching": True, "mode": "gemini"},
+        ), patch("main.threading.Thread", InlineThread):
+            self.assertTrue(aura._try_route_project_build(request))
+
+        aura._action_registry.run.assert_called_once()
+        self.assertEqual(
+            aura._action_registry.run.call_args.args[:2],
+            ("dev_agent", {"description": request}),
+        )
+        aura.ui.show_content.assert_called_once()
+
+    def test_project_build_route_respects_auto_switch_off(self):
+        from main import AuraLive
+
+        aura = object.__new__(AuraLive)
+        aura._local_mode_active = False
+        aura._action_registry = Mock()
+        aura._action_registry.has.return_value = True
+        with patch(
+            "main.get_local_llm_config",
+            return_value={"auto_model_switching": False, "mode": "gemini"},
+        ), patch("main.threading.Thread") as thread:
+            self.assertFalse(
+                aura._try_route_project_build("Make a Tic Tac Toe game")
+            )
+
+        thread.assert_not_called()
+
+    def test_project_generation_reports_actionable_router_failure(self):
+        from actions import dev_agent
+        from model_router import RetryLaterError
+
+        with patch(
+            "actions.dev_agent.gemini.call",
+            side_effect=RetryLaterError("Please try again in a moment."),
+        ):
+            model = dev_agent._get_model(task_type="cad_design")
+            with self.assertRaises(dev_agent.ModelGenerationError) as raised:
+                model.generate_content("Create a CAD design")
+
+        self.assertIn("temporarily unavailable or rate-limited", str(raised.exception))
+        self.assertNotIn("every Gemini model on the ladder failed", str(raised.exception))
+
+    def test_strict_gemini_call_preserves_router_failures_for_action_handlers(self):
+        from core import gemini
+        from model_router import RetryLaterError, router
+
+        with patch.object(
+            router,
+            "generate",
+            side_effect=RetryLaterError("Please try again in a moment."),
+        ):
+            with self.assertRaises(RetryLaterError):
+                gemini.call("prompt", raise_errors=True)
+            self.assertIsNone(gemini.call("prompt"))
+
+    def test_project_planning_failure_is_returned_without_traceback_text(self):
+        from actions import dev_agent
+
+        with patch(
+            "actions.dev_agent._plan_project",
+            side_effect=dev_agent.ModelGenerationError(
+                "Gemini models are temporarily unavailable or rate-limited. "
+                "Please try again shortly."
+            ),
+        ):
+            result = dev_agent._build_project(
+                description="Create a CAD design",
+                language="python",
+                project_name="",
+                timeout=30,
+            )
+
+        self.assertIn("Could not plan the project.", result)
+        self.assertIn("Please try again shortly.", result)
+        self.assertNotIn("Traceback", result)
+
+
 class LocalAIConfigTests(unittest.TestCase):
+    def test_open_aura_variants_raise_the_existing_main_window(self):
+        from main import AuraLive, _is_open_aura_command
+
+        for phrase in (
+            "open AURA",
+            "show the AURA window",
+            "Hey AURA, open the AURA main app",
+            "open AURA's main app",
+            "launch A.U.R.A. application",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(_is_open_aura_command(phrase))
+
+        aura = types.SimpleNamespace(ui=Mock())
+        AuraLive._open_aura_window(aura)
+        aura.ui.show_main_window.assert_called_once_with()
+
+    def test_ui_quit_request_uses_the_installed_cleanup_callback(self):
+        from ui import AuraUI
+
+        callback = Mock()
+        ui = types.SimpleNamespace(on_quit_requested=callback, _app=Mock())
+
+        AuraUI.request_quit(ui)
+
+        callback.assert_called_once_with()
+        ui._app.quit.assert_not_called()
+
+    def test_keyword_wake_queues_the_greeting_and_opens_the_session(self):
+        from main import AuraLive
+
+        aura = object.__new__(AuraLive)
+        aura._shutdown_event = threading.Event()
+        aura._manual_pause_event = threading.Event()
+        aura._wake_greeting_pending = threading.Event()
+        aura._wake_requested_event = threading.Event()
+
+        aura.wake_from_word(greeting=True)
+
+        self.assertTrue(aura._wake_greeting_pending.is_set())
+        self.assertTrue(aura._wake_requested_event.is_set())
+
+    def test_live_wake_greeting_uses_the_connected_brain_voice(self):
+        from main import AuraLive
+
+        sent = {}
+        turn_done = asyncio.Event()
+
+        class Session:
+            async def send_client_content(self, **payload):
+                sent.update(payload)
+                turn_done.set()
+
+        aura = types.SimpleNamespace(
+            session=Session(),
+            _session_end_event=threading.Event(),
+            _turn_done_event=turn_done,
+            set_speaking=Mock(),
+        )
+
+        asyncio.run(AuraLive._deliver_wake_greeting(aura))
+
+        self.assertIn(
+            "Hey, how can I help you today?",
+            sent["turns"]["parts"][0]["text"],
+        )
+        aura.set_speaking.assert_called_once_with(True)
+
     def test_tool_intent_gate_skips_schemas_for_chat_and_keeps_voice_actions(self):
         self.assertFalse(_request_needs_tools("Hello, how are you?"))
         self.assertFalse(_request_needs_tools("Tell me a short joke."))
@@ -88,6 +268,43 @@ class LocalAIConfigTests(unittest.TestCase):
         self.assertFalse(aura._local_turn_active.is_set())
         self.assertIsNone(aura._local_turn_task)
 
+    def test_startup_briefing_sends_greeting_then_fetched_news(self):
+        from main import AuraLive
+
+        class Session:
+            def __init__(self):
+                self.turns = []
+                self.briefing = None
+
+            async def send_client_content(self, **kwargs):
+                self.turns.append(kwargs["turns"])
+                if len(self.turns) == 1:
+                    self.briefing._turn_done_event.set()
+
+        aura = object.__new__(AuraLive)
+        aura.session = Session()
+        aura.session.briefing = aura
+        aura._turn_done_event = asyncio.Event()
+        aura.ui = Mock()
+
+        async def send_and_wait():
+            await aura._send_startup_briefing()
+            remaining = [
+                task for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+            ]
+            await asyncio.gather(*remaining)
+
+        with patch("main.load_memory", return_value={"identity": {}}), \
+                patch("main.pop_last_session", return_value=None), \
+                patch("main._fetch_news_sync", return_value="Headline one"):
+            asyncio.run(send_and_wait())
+
+        self.assertEqual(len(aura.session.turns), 2)
+        self.assertIn("Greet the user warmly", aura.session.turns[0]["parts"][0]["text"])
+        self.assertIn("Headline one", aura.session.turns[1]["parts"][0]["text"])
+        aura.ui.show_content.assert_called_once()
+
     def test_wrapped_gemini_keepalive_timeout_triggers_local_fallback(self):
         class WrappedFailure(Exception):
             def __init__(self):
@@ -100,15 +317,17 @@ class LocalAIConfigTests(unittest.TestCase):
         self.assertFalse(
             should_fallback_to_local("local", WrappedFailure())
         )
-        self.assertTrue(
-            should_fallback_to_local(
-                "fallback",
-                ExceptionGroup(
-                    "unhandled errors in a TaskGroup",
-                    [TimeoutError("timed out while closing connection")],
-                ),
+        exception_group = getattr(__import__("builtins"), "ExceptionGroup", None)
+        if exception_group is not None:
+            self.assertTrue(
+                should_fallback_to_local(
+                    "fallback",
+                    exception_group(
+                        "unhandled errors in a TaskGroup",
+                        [TimeoutError("timed out while closing connection")],
+                    ),
+                )
             )
-        )
 
     def test_initialization_modes_require_the_right_configuration(self):
         local_only = {

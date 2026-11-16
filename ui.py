@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import platform
 import random
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -13,6 +15,8 @@ import time
 import webbrowser
 from pathlib import Path
 from urllib.parse import quote_plus
+
+from compat import get_python_executable
 
 import psutil
 
@@ -27,14 +31,45 @@ else:
 os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
 
 from PyQt6.QtCore import (
-    QEasingCurve, QEvent, QLineF, QMimeData, QObject, QPoint, QPointF, QPropertyAnimation,
-    QRect, QRectF, QSize, QSizeF, Qt, QThread, QTimer, QUrl, QVariantAnimation,
+    QEasingCurve,
+    QEvent,
+    QLineF,
+    QMimeData,
+    QObject,
+    QParallelAnimationGroup,
+    QPoint,
+    QPointF,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    QSize,
+    QSizeF,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    QVariantAnimation,
     pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QConicalGradient, QCursor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QFontMetricsF, QKeySequence, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap, QRadialGradient, QShortcut,
+    QBrush,
+    QColor,
+    QConicalGradient,
+    QCursor,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QFontDatabase,
+    QFontMetricsF,
+    QKeySequence,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QRadialGradient,
+    QShortcut,
 )
 # Video playback for the HUD. Part of PyQt6, so it costs no new dependency —
 # but the multimedia plugins are a separate piece of the Qt install and can be
@@ -65,10 +100,10 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QScrollArea, QSizePolicy, QSlider,  # NEURAL: force-control slider
+    QScrollArea, QSizePolicy, QSlider, QSpinBox,  # NEURAL: force-control slider
     QSplitter,
     QGraphicsScene, QGraphicsView,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QSizeGrip,
+    QStackedWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QSizeGrip,
 )
 try:
     from earth.earth_widget import EarthWidget
@@ -101,6 +136,155 @@ def _base_dir() -> Path:
 BASE_DIR   = _base_dir()
 CONFIG_DIR = BASE_DIR / "config"
 API_FILE   = CONFIG_DIR / "api_keys.json"
+_LOGGER = logging.getLogger("aura.shortcuts")
+
+
+def build_shortcut_arguments(
+    script_path: str | Path, extra_args=(), frozen: bool = False
+) -> str:
+    """Build a Windows argument string without losing paths containing spaces."""
+    arguments = list(extra_args)
+    if not frozen:
+        arguments.insert(0, str(Path(script_path).resolve()))
+    return subprocess.list2cmdline(arguments)
+
+
+def _desktop_exec_quote(value: str | Path) -> str:
+    escaped = (
+        str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    )
+    return f'"{escaped}"'
+
+
+def _write_desktop_entry(path: Path, contents: str) -> None:
+    path.write_text(contents, encoding="utf-8")
+    path.chmod((path.stat().st_mode & 0o666) | 0o111)
+
+
+def _windows_known_desktop_dir() -> Path | None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        folder_id = _GUID(
+            0xB4BFCC3A, 0xDB2C, 0x424C,
+            (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41),
+        )
+        result = ctypes.c_wchar_p()
+        get_folder_path = ctypes.windll.shell32.SHGetKnownFolderPath
+        get_folder_path.argtypes = [
+            ctypes.POINTER(_GUID), wintypes.DWORD, wintypes.HANDLE,
+            ctypes.POINTER(ctypes.c_wchar_p),
+        ]
+        get_folder_path.restype = ctypes.c_long
+        status = get_folder_path(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(result)
+        )
+        if status != 0:
+            return None
+        try:
+            return Path(result.value) if result.value else None
+        finally:
+            free_memory = ctypes.windll.ole32.CoTaskMemFree
+            free_memory.argtypes = [ctypes.c_void_p]
+            free_memory.restype = None
+            free_memory(ctypes.cast(result, ctypes.c_void_p))
+    except (AttributeError, OSError, ImportError, TypeError, ctypes.ArgumentError):
+        return None
+
+
+def _windows_registry_desktop_dir() -> Path | None:
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "Desktop")
+        value = re.sub(
+            r"%([^%]+)%",
+            lambda match: os.environ.get(match.group(1), match.group(0)),
+            value,
+        )
+        return Path(os.path.expandvars(value)).expanduser()
+    except (OSError, ImportError, TypeError):
+        return None
+
+
+def get_desktop_dir() -> Path:
+    """Resolve and create the user's real Desktop without using the cwd."""
+    home = Path.home()
+    system = platform.system()
+    candidates: list[Path] = []
+    if system == "Windows":
+        known = _windows_known_desktop_dir()
+        registry = _windows_registry_desktop_dir()
+        if known is not None:
+            candidates.append(known)
+        if registry is not None:
+            candidates.append(registry)
+        profile = Path(os.environ.get("USERPROFILE", str(home)))
+        candidates.extend((profile / "Desktop", profile / "OneDrive" / "Desktop"))
+    elif system == "Linux":
+        config = home / ".config" / "user-dirs.dirs"
+        try:
+            for line in config.read_text(encoding="utf-8").splitlines():
+                match = re.match(r'\s*XDG_DESKTOP_DIR\s*=\s*"([^"]+)"', line)
+                if match:
+                    value = match.group(1).replace("$HOME", str(home))
+                    value = os.path.expandvars(value)
+                    candidate = Path(value).expanduser()
+                    if candidate != home:
+                        candidates.append(candidate)
+                    break
+        except OSError:
+            pass
+        try:
+            result = subprocess.run(
+                ["xdg-user-dir", "DESKTOP"], capture_output=True, text=True,
+                timeout=5, check=False,
+            )
+            value = result.stdout.strip()
+            candidate = Path(value).expanduser() if value else home
+            if candidate != home:
+                candidates.append(candidate)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        candidates.append(home / "Desktop")
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+
+    fallback = home / "Desktop"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def _shortcut_interpreter() -> str:
+    frozen = bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
+    if frozen:
+        return sys.executable
+    interpreter = get_python_executable(BASE_DIR)
+    if not interpreter:
+        raise RuntimeError(
+            "No Python interpreter is available for this feature. "
+            "Set AURA_PYTHON_EXECUTABLE or install Python."
+        )
+    python = Path(interpreter)
+    if platform.system() == "Windows":
+        pythonw = python.with_name("pythonw.exe")
+        if pythonw.is_file():
+            return str(pythonw)
+    return str(python)
 
 
 def _read_full_config() -> dict:
@@ -1363,7 +1547,7 @@ class HudCanvas(QWidget):
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(16)
+        self._tmr.start(33)
 
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
         """Compatibility hook: the central ball has no eyes, so there is
@@ -2714,6 +2898,36 @@ class SetupOverlay(QWidget):
             QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
         """)
         form_layout.addWidget(self._key_input)
+        form_layout.addWidget(_lbl(
+            "Free-tier Gemini prompts may be used by Google to improve products.",
+            7, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft,
+        ))
+        self._auto_model_switching = QCheckBox("Auto model switching")
+        self._auto_model_switching.setChecked(
+            bool(saved_local.get("auto_model_switching", True))
+        )
+        self._auto_model_switching.setStyleSheet(
+            f"QCheckBox {{ color: {C.ACC2}; background: transparent; }}"
+            f"QCheckBox::indicator {{ width: 15px; height: 15px; }}"
+            f"QCheckBox::indicator:unchecked {{ border: 1px solid {C.BORDER_B}; }}"
+            f"QCheckBox::indicator:checked {{ background: {C.PRI}; border: 1px solid {C.PRI}; }}"
+        )
+        form_layout.addWidget(self._auto_model_switching)
+        form_layout.addWidget(_lbl(
+            "DEEP MODEL DAILY SOFT BUDGET", 7, color=C.TEXT_DIM,
+            align=Qt.AlignmentFlag.AlignLeft,
+        ))
+        self._deep_daily_budget = QSpinBox()
+        self._deep_daily_budget.setRange(1, 10000)
+        self._deep_daily_budget.setValue(
+            max(1, min(10000, int(saved_local.get("deep_daily_budget", 50))))
+        )
+        self._deep_daily_budget.setFixedHeight(27)
+        self._deep_daily_budget.setStyleSheet(
+            f"QSpinBox {{ background: {C.PANEL2}; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 6px; }}"
+        )
+        form_layout.addWidget(self._deep_daily_budget)
 
         form_layout.addWidget(_lbl("INITIALISATION MODE", 8, True, color=C.ACC2,
                                    align=Qt.AlignmentFlag.AlignLeft))
@@ -3526,6 +3740,8 @@ class SetupOverlay(QWidget):
             "tts_engine": tts_engine,
             "tts_voice": self._selected_voice(),
             "local_voice_override": self._local_voice_override.isChecked(),
+            "auto_model_switching": self._auto_model_switching.isChecked(),
+            "deep_daily_budget": self._deep_daily_budget.value(),
             "voice_id": self._selected_voice(),
             "voice_by_model": dict(self._voice_by_model),
             "tts_voice_by_engine": dict(self._tts_voice_by_engine),
@@ -3628,9 +3844,10 @@ class CustomizeOverlay(QWidget):
     """Floating overlay — change assistant name, user name, UI colour and voice."""
 
     saved = pyqtSignal(str, str, str, str, bool)   # assistant_name, user_name, ui_color, voice, local_voice
+    wake_settings_changed = pyqtSignal()
     configure_local_ai = pyqtSignal()
     open_permissions = pyqtSignal()
-    _OW, _OH = 400, 660
+    _OW, _OH = 400, 710
 
     def __init__(self, assistant_name="AURA", user_name="",
                  ui_color=DEFAULT_UI_COLOR, voice="", local_voice=False, parent=None):
@@ -3705,6 +3922,128 @@ class CustomizeOverlay(QWidget):
         settings_row.addWidget(local_ai_btn, 1)
         settings_row.addWidget(permissions_btn)
         lay.addLayout(settings_row)
+
+        from memory.config_manager import (
+            get_background_assistant_config,
+            get_wake_word_enabled,
+            get_wake_word_sensitivity,
+        )
+        self._wake_word_enabled = QCheckBox("Enable offline Hey AURA wake word")
+        self._wake_word_enabled.setChecked(get_wake_word_enabled())
+        self._wake_word_enabled.setStyleSheet(
+            f"color: {C.TEXT}; background: transparent;"
+        )
+        lay.addWidget(self._wake_word_enabled)
+
+        sensitivity_row = QHBoxLayout()
+        sensitivity_label = _lbl(
+            "WAKE SENSITIVITY", 8, color=C.TEXT_DIM,
+            align=Qt.AlignmentFlag.AlignLeft,
+        )
+        self._wake_sensitivity_value = _lbl("", 8, color=C.PRI)
+        sensitivity_row.addWidget(sensitivity_label)
+        sensitivity_row.addStretch()
+        sensitivity_row.addWidget(self._wake_sensitivity_value)
+        lay.addLayout(sensitivity_row)
+        self._wake_sensitivity = QSlider(Qt.Orientation.Horizontal)
+        self._wake_sensitivity.setRange(1, 10)
+        self._wake_sensitivity.setValue(
+            round(get_wake_word_sensitivity() * 10)
+        )
+        self._wake_sensitivity.setEnabled(self._wake_word_enabled.isChecked())
+        self._wake_sensitivity.valueChanged.connect(
+            self._update_wake_sensitivity_label
+        )
+        self._wake_word_enabled.toggled.connect(
+            self._wake_sensitivity.setEnabled
+        )
+        lay.addWidget(self._wake_sensitivity)
+        self._update_wake_sensitivity_label(self._wake_sensitivity.value())
+
+        background_settings = get_background_assistant_config()
+        background_title = _lbl(
+            "BACKGROUND ASSISTANT", 8, color=C.TEXT_DIM,
+            align=Qt.AlignmentFlag.AlignLeft,
+        )
+        lay.addSpacing(4)
+        lay.addWidget(background_title)
+
+        auto_hide_row = QHBoxLayout()
+        self._background_auto_hide = QCheckBox("Auto-hide after inactivity")
+        self._background_auto_hide.setChecked(
+            background_settings["auto_hide_enabled"]
+        )
+        self._background_auto_hide.setStyleSheet(
+            f"color: {C.TEXT}; background: transparent;"
+        )
+        self._background_auto_hide_minutes = QSpinBox()
+        self._background_auto_hide_minutes.setRange(1, 120)
+        self._background_auto_hide_minutes.setSuffix(" min")
+        self._background_auto_hide_minutes.setValue(
+            background_settings["auto_hide_minutes"]
+        )
+        self._background_auto_hide_minutes.setEnabled(
+            self._background_auto_hide.isChecked()
+        )
+        self._background_auto_hide.toggled.connect(
+            self._background_auto_hide_minutes.setEnabled
+        )
+        auto_hide_row.addWidget(self._background_auto_hide)
+        auto_hide_row.addStretch()
+        auto_hide_row.addWidget(self._background_auto_hide_minutes)
+        lay.addLayout(auto_hide_row)
+
+        self._background_timing_spins = {}
+        for key, label, minimum, maximum, suffix in (
+            ("end_of_speech_ms", "END-OF-SPEECH SILENCE", 500, 5000, " ms"),
+            ("max_utterance_seconds", "MAX UTTERANCE", 10, 600, " sec"),
+            ("response_timeout_seconds", "RESPONSE TIMEOUT", 10, 600, " sec"),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(_lbl(label, 8, color=C.TEXT_DIM,
+                               align=Qt.AlignmentFlag.AlignLeft))
+            row.addStretch()
+            spin = QSpinBox()
+            spin.setRange(minimum, maximum)
+            spin.setSuffix(suffix)
+            spin.setValue(background_settings[key])
+            row.addWidget(spin)
+            lay.addLayout(row)
+            self._background_timing_spins[key] = spin
+
+        vad_row = QHBoxLayout()
+        vad_row.addWidget(_lbl(
+            "VOICE SENSITIVITY", 8, color=C.TEXT_DIM,
+            align=Qt.AlignmentFlag.AlignLeft,
+        ))
+        vad_row.addStretch()
+        self._background_vad_sensitivity = QSlider(
+            Qt.Orientation.Horizontal
+        )
+        self._background_vad_sensitivity.setRange(1, 10)
+        self._background_vad_sensitivity.setValue(
+            round(background_settings["vad_sensitivity"] * 10)
+        )
+        self._background_vad_value = _lbl("", 8, color=C.PRI)
+        self._background_vad_sensitivity.valueChanged.connect(
+            lambda value: self._background_vad_value.setText(f"{value * 10}%")
+        )
+        self._background_vad_value.setText(
+            f"{self._background_vad_sensitivity.value() * 10}%"
+        )
+        vad_row.addWidget(self._background_vad_sensitivity, 1)
+        vad_row.addWidget(self._background_vad_value)
+        lay.addLayout(vad_row)
+
+        self._background_speak = QCheckBox("Speak responses")
+        self._background_speak.setChecked(background_settings["speak_responses"])
+        self._background_conversation = QCheckBox("Conversation mode")
+        self._background_conversation.setChecked(
+            background_settings["conversation_mode"]
+        )
+        for checkbox in (self._background_speak, self._background_conversation):
+            checkbox.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+            lay.addWidget(checkbox)
 
         # ── Assistant voice — Gemini prebuilt voices ─────────────────────────
         # Names are language-neutral proper nouns, so the row reads the same in
@@ -4005,9 +4344,36 @@ class CustomizeOverlay(QWidget):
     def _save(self):
         name = self._name_input.text().strip() or "AURA"
         user = self._user_input.text().strip()
+        from memory.config_manager import (
+            save_background_assistant_config,
+            save_wake_word_enabled,
+            save_wake_word_sensitivity,
+        )
+        save_wake_word_enabled(self._wake_word_enabled.isChecked())
+        save_wake_word_sensitivity(self._wake_sensitivity.value() / 10.0)
+        save_background_assistant_config({
+            "auto_hide_enabled": self._background_auto_hide.isChecked(),
+            "auto_hide_minutes": self._background_auto_hide_minutes.value(),
+            "end_of_speech_ms": self._background_timing_spins[
+                "end_of_speech_ms"
+            ].value(),
+            "max_utterance_seconds": self._background_timing_spins[
+                "max_utterance_seconds"
+            ].value(),
+            "response_timeout_seconds": self._background_timing_spins[
+                "response_timeout_seconds"
+            ].value(),
+            "vad_sensitivity": self._background_vad_sensitivity.value() / 10.0,
+            "speak_responses": self._background_speak.isChecked(),
+            "conversation_mode": self._background_conversation.isChecked(),
+        })
         self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR,
                          self._sel_voice, self._jarvis_on)
+        self.wake_settings_changed.emit()
         self.hide()
+
+    def _update_wake_sensitivity_label(self, value: int):
+        self._wake_sensitivity_value.setText(f"{value * 10}%")
 
 
 @_motion_overlay
@@ -4737,6 +5103,12 @@ class PluginSettingsOverlay(QWidget):
                 w.setCursor(Qt.CursorShape.PointingHandCursor)
                 self._style_toggle(w)
                 w.toggled.connect(lambda _=False, b=w: self._style_toggle(b))
+            elif ftype == "readonly":
+                w = QLineEdit("" if stored is None else str(stored))
+                w.setFont(QFont("Courier New", 9))
+                w.setFixedHeight(28)
+                w.setReadOnly(True)
+                w.setStyleSheet(self._fs)
             else:  # text / password
                 w = QLineEdit("" if stored is None else str(stored))
                 w.setFont(QFont("Courier New", 10))
@@ -6636,6 +7008,28 @@ class _BrowserPage(_BrPageBase):
     """Web page. A pop-up (window.open with a size — e.g. "Sign in with Google")
     gets its own small window, so the page that opened it can still hear back
     from it. Ordinary new-tab links stay inside the one window."""
+
+    def acceptNavigationRequest(self, url, navigation_type, is_main_frame):  # noqa: N802
+        owner = getattr(self, "aura_owner", None)
+        if owner is not None and getattr(owner, "_cad_viewer_active", False) and is_main_frame:
+            viewer_path = (
+                Path(__file__).resolve().parent
+                / "aura_cad" / "viewer" / "assets" / "viewer.html"
+            )
+            try:
+                is_viewer = (
+                    url.isLocalFile()
+                    and Path(url.toLocalFile()).resolve() == viewer_path
+                )
+            except (OSError, ValueError):
+                is_viewer = False
+            if not is_viewer:
+                owner._cad_viewer_active = False
+                self.settings().setAttribute(
+                    QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,
+                    False,
+                )
+        return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
 
     def createWindow(self, kind):
         owner = getattr(self, "aura_owner", None)
@@ -11238,6 +11632,705 @@ class _EdgeResizer(QObject):
         return False
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Background assistant orb — the compact "Hey AURA" HUD
+#
+#  A holographic core (the HUD's own data sphere wrapped in tick rings, counter
+#  rotating arcs and a scanner sweep) beside a glass response panel with an
+#  equalizer header. Everything is painted from the live palette, so accent
+#  re-theming applies to it like every other panel.
+#
+#  Visibility is driven ONLY by window opacity, while resizing only ever moves
+#  geometry. (They used to share one animation group: every streamed reply
+#  chunk restarted the fade from the *current* opacity, so the orb that was
+#  still fading in was frozen at ~0 and never became visible.)
+# ═══════════════════════════════════════════════════════════════════════════
+from PyQt6.QtGui import QPolygonF as _OrbPolygonF
+
+_ORB_LABELS = {
+    "LISTENING": "LISTENING", "IDLE_ACTIVE": "LISTENING",
+    "USER_SPEAKING": "HEARING YOU", "PROCESSING": "THINKING",
+    "THINKING": "THINKING", "STREAMING": "RESPONDING",
+    "SPEAKING": "SPEAKING", "SLEEPING": "MUTED", "MUTED": "MUTED",
+}
+_ORB_BUSY = frozenset({"USER_SPEAKING", "PROCESSING", "THINKING",
+                       "STREAMING", "SPEAKING"})
+_ORB_THINKING = frozenset({"PROCESSING", "THINKING"})
+_ORB_MUTED = frozenset({"SLEEPING", "MUTED"})
+_ORB_TICKS = tuple(
+    (math.cos(math.radians(i * 5)), math.sin(math.radians(i * 5)))
+    for i in range(72)
+)
+
+
+class _OrbOnlyCanvas(HudCanvas):
+    """Transparent holographic core built around HudCanvas._draw_orb."""
+
+    def __init__(self, face_path: str, assistant_name: str):
+        super().__init__(face_path, assistant_name)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._tmr.setInterval(40)
+        self._tmr.stop()
+        self._sweep = 0.0
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._tmr.start()
+
+    def hideEvent(self, event):
+        self._tmr.stop()
+        super().hideEvent(event)
+
+    def _step(self):
+        super()._step()
+        busy = str(getattr(self, "state", "")).upper() in _ORB_BUSY
+        self._sweep = (self._sweep + (7.0 if busy else 2.4)) % 360.0
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = float(self.width()), float(self.height())
+        S = min(W, H)
+        if S < 20:
+            p.end()
+            return
+        cx, cy = W / 2.0, H / 2.0
+        muted = bool(self.muted)
+        state = str(getattr(self, "state", "") or "").upper()
+        accent = C.MUTED_C if muted else C.PRI
+        halo = max(30.0, min(255.0, self._halo + float(self._amp_disp) * 90.0))
+
+        # backdrop disc
+        disc_r = S * 0.49
+        disc = QRadialGradient(QPointF(cx, cy), disc_r)
+        disc.setColorAt(0.0, QColor(2, 5, 8, 238))
+        disc.setColorAt(0.78, QColor(4, 8, 12, 228))
+        disc.setColorAt(1.0, qcol(accent, 70))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(disc))
+        p.drawEllipse(QPointF(cx, cy), disc_r, disc_r)
+
+        # slowly turning tick ring
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(self._rings[0] * 0.25)
+        r_out = S * 0.472
+        for i, (c, s) in enumerate(_ORB_TICKS):
+            major = i % 6 == 0
+            ln = 5.5 if major else 2.8
+            alpha = min(255, int(halo * (0.95 if major else 0.5)))
+            p.setPen(QPen(qcol(accent, alpha), 1.3 if major else 0.9))
+            p.drawLine(QPointF(c * (r_out - ln), s * (r_out - ln)),
+                       QPointF(c * r_out, s * r_out))
+        p.restore()
+
+        # counter-rotating arc rings
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        def arcs(radius, base, span, gap, width, alpha, color):
+            rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
+            p.setPen(QPen(qcol(color, max(0, min(255, int(alpha)))), width))
+            a = base
+            while a < base + 360:
+                p.drawArc(rect, int(a * 16), int(span * 16))
+                a += span + gap
+
+        arcs(S * 0.425, self._rings[0], 74, 46, 2.4, halo, accent)
+        arcs(S * 0.385, self._rings[1], 38, 28, 1.5, halo * 0.7, accent)
+        arcs(S * 0.345, self._rings[2], 20, 24, 1.0, halo * 0.5, C.ACC2)
+
+        # scanner sweep: state-coloured, faster while the assistant is busy
+        if state == "USER_SPEAKING":
+            sweep_col = C.GREEN
+        elif state in _ORB_THINKING:
+            sweep_col = C.ACC2
+        else:
+            sweep_col = accent
+        r_sw = S * 0.455
+        rect = QRectF(cx - r_sw, cy - r_sw, r_sw * 2, r_sw * 2)
+        trail = QPen(qcol(sweep_col, 90), 2.0)
+        trail.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(trail)
+        p.drawArc(rect, int((self._sweep - 32) * 16), int(30 * 16))
+        head = QPen(qcol(sweep_col, 235), 2.6)
+        head.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(head)
+        p.drawArc(rect, int(self._sweep * 16), int(34 * 16))
+
+        # sonar pulses
+        lim = S * 0.36
+        for pr in self._pulses:
+            if pr < lim:
+                p.setPen(QPen(qcol(accent, int(150 * (1.0 - pr / lim))), 1.2))
+                p.drawEllipse(QPointF(cx, cy), pr, pr)
+
+        # the data sphere itself
+        self._draw_orb(p, cx, cy, S * 0.90)
+        p.end()
+
+
+class _OrbPanel(QWidget):
+    """Glass HUD frame: chamfered corners, accent edge lights, busy scanline."""
+
+    CUT = 14
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._busy = False
+        self._muted = False
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(45)
+        self._timer.timeout.connect(self._tick)
+
+    def set_muted(self, muted: bool) -> None:
+        muted = bool(muted)
+        if muted != self._muted:
+            self._muted = muted
+            self.update()
+
+    def set_busy(self, busy: bool) -> None:
+        busy = bool(busy)
+        if busy == self._busy:
+            return
+        self._busy = busy
+        if busy and self.isVisible():
+            self._timer.start()
+        elif not busy:
+            self._timer.stop()
+            self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._busy:
+            self._timer.start()
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def _tick(self):
+        self._phase = (self._phase + 0.02) % 1.0
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.75, 0.75, -0.75, -0.75)
+        c = float(self.CUT)
+        accent = C.MUTED_C if self._muted else C.PRI
+
+        path = QPainterPath()
+        path.moveTo(r.left() + c, r.top())
+        path.lineTo(r.right(), r.top())
+        path.lineTo(r.right(), r.bottom() - c)
+        path.lineTo(r.right() - c, r.bottom())
+        path.lineTo(r.left(), r.bottom())
+        path.lineTo(r.left(), r.top() + c)
+        path.closeSubpath()
+
+        body = QLinearGradient(r.topLeft(), r.bottomLeft())
+        body.setColorAt(0.0, QColor(9, 13, 18, 242))
+        body.setColorAt(1.0, QColor(3, 5, 8, 246))
+        p.fillPath(path, QBrush(body))
+
+        glow = QLinearGradient(r.topLeft(), QPointF(r.left(), r.top() + 110))
+        glow.setColorAt(0.0, qcol(accent, 44))
+        glow.setColorAt(1.0, qcol(accent, 0))
+        p.fillPath(path, QBrush(glow))
+
+        if self._busy:
+            p.save()
+            p.setClipPath(path)
+            y = r.top() + self._phase * (r.height() + 40.0) - 20.0
+            band = QLinearGradient(0.0, y - 30.0, 0.0, y)
+            band.setColorAt(0.0, qcol(accent, 0))
+            band.setColorAt(1.0, qcol(accent, 46))
+            p.fillRect(QRectF(r.left(), y - 30.0, r.width(), 30.0), QBrush(band))
+            p.setPen(QPen(qcol(accent, 90), 1.0))
+            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+            p.restore()
+
+        edge = QLinearGradient(r.topLeft(), r.topRight())
+        edge.setColorAt(0.0, qcol(accent, 235))
+        edge.setColorAt(0.55, qcol(C.BORDER_A, 190))
+        edge.setColorAt(1.0, qcol(accent, 120))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QBrush(edge), 1.3))
+        p.drawPath(path)
+
+        lit = QPen(qcol(accent), 2.2)
+        lit.setCapStyle(Qt.PenCapStyle.FlatCap)
+        p.setPen(lit)
+        p.drawLine(QPointF(r.left(), r.top() + c), QPointF(r.left() + c, r.top()))
+        p.drawLine(QPointF(r.right(), r.bottom() - c), QPointF(r.right() - c, r.bottom()))
+        p.drawLine(QPointF(r.left() + c + 8, r.top()), QPointF(r.left() + c + 64, r.top()))
+        p.drawLine(QPointF(r.right() - c - 64, r.bottom()), QPointF(r.right() - c - 8, r.bottom()))
+
+        p.setPen(QPen(qcol(accent, 150), 1.0))
+        t = 7.0
+        p.drawLine(QPointF(r.right() - t, r.top()), QPointF(r.right(), r.top()))
+        p.drawLine(QPointF(r.right(), r.top()), QPointF(r.right(), r.top() + t))
+        p.drawLine(QPointF(r.left(), r.bottom() - t), QPointF(r.left(), r.bottom()))
+        p.drawLine(QPointF(r.left(), r.bottom()), QPointF(r.left() + t, r.bottom()))
+        p.end()
+
+
+class _OrbHeader(QWidget):
+    """Status line: diamond, state label and a live equalizer, buttons on the right."""
+
+    def __init__(self, level_fn, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(34)
+        self._level_fn = level_fn
+        self._name = "AURA"
+        self._state = "LISTENING"
+        self._label = "LISTENING"
+        self._t = 0.0
+        self._lvl = 0.0
+        self._reserve = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._tick)
+        self._lay = QHBoxLayout(self)
+        self._lay.setContentsMargins(0, 5, 0, 5)
+        self._lay.setSpacing(6)
+        self._lay.addStretch(1)
+
+    def add_button(self, button) -> None:
+        self._lay.addWidget(button)
+        self._reserve += button.width() + 6
+
+    def set_name(self, name: str) -> None:
+        self._name = str(name or "AURA").upper()
+        self.update()
+
+    def set_state(self, state: str, label: str) -> None:
+        self._state = state
+        self._label = label
+        self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._timer.start()
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def _tick(self):
+        self._t += 0.12
+        try:
+            level = max(0.0, min(1.0, float(self._level_fn())))
+        except Exception:
+            level = 0.0
+        self._lvl += (level - self._lvl) * 0.5
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = float(self.width()), float(self.height())
+        cy = H / 2.0
+        state = self._state
+        col = C.MUTED_C if state in _ORB_MUTED else C.PRI
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(qcol(col)))
+        p.drawPolygon(_OrbPolygonF([QPointF(4, cy), QPointF(10, cy - 5.5),
+                                    QPointF(16, cy), QPointF(10, cy + 5.5)]))
+
+        font = QFont("Courier New", 9, QFont.Weight.Bold)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
+        fm = QFontMetricsF(font)
+        limit = W - self._reserve - 8.0
+
+        def width_of(text):
+            return fm.horizontalAdvance(text) + len(text) * 1.5
+
+        text = f"{self._name}  //  {self._label}"
+        if 24.0 + width_of(text) > limit:
+            text = self._label
+        p.setFont(font)
+        p.setPen(qcol(col))
+        tw = width_of(text)
+        p.drawText(QRectF(24, 0, tw + 4, H),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+
+        x0 = 24.0 + tw + 14.0
+        bw, gap, maxh = 3.0, 3.0, H - 14.0
+        count = int(max(0.0, min(16.0, (limit - x0) // (bw + gap))))
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(count):
+            if state in _ORB_THINKING:
+                v = 0.25 + 0.55 * abs(math.sin(self._t * 1.4 - i * 0.45))
+            elif state in ("SPEAKING", "STREAMING", "USER_SPEAKING"):
+                v = (0.18 + min(1.0, self._lvl * 1.6) * 0.7
+                     * (0.5 + 0.5 * abs(math.sin(self._t * 2.3 + i * 1.7)))
+                     + 0.08 * abs(math.sin(self._t + i)))
+            else:
+                v = 0.10 + 0.07 * math.sin(self._t * 0.8 + i * 0.6)
+            v = max(0.0, min(1.0, v))
+            h = max(2.0, v * maxh)
+            p.setBrush(QBrush(qcol(col, 110 + int(120 * v))))
+            p.drawRoundedRect(QRectF(x0 + i * (bw + gap), cy - h / 2.0, bw, h), 1.2, 1.2)
+
+        rule = QLinearGradient(0.0, 0.0, W, 0.0)
+        rule.setColorAt(0.0, qcol(col, 150))
+        rule.setColorAt(1.0, qcol(col, 0))
+        p.fillRect(QRectF(0, H - 1, W, 1), QBrush(rule))
+        p.end()
+
+
+class FloatingOrbOverlay(QWidget):
+    """Always-on-top "Hey AURA" session: holographic core + live response panel."""
+
+    dismiss_requested = pyqtSignal(str)
+    stop_requested = pyqtSignal()
+    text_submitted = pyqtSignal(str)
+
+    _MARGIN = 12
+    _CORE = 132
+
+    def __init__(self, face_path: str, assistant_name: str):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        always = getattr(Qt.WidgetAttribute, "WA_MacAlwaysShowToolWindow", None)
+        if always is not None:
+            self.setAttribute(always, True)
+        self.setWindowTitle(f"{assistant_name} assistant")
+        self.setMinimumSize(460, 176)
+        self.resize(680, 200)
+
+        self._fade_anim = None
+        self._geo_anim = None
+        self._hiding = False
+        self._expanded = False
+        self._user_moved = False
+        self._screen = None
+        self._last_markdown = ""
+
+        m = self._MARGIN
+        root = QHBoxLayout(self)
+        root.setContentsMargins(m, m, m, m)
+        root.setSpacing(6)
+
+        self.canvas = _OrbOnlyCanvas(face_path, assistant_name)
+        self.canvas.setFixedSize(self._CORE, self._CORE)
+        root.addWidget(self.canvas, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.panel = _OrbPanel()
+        self.panel.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                 QSizePolicy.Policy.Expanding)
+        root.addWidget(self.panel, 1)
+        pl = QVBoxLayout(self.panel)
+        pl.setContentsMargins(18, 4, 14, 12)
+        pl.setSpacing(6)
+
+        self.header = _OrbHeader(lambda: self.canvas._amp_disp, self.panel)
+        self.header.set_name(assistant_name)
+
+        def make_button(text, width, callback):
+            button = HudButton(text, "text", self.header)
+            button.setFixedSize(width, 24)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.clicked.connect(lambda _checked=False: callback())
+            self.header.add_button(button)
+            return button
+
+        make_button("COPY", 46, self._copy_reply)
+        make_button("STOP", 46, self.stop_requested.emit)
+        self.expand_button = make_button("MAX", 40, self._toggle_expand)
+        make_button("X", 28, lambda: self.dismiss_requested.emit("close button"))
+        pl.addWidget(self.header)
+
+        self.reply = QTextBrowser()
+        self.reply.setFrameShape(QFrame.Shape.NoFrame)
+        self.reply.setOpenLinks(False)
+        self.reply.setFont(QFont("Segoe UI", 10))
+        self.reply.setPlaceholderText("Listening…")
+        self.reply.setMinimumHeight(40)
+        self.reply.document().setDefaultStyleSheet(
+            f"a {{ color: {C.PRI}; }} code {{ color: {C.ACC2}; }}"
+        )
+        self.reply.anchorClicked.connect(self._open_link)
+        self.reply.setStyleSheet(f"""
+            QTextBrowser {{
+                color: {C.TEXT}; background: transparent; border: none;
+                selection-background-color: {C.PRI_DIM}; selection-color: {C.WHITE};
+            }}
+            QScrollBar:vertical {{ width: 6px; background: transparent; margin: 2px; }}
+            QScrollBar::handle:vertical {{
+                background: {C.PRI_DIM}; border-radius: 3px; min-height: 24px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background: {C.PRI}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: transparent;
+            }}
+        """)
+        pl.addWidget(self.reply, 1)
+
+        self.transcript = QLabel()
+        self.transcript.setWordWrap(True)
+        self.transcript.setFont(QFont("Segoe UI", 9))
+        self.transcript.setStyleSheet(
+            f"QLabel {{ color: {C.ACC2}; background: transparent; }}"
+        )
+        self.transcript.hide()
+        pl.addWidget(self.transcript)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.text_input = QLineEdit()
+        self.text_input.setPlaceholderText("Ask a follow-up…")
+        self.text_input.setFont(QFont("Courier New", 9))
+        self.text_input.setFixedHeight(28)
+        self.text_input.setStyleSheet(f"""
+            QLineEdit {{
+                color: {C.WHITE}; background: rgba(0, 0, 0, 140);
+                border: 1px solid {C.BORDER_A}; border-radius: 3px; padding: 3px 8px;
+                selection-background-color: {C.PRI_DIM};
+            }}
+            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
+        """)
+        self.text_input.returnPressed.connect(self._submit_text)
+        row.addWidget(self.text_input, 1)
+        send = HudButton("SEND", "text", self.panel)
+        send.setFixedSize(54, 28)
+        send.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        send.clicked.connect(lambda _checked=False: self._submit_text())
+        row.addWidget(send)
+        pl.addLayout(row)
+
+        self._relayout_timer = QTimer(self)
+        self._relayout_timer.setSingleShot(True)
+        self._relayout_timer.setInterval(30)
+        self._relayout_timer.timeout.connect(self._adjust_geometry)
+
+    # ── public state ──────────────────────────────────────────────────────
+    def set_name(self, name: str) -> None:
+        self.header.set_name(name)
+        self.setWindowTitle(f"{name} assistant")
+
+    def set_state(self, state: str) -> None:
+        state = str(state or "").upper()
+        self.setProperty("assistantState", state)
+        muted = state in _ORB_MUTED
+        self.canvas.speaking = state in _ORB_BUSY
+        self.canvas.muted = muted
+        self.canvas.state = state
+        self.canvas.update()
+        self.panel.set_muted(muted)
+        self.panel.set_busy(state in _ORB_BUSY)
+        self.header.set_state(state, _ORB_LABELS.get(state, state.replace("_", " ")))
+        self.update()
+
+    def set_reply(self, text: str) -> None:
+        value = str(text or "")
+        bar = self.reply.verticalScrollBar()
+        was_at_bottom = bar.value() >= bar.maximum() - 3
+        old_scroll = bar.value()
+        self._last_markdown = value
+        self.reply.setMarkdown(value)
+        bar.setValue(bar.maximum() if was_at_bottom else old_scroll)
+        self._relayout_timer.start()
+
+    def set_transcript(self, text: str) -> None:
+        value = str(text or "").strip()
+        self.transcript.setText(f"▸ {value}" if value else "")
+        self.transcript.setVisible(bool(value))
+        self._relayout_timer.start()
+
+    # ── show / hide: opacity only ─────────────────────────────────────────
+    def _fade(self, target: float, ms: int, on_done=None) -> None:
+        if self._fade_anim is not None:
+            self._fade_anim.stop()
+            self._fade_anim = None
+        if not _MOTION_ON or ms <= 0:
+            self.setWindowOpacity(float(target))
+            if on_done is not None:
+                on_done()
+            return
+        anim = QVariantAnimation(self)
+        anim.setStartValue(float(self.windowOpacity()))
+        anim.setEndValue(float(target))
+        anim.setDuration(int(ms))
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.valueChanged.connect(lambda v: self.setWindowOpacity(float(v)))
+        if on_done is not None:
+            anim.finished.connect(on_done)
+        self._fade_anim = anim
+        anim.start()
+
+    def show_animated(self) -> None:
+        self._hiding = False
+        self._screen = (
+            QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        )
+        if self.isVisible():
+            self.raise_()
+            self._fade(1.0, 140)
+            return
+        self._adjust_geometry(animate=False)
+        target = self.geometry()
+        if _MOTION_ON:
+            self.setWindowOpacity(0.0)
+            self.setGeometry(target.translated(0, 18))
+        else:
+            self.setWindowOpacity(1.0)
+        self.show()
+        self.raise_()
+        if _MOTION_ON:
+            self._move_to(target, True)
+            self._fade(1.0, 240)
+            # Safety net: never leave a visible-but-transparent window behind.
+            QTimer.singleShot(900, self._ensure_opaque)
+
+    def _ensure_opaque(self) -> None:
+        if self.isVisible() and not self._hiding and self.windowOpacity() < 0.99:
+            self._fade(1.0, 0)
+
+    def hide_animated(self) -> None:
+        if not self.isVisible():
+            return
+        self._hiding = True
+        self._fade(0.0, 130, self._finish_hide)
+
+    def _finish_hide(self) -> None:
+        if not self._hiding:
+            return
+        self._hiding = False
+        self.hide()
+        self.setWindowOpacity(1.0)
+
+    # ── geometry: size and position only ──────────────────────────────────
+    def _area(self):
+        screen = (
+            self._screen
+            or QApplication.screenAt(QCursor.pos())
+            or QApplication.primaryScreen()
+        )
+        return None if screen is None else screen.availableGeometry()
+
+    def _target_rect(self, height: int, width: int) -> QRect:
+        area = self._area()
+        if area is None:
+            return self.geometry()
+        width = min(width, area.width() - 16)
+        height = min(height, area.height() - 16)
+        if self._user_moved:
+            x = max(area.left() + 4, min(self.x(), area.right() - width - 3))
+            y = max(area.top() + 4, min(self.y(), area.bottom() - height - 3))
+        else:
+            x = area.x() + (area.width() - width) // 2
+            y = area.y() + area.height() - height - 20
+        return QRect(x, y, width, height)
+
+    def _move_to(self, target: QRect, animate: bool = True) -> None:
+        if self._geo_anim is not None:
+            self._geo_anim.stop()
+            self._geo_anim = None
+        if not animate or not self.isVisible() or not _MOTION_ON:
+            self.setGeometry(target)
+            return
+        if self.geometry() == target:
+            return
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(170)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(lambda: setattr(self, "_geo_anim", None))
+        self._geo_anim = anim
+        anim.start()
+
+    def _adjust_geometry(self, animate: bool = True) -> None:
+        if self._expanded:
+            return
+        area = self._area()
+        if area is None:
+            return
+        width = min(680, max(520, area.width() - 24))
+        self.reply.document().setTextWidth(max(120, self.reply.viewport().width()))
+        doc_height = int(self.reply.document().size().height())
+        chrome = 34 + 34 + 6 * 3 + 16 + self._MARGIN * 2
+        if self.transcript.isVisible():
+            chrome += self.transcript.sizeHint().height() + 6
+        max_height = int(area.height() * 0.70)
+        height = min(max_height, max(176, doc_height + chrome))
+        self._move_to(self._target_rect(height, width), animate)
+
+    # ── interaction ───────────────────────────────────────────────────────
+    def _copy_reply(self) -> None:
+        QApplication.clipboard().setText(self.reply.toPlainText())
+
+    def _open_link(self, url: QUrl) -> None:
+        if url.scheme().casefold() in ("http", "https"):
+            QDesktopServices.openUrl(url)
+
+    def _toggle_expand(self) -> None:
+        self._expanded = not self._expanded
+        self.expand_button.setText("MIN" if self._expanded else "MAX")
+        if self._expanded:
+            area = self._area()
+            if area is None:
+                return
+            width = int(area.width() * 0.85)
+            height = min(int(area.height() * 0.85), area.height() - 16)
+            self._move_to(self._target_rect(height, width), True)
+        else:
+            self._adjust_geometry()
+
+    def _submit_text(self) -> None:
+        text = self.text_input.text().strip()
+        if not text:
+            return
+        self.text_input.clear()
+        self.set_transcript("")
+        self.text_submitted.emit(text)
+
+    def mousePressEvent(self, event):
+        # Any click on the orb or the panel chrome drags the whole assistant.
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle = self.windowHandle()
+            if handle is not None:
+                try:
+                    if handle.startSystemMove():
+                        self._user_moved = True
+                        event.accept()
+                        return
+                except Exception:
+                    pass
+        super().mousePressEvent(event)
+
+    def paintEvent(self, _event):
+        # Soft accent glow around the core and the panel (drawn under both).
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        accent = C.MUTED_C if self.canvas.muted else C.PRI
+        pr = QRectF(self.panel.geometry())
+        cr = QRectF(self.canvas.geometry())
+        center = cr.center()
+        radius = min(cr.width(), cr.height()) * 0.49
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i in range(1, 9):
+            alpha = int(34 * (1.0 - i / 9.0) ** 2)
+            p.setPen(QPen(qcol(accent, alpha), 1.6))
+            p.drawRoundedRect(pr.adjusted(-i, -i, i, i), 4 + i, 4 + i)
+            p.drawEllipse(center, radius + i, radius + i)
+        p.end()
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -11269,10 +12362,25 @@ class MainWindow(QMainWindow):
     _system_panel_sig = pyqtSignal(str)
     _system_state_sig = pyqtSignal(str, object)
     _browser_cmd_sig = pyqtSignal(str, str, str, str)   # (action, url, fallback, label)
+    _cad_viewer_command_sig = pyqtSignal(str)
+    _cad_progress_sig = pyqtSignal(str, int, str, bool)
+    _cad_cancel_sig = pyqtSignal()
+    _cad_question_sig = pyqtSignal(str, str, object)
+    _cad_question_hide_sig = pyqtSignal()
+    _show_window_sig = pyqtSignal()
+    _background_hidden_sig = pyqtSignal()
+    _background_reply_sig = pyqtSignal(str)
+    _background_transcript_sig = pyqtSignal(str)
+    _background_text_sig = pyqtSignal(str)
+    _background_stop_sig = pyqtSignal()
+    _background_dismiss_sig = pyqtSignal(str)
+    _background_wake_sig = pyqtSignal()
+    _background_settings_sig = pyqtSignal()
 
-    def __init__(self, face_path: str):
+    def __init__(self, face_path: str, background_mode: bool = False):
         super().__init__()
         self._face_path = face_path
+        self._background_mode = bool(background_mode)
         self._news_video_panel = None
         self._news_shutting_down = False
         self._fx_graph_panel = None
@@ -11297,6 +12405,7 @@ class MainWindow(QMainWindow):
         self._hud_mode = "neural" if _cfg.get("hud_mode") == "neural" else "standard"
         self._neural_drive = str(_cfg.get("neural_drive") or (_neural_drives()[0] if _neural_drives() else ""))
         _display = self._assistant_name.upper()
+        self._background_orb = FloatingOrbOverlay(face_path, _display)
 
         # Kayıtlı UI rengini panel/stylesheet'ler kurulmadan ÖNCE uygula
         _ui_color = (_cfg.get("ui_color") or "").strip()
@@ -11318,12 +12427,14 @@ class MainWindow(QMainWindow):
         self.setGeometry(screen)
 
         self.on_text_command   = None
+        self.on_voice_text    = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop AURA mid-speech
         self.on_notification_read = None
         self.on_notification_stop = None
         self.on_notification_skip = None
         self.on_system_control_action = None
+        self.on_cad_cancel = None
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self.on_brain_change   = None   # callable: () -> None — apply brain/provider settings
@@ -11446,6 +12557,14 @@ class MainWindow(QMainWindow):
         self._center_split.setStretchFactor(1, 1)
         self._center_split.setCollapsible(0, False)
         body.addWidget(self._center_split, stretch=5)
+        self._cad_progress_panel = self._build_cad_progress_panel()
+        self._cad_question_panel = self._build_cad_question_panel()
+        self._cad_progress_job = ""
+        self._cad_progress_stage = ""
+        self._cad_progress_timer = QTimer(self)
+        self._cad_progress_timer.setSingleShot(True)
+        self._cad_progress_timer.setInterval(18000)
+        self._cad_progress_timer.timeout.connect(self._cad_progress_heartbeat)
 
         self._right_panel = self._build_right_panel()
         body.addWidget(self._right_panel, stretch=0)
@@ -11476,7 +12595,26 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._log_sig.connect(self._browser_log_tap)       # spoken "… in you" commands
+        self._show_window_sig.connect(self._bring_to_front)
+        self._background_reply_sig.connect(self._background_orb.set_reply)
+        self._background_transcript_sig.connect(
+            self._background_orb.set_transcript
+        )
+        self._background_orb.text_submitted.connect(
+            self._background_text_sig.emit
+        )
+        self._background_orb.stop_requested.connect(
+            self._background_stop_sig.emit
+        )
+        self._background_orb.dismiss_requested.connect(
+            self._background_dismiss_sig.emit
+        )
         self._browser_cmd_sig.connect(self._on_browser_cmd)
+        self._cad_viewer_command_sig.connect(self._run_cad_viewer_command)
+        self._cad_progress_sig.connect(self._show_cad_progress)
+        self._cad_cancel_sig.connect(self._cancel_cad_progress_job)
+        self._cad_question_sig.connect(self._show_cad_question)
+        self._cad_question_hide_sig.connect(self._hide_cad_question)
         _install_browser_guard()
         _set_browser_swallow_cb(
             lambda _u: self._log_sig.emit("SYS: Kept the page inside the in-app browser."))
@@ -11520,8 +12658,9 @@ class MainWindow(QMainWindow):
         if EarthWidget is not None:
             self._earth_box = EarthWidget(self.centralWidget())
             self._earth_box.on_close = self._earth_close
-            self._earth_box.show()
-            self._position_earth_box()
+            if not self._background_mode:
+                self._earth_box.show()
+                self._position_earth_box()
             # React the moment it maximises / restores / closes (resize + show/hide);
             # the slow timer is only a safety net and costs a couple of attribute reads.
             self._earth_box.installEventFilter(self)
@@ -11561,7 +12700,8 @@ class MainWindow(QMainWindow):
             print(f"[FaceUnlock] Init error: {e}")
             self._face_mode = "off"
             self._face_gate.set()
-        self._room_start()
+        if not self._background_mode:
+            self._room_start()
 
         # Clipboard panel (child of central widget, bottom-center)
         self._clipboard_panel = ClipboardPanel(self.centralWidget())
@@ -11572,7 +12712,8 @@ class MainWindow(QMainWindow):
         self._weather_widget = WeatherWidget(self.centralWidget())
         self._weather_widget._TOP = (self._title_bar.height()
                                      + self._header_w.height() + 12)
-        self._weather_widget.open_widget()
+        if not self._background_mode:
+            self._weather_widget.open_widget()
         self._notification_center = NotificationCenter()
         self._notification_toasts = NotificationToastManager(
             self.centralWidget(),
@@ -11598,21 +12739,36 @@ class MainWindow(QMainWindow):
         self._system_panel_sig.connect(self._run_system_panel_command)
         self._system_state_sig.connect(self._on_system_state_changed)
         self._notification_center.subscribe(self._notification_sig.emit)
+        from model_router import router as model_router
+        self._model_router = model_router
+        model_router.signals.model_switched.connect(
+            self._publish_model_router_notice,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        model_router.signals.invalid_api_key.connect(
+            self._on_model_router_invalid_key,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        if not self._background_mode and _read_full_config().get("gemini_api_key"):
+            model_router.start_refresh()
         self._notification_center.listener.on_unavailable(
             self._notification_unavailable_sig.emit
         )
         self._notification_toasts.on_dismiss = lambda _notification_id: None
         self._weather_widget.on_move = self._notification_toasts.reposition
-        if get_notifications_config()["notifications_enabled"]:
+        if (
+            not self._background_mode
+            and get_notifications_config()["notifications_enabled"]
+        ):
             self._notification_center.start()
-        sc_weather = QShortcut(QKeySequence("F9"), self)
-        sc_weather.activated.connect(self._toggle_weather_widget)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
         if not self._ready:
             self._show_setup()
 
+        sc_weather = QShortcut(QKeySequence("F9"), self)
+        sc_weather.activated.connect(self._toggle_weather_widget)
         sc_mute = QShortcut(QKeySequence("F4"), self)
         sc_mute.activated.connect(self._toggle_mute)
         sc_full = QShortcut(QKeySequence("F11"), self)
@@ -11623,12 +12779,28 @@ class MainWindow(QMainWindow):
         sc_neural.activated.connect(self._toggle_hud_mode)
 
         self._set_hud_mode(self._hud_mode, persist=False)
-
-        # Floating always-on-top orb: appears only while this window is minimised.
         self._mini_orb = MiniOrbWidget(self)
-
-        # Resize from any edge / corner (the window is frameless).
         self._edge_resizer = _EdgeResizer(self)
+        QTimer.singleShot(0, self._validate_existing_desktop_shortcut)
+
+    def _publish_model_router_notice(self, message: str) -> None:
+        """Publish neutral model notices through the existing notification center."""
+        from core.notifications.bus import notification_bus
+
+        notification_bus.publish(Notification(
+            source="app",
+            app_name="A.U.R.A.",
+            title="Assistant update",
+            body=str(message),
+            priority=15,
+            category="model_router",
+        ))
+
+    def _on_model_router_invalid_key(self) -> None:
+        if not self._ready:
+            return
+        self._ready = False
+        self._reconfig_sig.emit()
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -12305,7 +13477,8 @@ class MainWindow(QMainWindow):
     def _on_notification(self, notification: Notification) -> None:
         if not self.isVisible() or self.isMinimized() or self._face_mode in _FACE_COVER:
             return
-        self._notification_toasts.enqueue(notification)
+        if notification.category != "model_router":
+            self._notification_toasts.enqueue(notification)
         if self._notification_panel.isVisible():
             self._notification_panel.refresh()
 
@@ -12428,9 +13601,36 @@ class MainWindow(QMainWindow):
                         news_video.resume_after_minimize()
 
     def closeEvent(self, e):
-        if _Motion.main_out(self, e):       # first pass: fade everything out, then re-enter
+        app = QApplication.instance()
+        if (
+            app is not None
+            and app.property("_aura_tray_resident")
+            and not app.property("_aura_quitting")
+        ):
+            e.ignore()
+            self._close_news_video()
+            self._close_fx_graph(force=True)
+            self.hud._tmr.stop()
+            self._background_hidden_sig.emit()
+            self.hide()
+            return
+        if (
+            app is not None
+            and not app.property("_aura_tray_resident")
+            and not app.property("_aura_quitting")
+        ):
+            quit_callback = getattr(app, "_aura_quit_callback", None)
+            if callable(quit_callback):
+                e.ignore()
+                quit_callback()
+                return
+        if (
+            (app is None or not app.property("_aura_quitting"))
+            and _Motion.main_out(self, e)
+        ):                                  # first pass: fade everything out, then re-enter
             return
         _Motion.quitting = True             # really closing: no more deferred fades
+        self._background_orb.hide()
         try:
             self._edge_resizer.detach()
         except Exception:
@@ -12522,6 +13722,17 @@ class MainWindow(QMainWindow):
         win = self._ensure_browser(backend)
         if win is None:
             return
+        if backend == "qt" and label == "CAD preview":
+            try:
+                win.view.page().settings().setAttribute(
+                    QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,
+                    True,
+                )
+                win._cad_viewer_active = True
+            except Exception:
+                _LOGGER.exception("Could not enable local model loading for the CAD viewer")
+                self._log.append_log("ERR: The CAD preview could not read its local model.")
+                return
         other = self._browser_win if backend == "edge" else self._edge_win
         if other is not None and other.isVisible():     # one window at a time: take its place
             win._placed = True
@@ -12585,6 +13796,10 @@ class MainWindow(QMainWindow):
                 joined = f"{self._br_buf} {spoken}"      # transcript in pieces
             self._br_buf, self._br_buf_t = joined, now
             for cand in (spoken, joined):
+                voice_callback = getattr(self, "on_voice_text", None)
+                if callable(voice_callback) and voice_callback(cand):
+                    self._br_buf = ""
+                    return
                 if self._handle_neural_map_command(cand):
                     self._br_buf = ""
                     return
@@ -12615,6 +13830,31 @@ class MainWindow(QMainWindow):
             self._log.append_log("SYS: Browser closed." if shut else "SYS: The browser is not open.")
             return
         self._open_in("edge" if self._wants_edge(url) else "qt", url, fallback, label)
+
+    def _run_cad_viewer_command(self, command: str) -> None:
+        """Dispatch a fixed CAD control set to the currently open browser page."""
+        allowed = {"rotate", "zoom_in", "zoom_out", "reset", "wireframe",
+                   "explode", "grid", "screenshot"}
+        if command not in allowed:
+            _LOGGER.warning("Rejected unknown CAD viewer command")
+            return
+        script = (
+            "window.dispatchEvent(new CustomEvent('aura-cad-command',{detail:"
+            + json.dumps(command)
+            + "}));"
+        )
+        viewer_path = (
+            Path(__file__).resolve().parent
+            / "aura_cad" / "viewer" / "assets" / "viewer.html"
+        )
+        for window in (self._browser_win,):
+            if window is None:
+                continue
+            current = window.view.url()
+            if not current.isLocalFile() or Path(current.toLocalFile()).resolve() != viewer_path:
+                continue
+            page = window.view.page()
+            page.runJavaScript(script)
 
     def _on_browser_audible(self, audible: bool) -> None:
         """Close the microphone while a page is making sound.
@@ -12987,7 +14227,7 @@ class MainWindow(QMainWindow):
             sh = Dispatch("WScript.Shell")
             sc = sh.CreateShortCut(lnk)
             sc.TargetPath       = target
-            sc.Arguments        = f'"{args}"'
+            sc.Arguments        = args
             sc.WorkingDirectory = work_dir
             sc.Description      = "J.A.R.V.I.S AI Assistant"
             sc.IconLocation     = icon_loc
@@ -12998,26 +14238,30 @@ class MainWindow(QMainWindow):
 
         # ── Option 2: wscript.exe + VBScript (always available on Windows,
         #    GUI-mode executable — never opens a console window) ────────────
+        def _vbs_quote(value: str) -> str:
+            return '"' + value.replace('"', '""') + '"'
+
         vbs = "\n".join([
             'Set ws = CreateObject("WScript.Shell")',
-            f'Set sc = ws.CreateShortcut("{lnk}")',
-            f'sc.TargetPath = "{target}"',
-            f'sc.Arguments = Chr(34) & "{args}" & Chr(34)',
-            f'sc.WorkingDirectory = "{work_dir}"',
+            f'Set sc = ws.CreateShortcut({_vbs_quote(lnk)})',
+            f'sc.TargetPath = {_vbs_quote(target)}',
+            f'sc.Arguments = {_vbs_quote(args)}',
+            f'sc.WorkingDirectory = {_vbs_quote(work_dir)}',
             'sc.Description = "J.A.R.V.I.S AI Assistant"',
-            f'sc.IconLocation = "{icon_loc}"',
+            f'sc.IconLocation = {_vbs_quote(icon_loc)}',
             'sc.Save',
         ])
         import tempfile
         fd, tmp = tempfile.mkstemp(suffix=".vbs")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(vbs)
+            with os.fdopen(fd, "wb") as f:
+                f.write(vbs.encode("utf-16"))
             proc = subprocess.Popen(
                 ["wscript.exe", "/nologo", tmp],
                 creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
             )
-            proc.wait(timeout=10)
+            if proc.wait(timeout=10) != 0:
+                raise RuntimeError("Windows Script Host could not write the shortcut.")
         finally:
             try:
                 os.unlink(tmp)
@@ -13026,84 +14270,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _get_desktop_dir() -> Path:
-        """
-        Resolve the user's REAL desktop directory instead of assuming
-        ~/Desktop, which breaks when:
-          • OneDrive "Known Folder Move" relocates the desktop
-            (C:/Users/x/OneDrive/Desktop) — very common on Win 10/11;
-          • the XDG desktop is localized on Linux (~/Masaüstü,
-            ~/Schreibtisch, ~/Bureau, …).
-        Falls back to ~/Desktop only as a last resort.
-        """
-        home = Path.home()
-        _os = platform.system()
-
-        if _os == "Windows":
-            # ── 1) SHGetKnownFolderPath(FOLDERID_Desktop) — the canonical
-            #       answer; follows OneDrive redirection. No dependencies. ──
-            try:
-                import ctypes
-                from ctypes import wintypes
-
-                class _GUID(ctypes.Structure):
-                    _fields_ = [("Data1", wintypes.DWORD),
-                                ("Data2", wintypes.WORD),
-                                ("Data3", wintypes.WORD),
-                                ("Data4", ctypes.c_ubyte * 8)]
-
-                # FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
-                fid = _GUID(0xB4BFCC3A, 0xDB2C, 0x424C,
-                            (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9,
-                                                 0x9A, 0x87, 0xC6, 0x41))
-                buf = ctypes.c_wchar_p()
-                if ctypes.windll.shell32.SHGetKnownFolderPath(
-                        ctypes.byref(fid), 0, None, ctypes.byref(buf)) == 0:
-                    p = Path(buf.value)
-                    ctypes.windll.ole32.CoTaskMemFree(buf)
-                    if p.is_dir():
-                        return p
-            except Exception:
-                pass
-
-            # ── 2) Registry: User Shell Folders (may contain %VARS%) ──────
-            try:
-                import winreg
-                with winreg.OpenKey(
-                        winreg.HKEY_CURRENT_USER,
-                        r"Software\Microsoft\Windows\CurrentVersion"
-                        r"\Explorer\User Shell Folders") as key:
-                    val, _t = winreg.QueryValueEx(key, "Desktop")
-                p = Path(os.path.expandvars(val))
-                if p.is_dir():
-                    return p
-            except Exception:
-                pass
-
-        elif _os == "Linux":
-            # ── xdg-user-dir honours localized names (~/Masaüstü, …) ──────
-            try:
-                out = subprocess.run(["xdg-user-dir", "DESKTOP"],
-                                     capture_output=True, text=True, timeout=5)
-                p = Path(out.stdout.strip())
-                if out.stdout.strip() and p != home and p.is_dir():
-                    return p
-            except Exception:
-                pass
-            try:
-                cfg = home / ".config" / "user-dirs.dirs"
-                for line in cfg.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line.startswith("XDG_DESKTOP_DIR"):
-                        val = line.split("=", 1)[1].strip().strip('"')
-                        p = Path(val.replace("$HOME", str(home)))
-                        if p != home and p.is_dir():
-                            return p
-            except Exception:
-                pass
-
-        # macOS: ~/Desktop is always the real path (localization is
-        # display-only). Everything else lands here as a last resort.
-        return home / "Desktop"
+        return get_desktop_dir()
 
     def _create_desktop_shortcut(self):
         """
@@ -13111,25 +14278,24 @@ class MainWindow(QMainWindow):
         Never opens a terminal, console, or PowerShell window on any platform.
         """
         import stat as _stat
-        script  = Path(__file__).resolve().parent / "main.py"
-        python  = Path(sys.executable)
-        desktop = self._get_desktop_dir()
-
-        # Arc-reactor icon (.ico — also exported as .png for Linux/macOS)
-        ico_path = Path(__file__).resolve().parent / "config" / "aura.ico"
-        if not ico_path.exists():
-            self._build_aura_icon(ico_path)
-
         try:
+            script = (BASE_DIR / "main.py").resolve()
+            desktop = get_desktop_dir()
+            desktop.mkdir(parents=True, exist_ok=True)
+            frozen = bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
+            target = _shortcut_interpreter()
+            args = build_shortcut_arguments(script, frozen=frozen)
+            ico_path = BASE_DIR / "config" / "aura.ico"
+            if not ico_path.exists():
+                self._build_aura_icon(ico_path)
+
             _os = platform.system()
 
             # ── Windows ───────────────────────────────────────────────────────
             if _os == "Windows":
-                pythonw  = python.parent / "pythonw.exe"
-                target   = str(pythonw if pythonw.exists() else python)
                 lnk      = str(desktop / "AURA.lnk")
                 icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
-                self._create_lnk_windows(lnk, target, str(script),
+                self._create_lnk_windows(lnk, target, args,
                                          str(script.parent), icon_loc)
 
             # ── macOS — proper .app bundle (no Terminal window) ───────────────
@@ -13143,10 +14309,13 @@ class MainWindow(QMainWindow):
                 # Launcher executable (bash — runs as background process,
                 # macOS does NOT open Terminal for executables inside .app bundles)
                 launcher = mac_dir / "AURA"
+                launch_parts = [target]
+                if not frozen:
+                    launch_parts.append(str(script))
                 launcher.write_text(
                     "#!/usr/bin/env bash\n"
-                    f'cd "{script.parent}"\n'
-                    f'exec "{python}" "{script}"\n'
+                    f"cd {shlex.quote(str(script.parent))}\n"
+                    f"exec {' '.join(shlex.quote(part) for part in launch_parts)}\n"
                 )
                 launcher.chmod(launcher.stat().st_mode
                                | _stat.S_IEXEC | _stat.S_IXGRP | _stat.S_IXOTH)
@@ -13199,21 +14368,70 @@ class MainWindow(QMainWindow):
 
                 icon_line = f"Icon={png_path}\n" if png_path.exists() else ""
                 desk = desktop / "AURA.desktop"
-                desk.write_text(
+                launch_parts = [target]
+                if not frozen:
+                    launch_parts.append(str(script))
+                _write_desktop_entry(
+                    desk,
                     "[Desktop Entry]\n"
                     "Name=AURA\n"
-                    f"Exec={python} {script}\n"
+                    f"Exec={' '.join(_desktop_exec_quote(part) for part in launch_parts)}\n"
                     f"Path={script.parent}\n"
                     "Type=Application\n"
                     "Terminal=false\n"
                     "Categories=Utility;\n"
                     + icon_line
                 )
-                desk.chmod(desk.stat().st_mode | 0o755)
 
-            self._log.append_log("SYS: Desktop shortcut created.")
+            shortcut_path = {
+                "Windows": desktop / "AURA.lnk",
+                "Darwin": desktop / "AURA.app",
+            }.get(_os, desktop / "AURA.desktop")
+            if not shortcut_path.exists():
+                raise OSError(f"Shortcut file was not created: {shortcut_path}")
+            self._log.append_log(f"SYS: Desktop shortcut created: {shortcut_path}")
         except Exception as e:
             self._log.append_log(f"ERR: Shortcut failed — {e}")
+
+    def _validate_existing_desktop_shortcut(self):
+        """Repair an existing desktop shortcut whose interpreter was moved."""
+        try:
+            desktop = get_desktop_dir()
+            system = platform.system()
+            shortcut = {
+                "Windows": desktop / "AURA.lnk",
+                "Darwin": desktop / "AURA.app",
+            }.get(system, desktop / "AURA.desktop")
+            if not shortcut.exists():
+                return
+
+            if system == "Windows":
+                from win32com.client import Dispatch
+
+                target = Path(Dispatch("WScript.Shell").CreateShortCut(
+                    str(shortcut)
+                ).TargetPath)
+            elif system == "Darwin":
+                launcher = shortcut / "Contents" / "MacOS" / "AURA"
+                launch_line = next(
+                    line[5:] for line in launcher.read_text(encoding="utf-8").splitlines()
+                    if line.startswith("exec ")
+                )
+                target = Path(shlex.split(launch_line)[0])
+            else:
+                exec_line = next(
+                    line[5:] for line in shortcut.read_text(encoding="utf-8").splitlines()
+                    if line.startswith("Exec=")
+                )
+                target = Path(shlex.split(exec_line)[0].replace("%%", "%"))
+
+            if not target.is_file():
+                self._log.append_log(
+                    f"SYS: Shortcut interpreter missing ({target}); updating shortcut."
+                )
+                self._create_desktop_shortcut()
+        except Exception as exc:
+            _LOGGER.warning("Could not validate the existing AURA desktop shortcut: %s", exc)
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -13224,36 +14442,44 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         cw = self.centralWidget()
-        if self._overlay and self._overlay.isVisible():
+        if cw is None:
+            return
+        overlay = getattr(self, "_overlay", None)
+        if overlay and overlay.isVisible():
             ow, oh = 460, 390
-            self._overlay.setGeometry(
+            overlay.setGeometry(
                 (cw.width()  - ow) // 2,
                 (cw.height() - oh) // 2,
                 ow, oh,
             )
-        if self._remote_overlay and self._remote_overlay.isVisible():
+        remote_overlay = getattr(self, "_remote_overlay", None)
+        if remote_overlay and remote_overlay.isVisible():
             ow, oh = RemoteKeyOverlay._OW, RemoteKeyOverlay._OH
-            self._remote_overlay.setGeometry(
+            remote_overlay.setGeometry(
                 (cw.width()  - ow) // 2,
                 (cw.height() - oh) // 2,
                 ow, oh,
             )
-        if self._customize_overlay and self._customize_overlay.isVisible():
+        customize_overlay = getattr(self, "_customize_overlay", None)
+        if customize_overlay and customize_overlay.isVisible():
             ow, oh = CustomizeOverlay._OW, CustomizeOverlay._OH
-            self._customize_overlay.setGeometry(
+            customize_overlay.setGeometry(
                 (cw.width()  - ow) // 2,
                 (cw.height() - oh) // 2,
                 ow, oh,
             )
         # Camera preview — bottom-right corner of the center/HUD area
-        pw = _CameraPreview._W
-        ph = self._cam_preview.height() or _CameraPreview._H
-        self._cam_preview.setGeometry(
-            cw.width() - _RIGHT_W - pw - 12,
-            cw.height() - ph - 28,
-            pw, ph,
-        )
-        self._fit_video()
+        cam_preview = getattr(self, "_cam_preview", None)
+        if cam_preview is not None:
+            pw = _CameraPreview._W
+            ph = cam_preview.height() or _CameraPreview._H
+            cam_preview.setGeometry(
+                cw.width() - _RIGHT_W - pw - 12,
+                cw.height() - ph - 28,
+                pw, ph,
+            )
+        if hasattr(self, "_video_item"):
+            self._fit_video()
         # Face-unlock screen covers the whole window
         if hasattr(self, '_face_overlay') and self._face_overlay.isVisible():
             self._face_overlay.setGeometry(cw.rect())
@@ -13278,6 +14504,10 @@ class MainWindow(QMainWindow):
         # Content panel — reposition if open
         if hasattr(self, '_content_panel') and self._content_panel.isVisible():
             self._position_content_panel()
+        if hasattr(self, "_cad_progress_panel") and self._cad_progress_panel.isVisible():
+            self._position_cad_progress_panel()
+        if hasattr(self, "_cad_question_panel") and self._cad_question_panel.isVisible():
+            self._position_cad_question_panel()
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
@@ -13803,6 +15033,37 @@ class MainWindow(QMainWindow):
         y = origin.y() + cs.height() - ph - 18
         self._content_panel.setGeometry(x, y, pw, ph)
 
+    def _position_cad_progress_panel(self):
+        panel = getattr(self, "_cad_progress_panel", None)
+        if panel is None:
+            return
+        cs = self._center_split
+        origin = cs.mapTo(self.centralWidget(), cs.rect().topLeft())
+        width = min(390, max(260, cs.width() - 24))
+        panel.setGeometry(
+            origin.x() + (cs.width() - width) // 2,
+            origin.y() + 14,
+            width,
+            94,
+        )
+
+    def _position_cad_question_panel(self):
+        panel = getattr(self, "_cad_question_panel", None)
+        if panel is None:
+            return
+        cs = self._center_split
+        origin = cs.mapTo(self.centralWidget(), cs.rect().topLeft())
+        width = min(460, max(300, cs.width() - 32))
+        panel.setFixedWidth(width)
+        panel.adjustSize()
+        height = min(max(panel.sizeHint().height(), 150), max(180, cs.height() - 24))
+        panel.setGeometry(
+            origin.x() + (cs.width() - width) // 2,
+            origin.y() + max(12, (cs.height() - height) // 2),
+            width,
+            height,
+        )
+
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)
         self._input = QLineEdit()
@@ -13833,6 +15094,127 @@ class MainWindow(QMainWindow):
         send.clicked.connect(self._send)
         row.addWidget(send)
         return row
+
+    def _build_cad_progress_panel(self) -> QFrame:
+        panel = QFrame(self.centralWidget())
+        panel.setObjectName("CadBuildProgress")
+        panel.setStyleSheet(f"""
+            QFrame#CadBuildProgress {{
+                background: {C.DARK};
+                border: 1px solid {C.PRI_DIM};
+                border-radius: 6px;
+            }}
+            QLabel {{ background: transparent; border: none; }}
+            QProgressBar {{
+                background: {C.PANEL};
+                border: 1px solid {C.BORDER};
+                border-radius: 3px;
+            }}
+            QProgressBar::chunk {{
+                background: {C.PRI};
+                border-radius: 2px;
+            }}
+        """)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(11, 7, 11, 7)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        self._cad_progress_title = QLabel("CAD BUILD")
+        self._cad_progress_title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._cad_progress_title.setStyleSheet(f"color: {C.PRI};")
+        header.addWidget(self._cad_progress_title)
+        header.addStretch()
+        self._cad_progress_percent = QLabel("EST. 0%")
+        self._cad_progress_percent.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._cad_progress_percent.setStyleSheet(f"color: {C.TEXT};")
+        header.addWidget(self._cad_progress_percent)
+        self._cad_progress_cancel_btn = QPushButton("CANCEL")
+        self._cad_progress_cancel_btn.setFixedSize(54, 18)
+        self._cad_progress_cancel_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._cad_progress_cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cad_progress_cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {C.TEXT_DIM}; background: transparent;
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
+            QPushButton:disabled {{ color: {C.TEXT_DIM}; border-color: {C.BORDER}; }}
+        """)
+        self._cad_progress_cancel_btn.clicked.connect(self._cad_cancel_sig.emit)
+        header.addWidget(self._cad_progress_cancel_btn)
+        layout.addLayout(header)
+
+        self._cad_progress_status = QLabel("Preparing your model…")
+        self._cad_progress_status.setFont(QFont("Courier New", 8))
+        self._cad_progress_status.setStyleSheet(f"color: {C.TEXT_MED};")
+        self._cad_progress_status.setWordWrap(True)
+        layout.addWidget(self._cad_progress_status)
+
+        self._cad_progress_bar = QProgressBar()
+        self._cad_progress_bar.setRange(0, 100)
+        self._cad_progress_bar.setTextVisible(False)
+        self._cad_progress_bar.setFixedHeight(8)
+        layout.addWidget(self._cad_progress_bar)
+
+        note = QLabel("Estimated by completed stages; geometry time varies.")
+        note.setFont(QFont("Courier New", 7))
+        note.setStyleSheet(f"color: {C.TEXT_DIM};")
+        layout.addWidget(note)
+        panel.hide()
+        return panel
+
+    def _build_cad_question_panel(self) -> QFrame:
+        panel = QFrame(self.centralWidget())
+        panel.setObjectName("CadQuestionPanel")
+        panel.setStyleSheet(f"""
+            QFrame#CadQuestionPanel {{
+                background: {C.DARK};
+                border: 1px solid {C.PRI_DIM};
+                border-radius: 7px;
+            }}
+            QLabel {{ background: transparent; border: none; }}
+        """)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(15, 11, 15, 12)
+        layout.setSpacing(9)
+
+        header = QHBoxLayout()
+        self._cad_question_title = QLabel("CAD DESIGN · QUICK QUESTION")
+        self._cad_question_title.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._cad_question_title.setStyleSheet(f"color: {C.PRI};")
+        header.addWidget(self._cad_question_title)
+        header.addStretch()
+        close = QPushButton("✕")
+        close.setFixedSize(22, 22)
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setStyleSheet(
+            f"QPushButton {{ color: {C.TEXT_DIM}; background: transparent; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; }}"
+            f"QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}"
+        )
+        close.clicked.connect(self._hide_cad_question)
+        header.addWidget(close)
+        layout.addLayout(header)
+
+        self._cad_question_text = QLabel("")
+        self._cad_question_text.setWordWrap(True)
+        self._cad_question_text.setFont(QFont("Segoe UI", 10))
+        self._cad_question_text.setStyleSheet(f"color: {C.WHITE};")
+        layout.addWidget(self._cad_question_text)
+
+        self._cad_question_options_lay = QVBoxLayout()
+        self._cad_question_options_lay.setContentsMargins(0, 0, 0, 0)
+        self._cad_question_options_lay.setSpacing(5)
+        layout.addLayout(self._cad_question_options_lay)
+
+        self._cad_question_hint = QLabel("")
+        self._cad_question_hint.setWordWrap(True)
+        self._cad_question_hint.setFont(QFont("Courier New", 7))
+        self._cad_question_hint.setStyleSheet(f"color: {C.TEXT_DIM};")
+        layout.addWidget(self._cad_question_hint)
+        panel.hide()
+        return panel
 
     def _build_content_panel(self) -> QWidget:
         """
@@ -13946,6 +15328,124 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._content_display)
 
         return w
+
+    def _show_cad_progress(
+        self, job_id: str, percent: int, message: str, active: bool
+    ) -> None:
+        if not active:
+            if self._cad_progress_job == job_id:
+                self._cad_progress_timer.stop()
+                self._cad_progress_panel.hide()
+                self._cad_progress_job = ""
+            return
+        if self._cad_progress_job != job_id:
+            self._cad_progress_job = job_id
+            self._cad_progress_bar.setValue(0)
+            self._cad_progress_cancel_btn.setEnabled(True)
+        value = max(0, min(100, int(percent)))
+        self._cad_progress_stage = str(message or "Working on your model…")
+        self._cad_progress_title.setText("CAD BUILD")
+        self._cad_progress_status.setText(self._cad_progress_stage)
+        self._cad_progress_bar.setValue(value)
+        self._cad_progress_percent.setText(f"EST. {value}%")
+        self._position_cad_progress_panel()
+        self._cad_progress_panel.show()
+        self._cad_progress_panel.raise_()
+        if value >= 100:
+            self._cad_progress_timer.stop()
+            QTimer.singleShot(
+                2500,
+                lambda expected=job_id: self._hide_completed_cad_progress(expected),
+            )
+        else:
+            self._cad_progress_timer.start()
+
+    def _show_cad_question(self, title: str, question: str, options) -> None:
+        self._cad_question_title.setText(str(title or "CAD DESIGN").upper()[:48])
+        self._cad_question_text.setText(str(question or "What would you like?"))
+        while self._cad_question_options_lay.count():
+            item = self._cad_question_options_lay.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        choices = [str(option).strip() for option in (options or []) if str(option).strip()]
+        for index, option in enumerate(choices):
+            button = QPushButton(f"{index + 1}.  {option}")
+            button.setMinimumHeight(30)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setFont(QFont("Segoe UI", 9))
+            button.setStyleSheet(f"""
+                QPushButton {{
+                    color: {C.TEXT}; background: {C.PANEL};
+                    border: 1px solid {C.BORDER}; border-radius: 4px;
+                    padding: 5px 9px; text-align: left;
+                }}
+                QPushButton:hover {{
+                    color: {C.WHITE}; border-color: {C.PRI};
+                    background: {C.PRI_GHO};
+                }}
+            """)
+            button.clicked.connect(
+                lambda _checked=False, value=option: self._select_cad_question_option(value)
+            )
+            self._cad_question_options_lay.addWidget(button)
+
+        if choices:
+            ordinals = ("first", "second", "third", "fourth", "fifth")
+            spoken = ", ".join(
+                f"{ordinals[index]} option"
+                for index in range(min(len(choices), len(ordinals)))
+            )
+            self._cad_question_hint.setText(f"Tap a choice, or tell AURA: {spoken}.")
+        else:
+            self._cad_question_hint.setText("Answer by speaking or typing to AURA.")
+        self._position_cad_question_panel()
+        self._cad_question_panel.show()
+        self._cad_question_panel.raise_()
+
+    def _select_cad_question_option(self, answer: str) -> None:
+        self._cad_question_panel.hide()
+        self._log_sig.emit(f"You: {answer}")
+        callback = self.on_text_command
+        if callable(callback):
+            threading.Thread(
+                target=callback,
+                args=(answer,),
+                name="aura-cad-question-answer",
+                daemon=True,
+            ).start()
+        else:
+            self._log_sig.emit("ERR: CAD question answer could not be submitted.")
+
+    def _hide_cad_question(self) -> None:
+        self._cad_question_panel.hide()
+
+    def _cad_progress_heartbeat(self) -> None:
+        if self._cad_progress_panel.isVisible() and self._cad_progress_stage:
+            self._cad_progress_status.setText(
+                f"Still working — {self._cad_progress_stage}"
+            )
+            self._cad_progress_timer.start()
+
+    def _hide_completed_cad_progress(self, expected_job: str) -> None:
+        if self._cad_progress_job == expected_job and self._cad_progress_bar.value() >= 100:
+            self._cad_progress_panel.hide()
+            self._cad_progress_job = ""
+
+    def _cancel_cad_progress_job(self) -> None:
+        callback = self.on_cad_cancel
+        if not callable(callback):
+            self._cad_progress_status.setText("Cancellation is unavailable.")
+            return
+        self._cad_progress_cancel_btn.setEnabled(False)
+        self._cad_progress_status.setText("Cancellation requested…")
+        try:
+            callback()
+        except Exception:
+            _LOGGER.exception("Could not cancel the active CAD job")
+            self._cad_progress_cancel_btn.setEnabled(True)
+            self._cad_progress_status.setText("Could not cancel; the job is still running.")
 
     def _show_content(self, title: str, text: str):
         """Slot — runs on Qt main thread. Updates and shows the content panel."""
@@ -14844,7 +16344,9 @@ class MainWindow(QMainWindow):
     def _toggle_autostart(self):
         currently_on = self._check_autostart()
         try:
-            script = str(Path(__file__).resolve().parent / "main.py")
+            script = (BASE_DIR / "main.py").resolve()
+            frozen = bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
+            target = _shortcut_interpreter()
             if _OS == "Windows":
                 import winreg
                 reg = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -14852,10 +16354,11 @@ class MainWindow(QMainWindow):
                 if currently_on:
                     winreg.DeleteValue(reg, "AURA_AI")
                 else:
-                    pythonw = Path(sys.executable).parent / "pythonw.exe"
-                    exe = str(pythonw if pythonw.exists() else sys.executable)
-                    winreg.SetValueEx(reg, "AURA_AI", 0, winreg.REG_SZ,
-                                      f'"{exe}" "{script}"')
+                    arguments = build_shortcut_arguments(script, frozen=frozen)
+                    winreg.SetValueEx(
+                        reg, "AURA_AI", 0, winreg.REG_SZ,
+                        f'"{target}" {arguments}' if arguments else f'"{target}"',
+                    )
                 winreg.CloseKey(reg)
             elif _OS == "Darwin":
                 plist_dir = Path.home() / "Library" / "LaunchAgents"
@@ -14864,6 +16367,11 @@ class MainWindow(QMainWindow):
                 if currently_on:
                     plist.unlink(missing_ok=True)
                 else:
+                    import xml.sax.saxutils
+
+                    program_arguments = [target]
+                    if not frozen:
+                        program_arguments.append(str(script))
                     plist.write_text(
                         '<?xml version="1.0" encoding="UTF-8"?>\n'
                         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -14871,11 +16379,18 @@ class MainWindow(QMainWindow):
                         '<plist version="1.0"><dict>\n'
                         '  <key>Label</key><string>com.aura.assistant</string>\n'
                         '  <key>ProgramArguments</key><array>\n'
-                        f'    <string>{sys.executable}</string>\n'
-                        f'    <string>{script}</string>\n'
-                        '  </array>\n'
-                        '  <key>RunAtLoad</key><true/>\n'
-                        '</dict></plist>\n'
+                        + "".join(
+                            "    <string>"
+                            + xml.sax.saxutils.escape(value)
+                            + "</string>\n"
+                            for value in program_arguments
+                        )
+                        + '  </array>\n'
+                        + '  <key>WorkingDirectory</key><string>'
+                        + xml.sax.saxutils.escape(str(script.parent))
+                        + '</string>\n'
+                        + '  <key>RunAtLoad</key><true/>\n'
+                        + '</dict></plist>\n'
                     )
             else:
                 desk_dir = Path.home() / ".config" / "autostart"
@@ -14884,10 +16399,14 @@ class MainWindow(QMainWindow):
                 if currently_on:
                     desk.unlink(missing_ok=True)
                 else:
+                    launch_parts = [target]
+                    if not frozen:
+                        launch_parts.append(str(script))
                     desk.write_text(
                         "[Desktop Entry]\n"
                         f"Name={self._assistant_name}\n"
-                        f"Exec={sys.executable} {script}\n"
+                        f"Exec={' '.join(_desktop_exec_quote(part) for part in launch_parts)}\n"
+                        f"Path={script.parent}\n"
                         "Type=Application\nTerminal=false\n"
                         "X-GNOME-Autostart-enabled=true\n"
                     )
@@ -15072,6 +16591,7 @@ class MainWindow(QMainWindow):
         )
         ov.on_preview = self._preview_ui_color
         ov.saved.connect(self._apply_name_update)
+        ov.wake_settings_changed.connect(self._background_settings_sig.emit)
         ov.configure_local_ai.connect(self._open_local_ai_settings)
         ov.open_permissions.connect(self._open_permissions)
         ov.show()
@@ -15352,6 +16872,7 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
     def _apply_state(self, state: str):
+        self._background_orb.set_state(state)
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
         panel = self._news_video_panel
@@ -15359,6 +16880,31 @@ class MainWindow(QMainWindow):
             panel.set_speaking(self.hud.speaking)
         # The USD/INR graph deliberately ignores speaking/listening changes:
         # once it has data it stays until the user presses its close button.
+
+    def _bring_to_front(self):
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self.hud._tmr.start()
+        self.raise_()
+        self.activateWindow()
+
+    def show_background_orb(self):
+        orb = self._background_orb
+        if orb.isVisible() and not orb._hiding:
+            orb.show_animated()          # already up: keep its reply, just surface it
+            return
+        orb.set_reply("")
+        orb.set_transcript("")
+        orb.set_state("LISTENING")
+        orb.show_animated()
+
+    def show_background_reply(self, text: str):
+        self._background_orb.set_reply(text)
+
+    def hide_background_orb(self):
+        self._background_orb.hide_animated()
 
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False
@@ -15409,6 +16955,8 @@ class MainWindow(QMainWindow):
                 "tts_engine": settings["tts_engine"],
                 "tts_voice": settings["tts_voice"],
                 "local_voice_override": settings["local_voice_override"],
+                "auto_model_switching": settings["auto_model_switching"],
+                "deep_daily_budget": settings["deep_daily_budget"],
                 "voice_id": settings["voice_id"],
                 "voice_by_model": settings["voice_by_model"],
                 "tts_voice_by_engine": settings["tts_voice_by_engine"],
@@ -15455,7 +17003,13 @@ class _RootShim:
 
 
 class AuraUI:
-    def __init__(self, face_path: str, size=None):
+    def __init__(
+        self,
+        face_path: str,
+        size=None,
+        show_window: bool = True,
+        background_mode: bool = False,
+    ):
         flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
         for flag in (
             "--enable-webgl", "--enable-unsafe-swiftshader",
@@ -15466,15 +17020,63 @@ class AuraUI:
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags)
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        self._app.setQuitOnLastWindowClosed(False)
         _Motion.install_app_hooks(self._app)
-        self._win = MainWindow(face_path)
+        self._win = MainWindow(face_path, background_mode=background_mode)
+        self._win._background_stop_sig.connect(self._stop_background_request)
+        self._win._background_text_sig.connect(self._submit_background_text)
         from core.confirmation import configure_confirmation_broker
         self._win._access_broker = configure_confirmation_broker(
             parent=self._win, accent_provider=lambda: C.PRI
         )
         self.on_system_control_action = None
-        self._win.showMaximized()
+        self.on_show_main_window = None
+        self.on_quit_requested = None
+        if show_window:
+            self._win.showMaximized()
+        else:
+            self._win.hud._tmr.stop()
         self.root = _RootShim(self._app)
+
+    def show_main_window(self) -> None:
+        if self.on_show_main_window is not None:
+            self.on_show_main_window()
+        else:
+            self._win._show_window_sig.emit()
+
+    def request_quit(self) -> None:
+        if self.on_quit_requested is not None:
+            self.on_quit_requested()
+        else:
+            self._app.quit()
+
+    def show_background_orb(self) -> None:
+        self._win._background_wake_sig.emit()
+
+    def show_background_reply(self, text: str) -> None:
+        self._win._background_reply_sig.emit(str(text or ""))
+
+    def show_background_transcript(self, text: str) -> None:
+        self._win._background_transcript_sig.emit(str(text or ""))
+
+    def dismiss_background_orb(self, reason: str) -> None:
+        self._win._background_dismiss_sig.emit(str(reason or "dismissed"))
+
+    def _stop_background_request(self) -> None:
+        if self._win.on_interrupt is not None:
+            self._win.on_interrupt()
+
+    def _submit_background_text(self, text: str) -> None:
+        if self._win.on_text_command is not None:
+            self._win._log_sig.emit(f"You: {text}")
+            self._win._state_sig.emit("PROCESSING")
+            threading.Thread(
+                target=self._win.on_text_command, args=(text,),
+                name="aura-orb-text", daemon=True,
+            ).start()
+
+    def notify_background_settings_changed(self) -> None:
+        self._win._background_settings_sig.emit()
 
     @property
     def muted(self) -> bool:
@@ -15500,6 +17102,14 @@ class AuraUI:
     @on_text_command.setter
     def on_text_command(self, cb):
         self._win.on_text_command = cb
+
+    @property
+    def on_voice_text(self):
+        return self._win.on_voice_text
+
+    @on_voice_text.setter
+    def on_voice_text(self, cb):
+        self._win.on_voice_text = cb
 
     @property
     def on_remote_clicked(self):
@@ -15556,6 +17166,28 @@ class AuraUI:
         url, fallback, _kind = _resolve_site(target or "")
         if url:
             self._win._browser_cmd_sig.emit("open", url, fallback, str(target)[:60])
+
+    def open_local_file_in_browser(self, target: str) -> None:
+        """Thread-safe local viewer entry point; remote file URLs are refused."""
+        url = QUrl(str(target or ""))
+        viewer_path = (
+            Path(__file__).resolve().parent
+            / "aura_cad" / "viewer" / "assets" / "viewer.html"
+        )
+        if (
+            url.scheme().casefold() != "file"
+            or Path(url.toLocalFile()).resolve() != viewer_path
+            or not viewer_path.is_file()
+        ):
+            raise ValueError("The in-app browser only opens the bundled CAD viewer here.")
+        self._win._browser_cmd_sig.emit(
+            "open", url.toString(QUrl.ComponentFormattingOption.FullyEncoded), "",
+            "CAD preview",
+        )
+
+    def run_cad_viewer_command(self, command: str) -> None:
+        """Thread-safe, allowlisted command channel to the local CAD page."""
+        self._win._cad_viewer_command_sig.emit(str(command or "").casefold())
 
     def search_in_browser(self, query: str, site: str = "google") -> None:
         """Thread-safe: run a web search in the in-app browser."""
@@ -15661,6 +17293,30 @@ class AuraUI:
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
         self._win._content_sig.emit(title[:48], text[:4000])
+
+    def show_cad_question(self, title: str, question: str, options) -> None:
+        """Thread-safe: show one CAD clarification in its floating choice card."""
+        self._win._cad_question_sig.emit(
+            str(title or "CAD DESIGN"),
+            str(question or ""),
+            list(options or []),
+        )
+
+    def hide_cad_question(self) -> None:
+        self._win._cad_question_hide_sig.emit()
+
+    def show_cad_progress(self, job_id: str, percent: int, message: str) -> None:
+        """Thread-safe CAD progress update; percentages are stage estimates."""
+        self._win._cad_progress_sig.emit(
+            str(job_id), int(percent), str(message or ""), True
+        )
+
+    def finish_cad_progress(self, job_id: str, completed: bool = False) -> None:
+        """Finish a CAD progress panel after success, failure, or cancellation."""
+        if completed:
+            self.show_cad_progress(job_id, 100, "Model complete — opening preview.")
+        else:
+            self._win._cad_progress_sig.emit(str(job_id), 0, "", False)
 
     def show_quiz(self, topic: str, questions, grade=None) -> None:
         """Thread-safe: put an interactive quiz on the board.

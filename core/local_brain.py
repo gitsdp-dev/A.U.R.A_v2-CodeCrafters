@@ -76,6 +76,7 @@ class LocalBrain:
         notify: Callable[[str], None],
         max_turns: int = 4,
         on_timing: Callable[[str], None] | None = None,
+        request_timeout: int = 120,
     ):
         self._system_prompt = system_prompt
         self._tools = gemini_tools_to_openai(declarations)
@@ -88,6 +89,7 @@ class LocalBrain:
         self._notify = notify
         self._on_timing = on_timing or notify
         self._max_turns = max(2, max_turns)
+        self._request_timeout = max(1, int(request_timeout))
         self._history: list[dict] = []
         self._reported_tool_fallback = False
 
@@ -108,7 +110,10 @@ class LocalBrain:
             use_tools = self._tools if _request_needs_tools(text) else []
             try:
                 events = call_llm_stream(
-                    messages, tools=use_tools, max_tokens=96
+                    messages,
+                    tools=use_tools,
+                    timeout=self._request_timeout,
+                    max_tokens=96,
                 )
                 done = {}
                 while True:

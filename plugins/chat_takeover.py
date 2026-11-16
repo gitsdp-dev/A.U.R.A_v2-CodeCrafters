@@ -338,8 +338,8 @@ class _RestEngine:
         self._instruction = user_instruction
 
     def check(self, jpg: bytes, recent: list) -> str:
-        from google import genai
         from google.genai import types as gtypes
+        from core import gemini
 
         prompt = (
             "You are an AI that has temporarily taken over the USER's side of "
@@ -369,12 +369,14 @@ class _RestEngine:
             "punctuation (no commas, no trailing period); no signatures, no "
             "AI mentions — else null."
         )
-        client = genai.Client(api_key=self._api_key)
-        resp = client.models.generate_content(
-            model=_REST_MODEL,
-            contents=[gtypes.Part.from_bytes(data=jpg, mime_type="image/jpeg"),
-                      prompt],
+        resp = gemini.call(
+            [gtypes.Part.from_bytes(data=jpg, mime_type="image/jpeg"), prompt],
+            tier=_REST_MODEL,
+            task_type="file_task",
+            key=self._api_key,
         )
+        if resp is None:
+            raise RuntimeError("Gemini returned no chat-screen analysis.")
         text = (resp.text or "").strip()
         if "{" in text and "}" in text:
             text = text[text.find("{"): text.rfind("}") + 1]

@@ -32,8 +32,6 @@ LIMITS:
 
 import asyncio
 import platform
-import subprocess
-import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -109,16 +107,15 @@ _id_counter = 0
 
 
 def _ensure_winsdk() -> bool:
-    """Checks if winsdk is installed; if not, attempts automatic installation via pip."""
+    """Check PyWinRT first, then support environments retaining the legacy winsdk."""
     try:
-        import winsdk  # noqa: F401
+        import winrt.windows.ui.notifications  # noqa: F401
         return True
     except ImportError:
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "winsdk"])
-            import winsdk  # noqa: F401
+            import winsdk.windows.ui.notifications  # noqa: F401
             return True
-        except Exception:
+        except ImportError:
             return False
 
 
@@ -183,10 +180,16 @@ def _run_async(coro):
 
 async def _get_notifications():
     from core.notifications.listener import _get_current_user_notification_listener
-    from winsdk.windows.ui.notifications.management import (
-        UserNotificationListener, UserNotificationListenerAccessStatus,
-    )
-    from winsdk.windows.ui.notifications import NotificationKinds
+    try:
+        from winrt.windows.ui.notifications.management import (
+            UserNotificationListener, UserNotificationListenerAccessStatus,
+        )
+        from winrt.windows.ui.notifications import NotificationKinds
+    except ImportError:
+        from winsdk.windows.ui.notifications.management import (
+            UserNotificationListener, UserNotificationListenerAccessStatus,
+        )
+        from winsdk.windows.ui.notifications import NotificationKinds
 
     listener = _get_current_user_notification_listener(UserNotificationListener)
     status = await listener.request_access_async()
@@ -296,8 +299,10 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     pattern = (parameters.get("pattern") or "").strip().lower()
 
     if not _ensure_winsdk():
-        return ("I need the 'winsdk' library to read Windows notifications, but automatic installation "
-                "failed. Please install it manually with: pip install winsdk")
+        return (
+            "Windows notification reading is unavailable: install the PyWinRT "
+            "notification namespace packages or use an existing winsdk installation."
+        )
 
     if action in ("watches", "list_watches"):
         with _watches_lock:

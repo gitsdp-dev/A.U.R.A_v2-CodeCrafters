@@ -89,7 +89,8 @@ def _gemini_search(query: str) -> str:
     try:
         response = gemini.call(query, tier=gemini.SEARCH,
                                config={"tools": [{"google_search": {}}]},
-                               timeout_ms=30_000)
+                               timeout_ms=30_000,
+                               task_type="long_reasoning")
         if response is None:
             raise RuntimeError("every Gemini model on the ladder failed")
     except Exception as e:
@@ -213,6 +214,7 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
         tier=gemini.SEARCH,
         config={"tools": [{"google_search": {}}]},
         timeout_ms=30_000,
+        task_type="long_reasoning",
     )
     if response is None:
         return [], ""

@@ -112,6 +112,18 @@ class SetupOverlayTests(unittest.TestCase):
             worker.wait(3000)
         overlay.close()
 
+    def test_invalid_key_handler_marks_ui_unready_and_requests_setup(self):
+        requested = []
+        window = SimpleNamespace(
+            _ready=True,
+            _reconfig_sig=SimpleNamespace(emit=lambda: requested.append(True)),
+        )
+
+        MainWindow._on_model_router_invalid_key(window)
+
+        self.assertFalse(window._ready)
+        self.assertEqual(requested, [True])
+
     def test_local_initialisation_is_saved_and_does_not_prompt_next_boot(self):
         with tempfile.TemporaryDirectory() as folder:
             config_path = Path(folder) / "api_keys.json"

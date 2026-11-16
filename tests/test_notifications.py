@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import sqlite3
+from types import SimpleNamespace
 
 from core.notifications.intent import match_notification_intent
 from core.notifications.listener import (
@@ -7,6 +8,7 @@ from core.notifications.listener import (
     _notification_from_winrt,
     _notification_from_xml,
     _read_windows_database,
+    _windows_toast_app_name,
 )
 from core.notifications.models import Notification
 from core.notifications.priority import HIGH, priority_level, score_notification, sort_notifications
@@ -41,6 +43,22 @@ def test_windows_listener_supports_current_sdk_projection_member_names():
 
     assert _get_current_user_notification_listener(GetCurrentProjection) is listener
     assert _get_current_user_notification_listener(CurrentProjection) is listener
+
+
+def test_windows_toast_uses_generic_app_name_when_appmodel_projection_is_missing():
+    class Item:
+        @property
+        def app_info(self):
+            raise ModuleNotFoundError("winrt.windows.applicationmodel")
+
+    assert _windows_toast_app_name(Item()) == "Windows"
+
+
+def test_windows_toast_reads_app_name_when_appmodel_projection_is_available():
+    item = SimpleNamespace(
+        app_info=SimpleNamespace(display_info=SimpleNamespace(display_name="Calendar"))
+    )
+    assert _windows_toast_app_name(item) == "Calendar"
 
 
 def test_priority_uses_app_and_urgency_overrides():
@@ -171,6 +189,30 @@ def test_center_filters_blocked_apps_and_publishes_local_items(tmp_path):
         assert [item.title for item in forwarded] == ["Allowed"]
     finally:
         center.stop()
+
+
+def test_model_router_notice_is_stored_without_a_toast():
+    from ui import MainWindow
+
+    refreshed = []
+    toasts = []
+    window = SimpleNamespace(
+        isVisible=lambda: True,
+        isMinimized=lambda: False,
+        _face_mode="",
+        _notification_toasts=SimpleNamespace(enqueue=toasts.append),
+        _notification_panel=SimpleNamespace(
+            isVisible=lambda: True,
+            refresh=lambda: refreshed.append(True),
+        ),
+    )
+    notice = _notification("Assistant update", "Using a faster model.")
+    notice.category = "model_router"
+
+    MainWindow._on_notification(window, notice)
+
+    assert toasts == []
+    assert refreshed == [True]
 
 
 def test_notification_config_defaults_and_clamps(monkeypatch):

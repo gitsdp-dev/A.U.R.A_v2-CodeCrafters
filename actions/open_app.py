@@ -2,6 +2,8 @@ import time
 import subprocess
 import platform
 import shutil
+import webbrowser
+from urllib.parse import urlsplit
 
 try:
     import psutil
@@ -76,6 +78,31 @@ def _normalize(raw: str) -> str:
             return os_map.get(_SYSTEM, raw)
 
     return raw  
+
+
+def _website_url(value: str) -> str | None:
+    candidate = value.strip().rstrip(".,!?")
+    if not candidate or any(char.isspace() for char in candidate):
+        return None
+    if "://" not in candidate:
+        host = candidate.split("/", 1)[0].split(":", 1)[0].casefold()
+        if "." not in host and host != "localhost":
+            return None
+        candidate = f"https://{candidate}"
+    try:
+        parsed = urlsplit(candidate)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+        ):
+            return None
+        parsed.port
+    except ValueError:
+        return None
+    return candidate
+
 
 def _launch_windows(app_name: str) -> bool:
 
@@ -247,6 +274,15 @@ def open_app(
 
     if not app_name:
         return "No application name provided."
+
+    website_url = _website_url(app_name)
+    if website_url:
+        try:
+            if webbrowser.open(website_url, new=2):
+                return f"Opened website {website_url}."
+            return f"Could not open website {website_url} in the default browser."
+        except Exception as e:
+            return f"Failed to open website {website_url}: {e}"
 
     launcher = _OS_LAUNCHERS.get(_SYSTEM)
     if launcher is None:

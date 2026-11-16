@@ -2,6 +2,8 @@ import os
 import subprocess
 import sys
 
+from compat import get_python_executable
+
 
 def test_panel_actions_are_not_blocked_by_snapshots_and_external_updates_render():
     script = r'''
@@ -103,7 +105,7 @@ finally:
     environment = os.environ.copy()
     environment["QT_QPA_PLATFORM"] = "offscreen"
     completed = subprocess.run(
-        [sys.executable, "-c", script],
+        [get_python_executable(), "-c", script],
         capture_output=True,
         text=True,
         timeout=20,

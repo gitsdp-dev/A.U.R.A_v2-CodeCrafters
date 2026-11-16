@@ -40,7 +40,10 @@ class WifiControl(SystemControl):
         return platform.system() == "Windows"
 
     async def _radios(self):
-        from winsdk.windows.devices.radios import Radio, RadioKind
+        try:
+            from winrt.windows.devices.radios import Radio, RadioKind
+        except ImportError:
+            from winsdk.windows.devices.radios import Radio, RadioKind
 
         radios = await Radio.get_radios_async()
         wifi_kind = getattr(RadioKind, "WI_FI", None)
@@ -56,7 +59,10 @@ class WifiControl(SystemControl):
             radios = await self._radios()
             if not radios:
                 return None
-            from winsdk.windows.devices.radios import RadioState
+            try:
+                from winrt.windows.devices.radios import RadioState
+            except ImportError:
+                from winsdk.windows.devices.radios import RadioState
 
             states = [radio.state for radio in radios]
             if all(state == RadioState.ON for state in states):
@@ -139,7 +145,10 @@ class WifiControl(SystemControl):
                 radios = await self._radios()
                 if not radios:
                     return False
-                from winsdk.windows.devices.radios import RadioState
+                try:
+                    from winrt.windows.devices.radios import RadioState
+                except ImportError:
+                    from winsdk.windows.devices.radios import RadioState
 
                 target = RadioState.ON if value else RadioState.OFF
                 for radio in radios:

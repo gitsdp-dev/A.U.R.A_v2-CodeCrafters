@@ -178,6 +178,7 @@ def _summarize_with_gemini(transcript: str, video_url: str) -> str:
         f"Please summarize this YouTube video transcript:\n\n{truncated}",
         tier=gemini.SMART,
         timeout_ms=60_000,
+        task_type="long_reasoning",
         config=types.GenerateContentConfig(
             system_instruction=(
                 "You are JARVIS, an AI assistant. "

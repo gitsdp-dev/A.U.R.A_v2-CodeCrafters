@@ -206,14 +206,13 @@ def _is_transient_error(e) -> bool:
 
 def _call_persona(prompt: str, unit_name: str, api_key: str, attempts: int = 3, use_search: bool = False) -> dict:
     """Shared call+parse logic with transient backoff retry, grounding fallback, and robust JSON normalization."""
-    from google import genai
     from google.genai import types
+    from core import gemini
     persona = _PERSONAS[unit_name]
     last_err = None
 
     for attempt in range(attempts):
         try:
-            client = genai.Client(api_key=api_key)
             # If search is requested, try Google Search grounding first; if quota is hit on retry, fall back to base model
             config = None
             if use_search and attempt == 0:
@@ -221,11 +220,15 @@ def _call_persona(prompt: str, unit_name: str, api_key: str, attempts: int = 3, 
                     tools=[types.Tool(google_search=types.GoogleSearch())]
                 )
 
-            resp = client.models.generate_content(
-                model=_MODEL,
-                contents=prompt,
+            resp = gemini.call(
+                prompt,
+                tier=_MODEL,
+                task_type="long_reasoning",
+                key=api_key,
                 config=config,
             )
+            if resp is None:
+                raise RuntimeError("Gemini returned no persona assessment.")
             text = (resp.text or "").strip()
             if "{" in text and "}" in text:
                 text = text[text.find("{"): text.rfind("}") + 1]

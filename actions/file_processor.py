@@ -23,6 +23,8 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+from compat import get_python_executable
 from datetime import datetime
 
 # Model choice, timeout and fallback ladder all live in core/gemini.py.
@@ -34,12 +36,20 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
 
 
-def _gemini_client(tier: str = gemini.SMART):
+def _gemini_client(
+    tier: str = gemini.SMART,
+    task_type: str = "file_task",
+):
     """Summarising documents and reading images — the reasoning tier, with a
     long deadline because the input can be a whole file."""
     class _W:
         def generate_content(self, contents):
-            resp = gemini.call(contents, tier=tier, timeout_ms=90000)
+            resp = gemini.call(
+                contents,
+                tier=tier,
+                timeout_ms=90000,
+                task_type=task_type,
+            )
             if resp is None:
                 raise RuntimeError("every Gemini model on the ladder failed")
             return resp
@@ -180,7 +190,7 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
 def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
     action = action or "summarize"
 
-    def _extract_pdf_text(max_chars=50000) -> str:
+    def _extract_pdf_text(max_chars=50000) -> str | None:
         text = ""
         try:
             import pdfplumber
@@ -189,17 +199,22 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
                     text += (page.extract_text() or "") + "\n"
         except ImportError:
             try:
-                import PyPDF2
-                with open(path, "rb") as f:
-                    reader = PyPDF2.PdfReader(f)
-                    for page in reader.pages:
-                        text += page.extract_text() + "\n"
+                from pypdf import PdfReader
             except ImportError:
-                return ""
+                try:
+                    from PyPDF2 import PdfReader
+                except ImportError:
+                    return None
+            with open(path, "rb") as f:
+                reader = PdfReader(f)
+                for page in reader.pages:
+                    text += (page.extract_text() or "") + "\n"
         return text[:max_chars]
 
     if action in ("summarize", "extract_text", "translate_hint", "analyze", "reformat"):
         text = _extract_pdf_text()
+        if text is None:
+            return "PDF reading is unavailable. Install pypdf to enable this feature."
         if not text.strip():
             return "Could not extract text from PDF (may be scanned/image-based)."
 
@@ -464,9 +479,12 @@ def _process_code(path: Path, action: str, params: dict, speak=None) -> str:
 
     if action == "run":
         if ext == "py":
+            python_exe = get_python_executable()
+            if not python_exe:
+                return "Python scripts are unavailable: no Python interpreter is installed."
             try:
                 result = subprocess.run(
-                    ["python", str(path)],
+                    [python_exe, str(path)],
                     capture_output=True, text=True, timeout=30
                 )
                 out = result.stdout or result.stderr

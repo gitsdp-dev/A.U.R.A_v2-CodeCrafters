@@ -366,15 +366,14 @@ def _live_call(contents, config, timeout_ms: int, key: str):
     return _Reply(text) if text else None
 
 
-def call(contents, tier: str = FAST, config=None,
-         timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = ""):
-    """Run one generation, walking the ladder until one answers.
+def _legacy_call(contents, tier: str = FAST, config=None,
+                 timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = ""):
+    """Run the pre-router generation ladder, retained for settings compatibility.
 
     Returns the SDK's own response object, so callers that need more than the
     text — grounding metadata, candidates, usage — still get it. Returns None
-    when every model on the ladder failed; the reason for each is printed, since
-    a silent None during a session nobody can debug is how the original problem
-    stayed hidden.
+    when every model on the ladder failed. Logs model/status metadata only;
+    provider error text can contain sensitive request details.
     """
     # `tier` is normally FAST or SMART. Anything else is taken to be an explicit
     # model name — screen_agent lets the user pick one in its settings — and it
@@ -412,25 +411,112 @@ def call(contents, tier: str = FAST, config=None,
                 print(f"[Gemini] {model}: out of quota — skipping it for "
                       f"{_COOLDOWN_SECONDS // 60} minutes")
             else:
-                print(f"[Gemini] {model}: {type(e).__name__}: {msg[:140]}")
+                status = getattr(e, "status_code", None)
+                print(
+                    f"[Gemini] {model} unavailable "
+                    f"({type(e).__name__}, status={status})"
+                )
     return None
 
 
+def call(contents, tier: str = FAST, config=None,
+         timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = "",
+         task_type: str | None = None, session=None, on_chunk=None,
+         critical: bool = False, raise_errors: bool = False):
+    """Route one-shot generation and preserve the SDK response shape."""
+    try:
+        import model_router
+    except Exception as error:
+        print(f"[Gemini] model router unavailable ({type(error).__name__})")
+        return _legacy_call(
+            contents, tier=tier, config=config, timeout_ms=timeout_ms, key=key
+        )
+
+    try:
+        response, _metadata = model_router.router.generate(
+            task_type,
+            contents,
+            config=config,
+            timeout_ms=timeout_ms,
+            key=key,
+            session=session,
+            on_chunk=on_chunk,
+            critical=critical,
+            legacy_tier=tier,
+        )
+        return response
+    except model_router.InvalidApiKeyError:
+        if raise_errors:
+            raise
+        return None
+    except model_router.RouterError as error:
+        print(f"[Gemini] routed generation stopped ({type(error).__name__})")
+        if raise_errors:
+            raise
+        return None
+    except Exception as error:
+        # SDK errors can include request URLs; never print exception contents.
+        print(f"[Gemini] routed generation failed ({type(error).__name__})")
+        if raise_errors:
+            raise
+        try:
+            return _legacy_call(
+                contents, tier=tier, config=config, timeout_ms=timeout_ms, key=key
+            )
+        except Exception as fallback_error:
+            print(f"[Gemini] legacy fallback failed ({type(fallback_error).__name__})")
+            return None
+
+
+def user_facing_error(error: Exception | None) -> str:
+    """Translate generation failures into safe, actionable user-facing text."""
+    try:
+        import model_router
+    except Exception:
+        return "The AI service could not complete this request. Please try again."
+
+    if isinstance(error, model_router.InvalidApiKeyError):
+        return (
+            "The Gemini API key was rejected. Check or replace it in API settings, "
+            "then retry."
+        )
+    if isinstance(error, model_router.RetryLaterError):
+        return (
+            "Gemini models are temporarily unavailable or rate-limited. "
+            "Please try again shortly."
+        )
+    if isinstance(error, model_router.RouterError):
+        if "not configured" in str(error).casefold():
+            return "Gemini is not configured. Add an API key in API settings, then retry."
+        return "Gemini could not start this request. Check the AI settings and try again."
+    return (
+        "The AI service could not complete this request. Check your connection "
+        "and model access, then try again."
+    )
+
+
 def text(contents, tier: str = FAST, config=None,
-         timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = "", default: str = "") -> str:
+         timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = "", default: str = "",
+         task_type: str | None = None, session=None,
+         critical: bool = False) -> str:
     """`call`, reduced to the reply text. `default` when nothing answered."""
     resp = call(contents, tier=tier, config=config,
-                timeout_ms=timeout_ms, key=key)
+                timeout_ms=timeout_ms, key=key, task_type=task_type,
+                session=session, critical=critical)
     if resp is None:
         return default
     return (getattr(resp, "text", None) or "").strip() or default
 
 
 def as_json(contents, tier: str = FAST, config=None,
-            timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = "", default=None):
+            timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = "", default=None,
+            task_type: str | None = None):
     """`text`, parsed as JSON, tolerating the fences and prose a model wraps it
     in. `default` when nothing answered or the answer would not parse."""
-    raw = text(contents, tier=tier, config=config, timeout_ms=timeout_ms, key=key)
+    raw = text(
+        contents, tier=tier, config=config, timeout_ms=timeout_ms, key=key,
+        task_type=task_type,
+    )
     if not raw:
         return default
     if "{" in raw and "}" in raw:

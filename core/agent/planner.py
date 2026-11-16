@@ -34,7 +34,13 @@ class GeminiPlanner:
             f"Previous error, if any: {error}\n"
         )
         response = await asyncio.to_thread(
-            gemini.text, prompt, gemini.SMART, None, self.timeout_ms
+            gemini.text,
+            prompt,
+            gemini.SMART,
+            None,
+            self.timeout_ms,
+            task_type="long_agent_plan",
+            critical=True,
         )
         if not response:
             raise RuntimeError("planner returned no response")

@@ -69,7 +69,7 @@ def _build_spec(request: str) -> dict:
     if not api_key:
         raise RuntimeError("no API key configured")
 
-    from google import genai
+    from core import gemini
     prompt = (
         "Convert the user's request into a spreadsheet specification.\n"
         f'USER REQUEST: "{request}"\n'
@@ -86,8 +86,14 @@ def _build_spec(request: str) -> dict:
         '"value_col":int,"title":string}.\n'
         "Keep it under 100 rows."
     )
-    client = genai.Client(api_key=api_key)
-    resp = client.models.generate_content(model=_MODEL, contents=prompt)
+    resp = gemini.call(
+        prompt,
+        tier=_MODEL,
+        task_type="long_reasoning",
+        key=api_key,
+    )
+    if resp is None:
+        raise RuntimeError("Gemini returned no spreadsheet specification.")
     text = (resp.text or "").strip()
     if "{" in text and "}" in text:
         text = text[text.find("{"): text.rfind("}") + 1]

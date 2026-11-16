@@ -6,6 +6,10 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from shlex import quote as shell_quote
+from xml.sax.saxutils import escape as xml_escape
+
+from compat import get_python_executable
 
 _CNW: dict = (
     {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -145,7 +149,11 @@ except Exception:
 
 def _schedule_windows(target_dt: datetime, task_name: str,
                       script_path: Path, message: str) -> str:
-    python_exe = Path(sys.executable)
+    interpreter = get_python_executable()
+    if not interpreter:
+        print("[Reminder] ❌ Cannot schedule reminder: Python interpreter unavailable.")
+        return ""
+    python_exe = Path(interpreter)
     pythonw = python_exe.parent / "pythonw.exe"
     if pythonw.exists():
         python_exe = pythonw
@@ -160,8 +168,8 @@ def _schedule_windows(target_dt: datetime, task_name: str,
         '    <Enabled>true</Enabled>\n'
         '  </TimeTrigger></Triggers>\n'
         '  <Actions><Exec>\n'
-        f'    <Command>{python_exe}</Command>\n'
-        f'    <Arguments>"{script_path}"</Arguments>\n'
+        f'    <Command>{xml_escape(str(python_exe))}</Command>\n'
+        f'    <Arguments>{xml_escape(subprocess.list2cmdline([str(script_path)]))}</Arguments>\n'
         '  </Exec></Actions>\n'
         '  <Settings>\n'
         '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
@@ -201,6 +209,10 @@ def _schedule_windows(target_dt: datetime, task_name: str,
 
 def _schedule_mac(target_dt: datetime, task_name: str,
                   script_path: Path) -> str:
+    interpreter = get_python_executable()
+    if not interpreter:
+        print("[Reminder] ❌ Cannot schedule reminder: Python interpreter unavailable.")
+        return ""
     agents_dir = Path.home() / "Library" / "LaunchAgents"
     agents_dir.mkdir(parents=True, exist_ok=True)
 
@@ -215,8 +227,8 @@ def _schedule_mac(target_dt: datetime, task_name: str,
   <key>Label</key>             <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{sys.executable}</string>
-    <string>{script_path}</string>
+    <string>{xml_escape(interpreter)}</string>
+    <string>{xml_escape(str(script_path))}</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -251,6 +263,10 @@ def _schedule_mac(target_dt: datetime, task_name: str,
 
 def _schedule_linux(target_dt: datetime, task_name: str,
                     script_path: Path) -> str:
+    interpreter = get_python_executable()
+    if not interpreter:
+        print("[Reminder] ❌ Cannot schedule reminder: Python interpreter unavailable.")
+        return ""
 
     if shutil.which("systemd-run"):
         on_calendar = target_dt.strftime("%Y-%m-%d %H:%M:00")
@@ -261,7 +277,7 @@ def _schedule_linux(target_dt: datetime, task_name: str,
                 f"--on-calendar={on_calendar}",
                 f"--unit={task_name}",
                 "--",
-                sys.executable, str(script_path),
+                interpreter, str(script_path),
             ],
             capture_output=True, text=True,
         )
@@ -271,7 +287,7 @@ def _schedule_linux(target_dt: datetime, task_name: str,
 
     if shutil.which("at"):
         at_time = target_dt.strftime("%H:%M %Y-%m-%d")
-        cmd_str = f"{sys.executable} {script_path}\n"
+        cmd_str = f"{shell_quote(interpreter)} {shell_quote(str(script_path))}\n"
         result  = subprocess.run(
             ["at", at_time],
             input=cmd_str, capture_output=True, text=True,

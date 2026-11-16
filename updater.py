@@ -36,6 +36,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from compat import get_python_executable
 from typing import Any, Callable, NamedTuple, Optional
 
 # ── PyQt6 imports (only the essentials; UI classes live below) ───────────────
@@ -964,8 +965,12 @@ def launch_helper(
 
     helper = _write_helper_script()
 
+    python_exe = get_python_executable(BASE_DIR)
+    if not python_exe:
+        log.error("Update helper cannot start: no Python interpreter is available.")
+        return
     args = [
-        sys.executable,
+        python_exe,
         str(helper),
         "--staging",  str(staging_dir),
         "--base",     str(BASE_DIR),

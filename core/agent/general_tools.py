@@ -14,6 +14,8 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+from compat import get_python_executable
 from urllib.parse import urlparse
 
 import requests
@@ -137,6 +139,7 @@ def screen_tool(parameters: dict, player=None) -> str:
             ],
             tier=gemini.SMART,
             timeout_ms=30_000,
+            task_type="tool_output_parsing",
         )
         try:
             action = json.loads(
@@ -219,7 +222,13 @@ def files_tool(parameters: dict, player=None) -> str:
             :30_000
         ]
     if suffix == ".pdf":
-        from PyPDF2 import PdfReader
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            try:
+                from PyPDF2 import PdfReader
+            except ImportError:
+                return "PDF reading is unavailable. Install pypdf to enable this feature."
 
         return "\n".join(
             page.extract_text() or "" for page in PdfReader(str(target)).pages
@@ -276,6 +285,7 @@ def web_research_tool(parameters: dict, player=None) -> str:
         ),
         tier=gemini.SMART,
         timeout_ms=60_000,
+        task_type="long_reasoning",
     )
     return (
         str(response or "")
@@ -307,8 +317,11 @@ def python_sandbox_tool(parameters: dict, player=None) -> str:
         script = Path(folder) / "main.py"
         script.write_text(code, encoding="utf-8")
         try:
+            python_exe = get_python_executable()
+            if not python_exe:
+                return "Python scripts are unavailable: no Python interpreter is installed."
             result = subprocess.run(
-                [sys.executable, "-I", str(script)],
+                [python_exe, "-I", str(script)],
                 check=False,
                 cwd=folder,
                 capture_output=True,

@@ -79,7 +79,12 @@ class GoalVerifier:
         )
         try:
             response = await asyncio.to_thread(
-                gemini.text, prompt, gemini.FAST, None, self.timeout_ms
+                gemini.text,
+                prompt,
+                gemini.FAST,
+                None,
+                self.timeout_ms,
+                task_type="tool_output_parsing",
             )
             data = json.loads(
                 str(response or "")

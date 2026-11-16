@@ -569,7 +569,10 @@ def _transcribe_gemini(data: bytes, mime: str) -> str:
          "spoken in. Reply with the transcription alone — no quotation marks, "
          "no translation, no commentary, no apology. If there is nothing "
          "intelligible in it, reply with nothing at all."],
-        timeout_ms=45_000, default="").strip()
+        timeout_ms=45_000,
+        default="",
+        task_type="short_summary",
+    ).strip()
 
 
 def transcribe(data: bytes, mime: str = "audio/ogg") -> str:

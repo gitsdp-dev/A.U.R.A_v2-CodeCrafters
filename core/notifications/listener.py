@@ -31,6 +31,15 @@ def _get_current_user_notification_listener(listener_type):
     raise RuntimeError("Windows notification listener has no current-instance API.")
 
 
+def _windows_toast_app_name(item) -> str:
+    """Read optional app metadata without discarding an otherwise valid toast."""
+    try:
+        return str(item.app_info.display_info.display_name or "Windows")
+    except (ImportError, AttributeError, RuntimeError):
+        LOGGER.debug("Windows toast app metadata is unavailable; using a generic name")
+        return "Windows"
+
+
 class NotificationListener:
     """Platform-selected listener; callbacks are always invoked off the UI thread."""
 
@@ -121,11 +130,18 @@ class NotificationListener:
         self._run_windows_database()
 
     def _run_windows_winrt(self) -> None:
-        from winsdk.windows.ui.notifications import NotificationKinds
-        from winsdk.windows.ui.notifications.management import (
-            UserNotificationListener,
-            UserNotificationListenerAccessStatus,
-        )
+        try:
+            from winrt.windows.ui.notifications import NotificationKinds
+            from winrt.windows.ui.notifications.management import (
+                UserNotificationListener,
+                UserNotificationListenerAccessStatus,
+            )
+        except ImportError:
+            from winsdk.windows.ui.notifications import NotificationKinds
+            from winsdk.windows.ui.notifications.management import (
+                UserNotificationListener,
+                UserNotificationListenerAccessStatus,
+            )
 
         async def fetch(listener):
             items = await listener.get_notifications_async(NotificationKinds.TOAST)
@@ -133,11 +149,10 @@ class NotificationListener:
             for item in items:
                 try:
                     toast = item.notification
-                    app = item.app_info.display_info.display_name
-                    results.append((
-                        str(item.id),
-                        _notification_from_winrt(toast, app or "Windows", item.id),
-                    ))
+                    app = _windows_toast_app_name(item)
+                    results.append(
+                        (str(item.id), _notification_from_winrt(toast, app, item.id))
+                    )
                 except Exception as exc:
                     self._seen.add(str(item.id))
                     LOGGER.warning("Could not decode a Windows toast: %s", exc)

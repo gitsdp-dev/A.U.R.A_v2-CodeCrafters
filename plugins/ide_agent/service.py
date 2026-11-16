@@ -179,7 +179,13 @@ class IDEAgentService:
             f"Project tree:\n{tree[:12000]}\n"
             f"Request:\n{request}\n"
         )
-        response = gemini.text(prompt, tier=gemini.SMART, timeout_ms=90_000)
+        response = gemini.text(
+            prompt,
+            tier=gemini.SMART,
+            timeout_ms=90_000,
+            task_type="multi_file_refactor",
+            critical=True,
+        )
         if not response:
             raise RuntimeError("Gemini returned no coding plan")
         payload = json.loads(response.strip().removeprefix("```json").removesuffix("```").strip())

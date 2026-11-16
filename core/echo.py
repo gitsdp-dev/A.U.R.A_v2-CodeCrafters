@@ -169,6 +169,11 @@ class EchoGuard:
         return _BLOCKS_NORMAL if self.reliable else _BLOCKS_NOISY
 
     @property
+    def user_speech_confirmed(self) -> bool:
+        """True after the required consecutive non-echo voice blocks."""
+        return self._run >= self.required_blocks
+
+    @property
     def last_similarity(self) -> float:
         """1.0 = fully explained by our own output, 0.0 = nothing to do with it."""
         return self._last_sim
@@ -212,6 +217,7 @@ class EchoGuard:
                 return False
             if not self._hist:
                 # Nothing playing that we know of — anything audible is theirs.
+                self._run += 1
                 return True
 
             t = time.monotonic() if when is None else when
@@ -239,6 +245,7 @@ class EchoGuard:
 
             # Nothing in the window explained it at all — that is not our sound.
             if best_level <= 0.0:
+                self._run += 1
                 return True
 
             # Learning happens in two stages, and the order matters both times.

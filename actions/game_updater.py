@@ -7,6 +7,10 @@ import time
 import subprocess
 import threading
 from pathlib import Path
+from shlex import quote as shell_quote
+from xml.sax.saxutils import escape as xml_escape
+
+from compat import get_python_executable
 from datetime import datetime
 
 from config import get_os, is_windows, is_mac, is_linux
@@ -812,10 +816,15 @@ def _schedule_daily_update(hour: int = 3, minute: int = 0) -> str:
 def _schedule_windows(hour: int, minute: int) -> str:
     task_name   = "JARVIS_GameUpdater"
     script_path = Path(__file__).resolve()
+    interpreter = get_python_executable()
+    if not interpreter:
+        return "Scheduling failed: Python interpreter unavailable."
     subprocess.run(["schtasks", "/Delete", "/TN", task_name, "/F"], capture_output=True, **_CNW)
     for extra in (["/RL", "HIGHEST", "/RU", "SYSTEM"], []):
         cmd    = ["schtasks", "/Create", "/TN", task_name,
-                  "/TR", f'"{sys.executable}" "{script_path}" --scheduled',
+                  "/TR", subprocess.list2cmdline(
+                      [interpreter, str(script_path), "--scheduled"]
+                  ),
                   "/SC", "DAILY", "/ST", f"{hour:02d}:{minute:02d}", "/F", *extra]
         result = subprocess.run(cmd, capture_output=True, text=True, **_CNW)
         if result.returncode == 0:
@@ -828,6 +837,9 @@ def _schedule_mac(hour: int, minute: int) -> str:
     plist_dir.mkdir(parents=True, exist_ok=True)
     plist_path  = plist_dir / "com.jarvis.gameupdater.plist"
     script_path = Path(__file__).resolve()
+    interpreter = get_python_executable()
+    if not interpreter:
+        return "Scheduling failed: Python interpreter unavailable."
     plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -835,8 +847,8 @@ def _schedule_mac(hour: int, minute: int) -> str:
     <key>Label</key><string>com.jarvis.gameupdater</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{sys.executable}</string>
-        <string>{script_path}</string>
+        <string>{xml_escape(interpreter)}</string>
+        <string>{xml_escape(str(script_path))}</string>
         <string>--scheduled</string>
     </array>
     <key>StartCalendarInterval</key>
@@ -860,8 +872,14 @@ def _schedule_mac(hour: int, minute: int) -> str:
 
 def _schedule_linux(hour: int, minute: int) -> str:
     script_path = Path(__file__).resolve()
+    interpreter = get_python_executable()
+    if not interpreter:
+        return "Scheduling failed: Python interpreter unavailable."
     marker      = "# JARVIS_GameUpdater"
-    cron_entry  = f"{minute} {hour} * * * {sys.executable} {script_path} --scheduled  {marker}"
+    cron_entry  = (
+        f"{minute} {hour} * * * {shell_quote(interpreter)} "
+        f"{shell_quote(str(script_path))} --scheduled  {marker}"
+    )
     try:
         existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
         lines    = [l for l in existing.stdout.splitlines()

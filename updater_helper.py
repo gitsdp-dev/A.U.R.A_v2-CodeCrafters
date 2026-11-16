@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from compat import get_python_executable
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,8 +290,11 @@ def main() -> int:  # noqa: C901
     if req_changed:
         log.info("requirements.txt changed — installing/updating dependencies…")
         try:
+            python_exe = get_python_executable(base)
+            if not python_exe:
+                raise RuntimeError("No Python interpreter is available for dependency installation.")
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-r", str(req_path)],
+                [python_exe, "-m", "pip", "install", "-r", str(req_path)],
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode != 0:
@@ -348,7 +352,11 @@ def main() -> int:  # noqa: C901
 
 def _relaunch(entry: Path, cwd: Path) -> None:
     """Relaunch A.U.R.A with the same Python interpreter, no console window."""
-    cmd = [sys.executable, str(entry)]
+    python_exe = get_python_executable(cwd)
+    if not python_exe:
+        log.error("A.U.R.A relaunch skipped: no Python interpreter is available.")
+        return
+    cmd = [python_exe, str(entry)]
     log.info("Relaunching: %s", " ".join(cmd))
 
     kw: dict = {"cwd": str(cwd)}

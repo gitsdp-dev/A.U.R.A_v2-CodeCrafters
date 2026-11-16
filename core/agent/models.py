@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from typing import Any
 
 
-class ToolRisk(StrEnum):
+class ToolRisk(str, Enum):
     """Risk categories used by the confirmation policy."""
 
     SAFE = "safe"
     CONFIRM = "confirm"
     DANGEROUS = "dangerous"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass(frozen=True, slots=True)

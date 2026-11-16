@@ -5,6 +5,8 @@ import re
 import time
 from pathlib import Path
 
+from compat import get_python_executable
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -22,19 +24,64 @@ from core import gemini
 MODEL_PLANNER    = gemini.SMART
 MODEL_WRITER     = gemini.SMART
 
+_PROJECT_BUILD_VERB = re.compile(
+    r"\b(?:build|create|make|develop|generate|code)\b", re.IGNORECASE
+)
+_PROJECT_BUILD_TARGET = re.compile(
+    r"\b(?:game|app|application|website|site|project|program)\b|"
+    r"\btic[\s-]?tac[\s-]?toe\b",
+    re.IGNORECASE,
+)
+_PROJECT_EXPLANATION = re.compile(
+    r"^(?:(?:can|could|would)\s+you\s+)?"
+    r"(?:how\s+(?:do|can|to)|explain|teach(?:\s+me)?|"
+    r"what\s+is|steps?\s+to)\b",
+    re.IGNORECASE,
+)
+
+
+def is_project_build_request(text: str) -> bool:
+    """Identify explicit requests to create a runnable project or game."""
+    request = " ".join(str(text or "").split())
+    return bool(
+        request
+        and not _PROJECT_EXPLANATION.search(request)
+        and _PROJECT_BUILD_VERB.search(request)
+        and _PROJECT_BUILD_TARGET.search(request)
+    )
+
+
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
 
 
-def _get_model(model_name: str = gemini.SMART):
+def _get_model(
+    model_name: str = gemini.SMART,
+    task_type: str = "vibe_coding",
+):
     """Planning and writing whole files — the reasoning tier, and a long
     deadline because the answer is a source file rather than a sentence."""
     class _W:
         def generate_content(self, contents):
-            resp = gemini.call(contents, tier=model_name, timeout_ms=60000)
+            try:
+                resp = gemini.call(
+                    contents,
+                    tier=model_name,
+                    timeout_ms=60000,
+                    task_type=task_type,
+                    critical=task_type in {
+                        "cad_design", "vibe_coding", "multi_file_refactor",
+                        "long_agent_plan"
+                    },
+                    raise_errors=True,
+                )
+            except Exception as error:
+                raise ModelGenerationError(
+                    gemini.user_facing_error(error)
+                ) from None
             if resp is None:
-                raise RuntimeError("every Gemini model on the ladder failed")
+                raise ModelGenerationError(gemini.user_facing_error(None))
             return resp
 
     return _W()
@@ -106,8 +153,12 @@ class RateLimitError(Exception):
     pass
 
 
+class ModelGenerationError(RuntimeError):
+    """A safe, actionable generation failure for project-build callers."""
+
+
 def _plan_project(description: str, language: str) -> dict:
-    model = _get_model(MODEL_PLANNER)
+    model = _get_model(MODEL_PLANNER, "long_agent_plan")
 
     prompt = f"""You are a senior software architect. Create a minimal, complete file plan for this project.
 
@@ -148,6 +199,8 @@ JSON:"""
         response = model.generate_content(prompt)
         raw = _strip_fences(response.text)
         return json.loads(raw)
+    except ModelGenerationError:
+        raise
     except json.JSONDecodeError as e:
         raise ValueError(f"Planner returned invalid JSON: {e}\nRaw: {response.text[:300]}")
     except Exception as e:
@@ -242,12 +295,15 @@ Code for {file_path}:"""
 def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     if not dependencies:
         return "No external dependencies."
+    python_exe = get_python_executable()
+    if not python_exe:
+        return "Cannot install dependencies: no Python interpreter is available."
 
     to_install = []
     for dep in dependencies:
         pkg_name = re.split(r"[>=<!]", dep)[0].strip()
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "show", pkg_name],
+            [python_exe, "-m", "pip", "show", pkg_name],
             capture_output=True, text=True
         )
         if result.returncode != 0:
@@ -261,7 +317,7 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     print(f"[DevAgent] 📦 Installing: {to_install}")
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install"] + to_install,
+            [python_exe, "-m", "pip", "install"] + to_install,
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=120, cwd=str(project_dir)
@@ -299,8 +355,15 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
     try:
         parts = run_command.split()
-        if parts[0].lower() == "python":
-            parts[0] = sys.executable
+        if parts[0].lower() in {"python", "py"}:
+            python_exe = get_python_executable()
+            if not python_exe:
+                return "Python command is unavailable: no Python interpreter is installed."
+            if parts[0].lower() == "py" and len(parts) > 1 and re.fullmatch(
+                r"-3\.\d+", parts[1]
+            ):
+                parts.pop(1)
+            parts[0] = python_exe
 
         result = subprocess.run(
             parts,
@@ -340,8 +403,11 @@ def _try_auto_install(error_output: str, project_dir: Path) -> bool:
     pkg = match.group(1).replace("_", "-").split(".")[0]
     print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
     try:
+        python_exe = get_python_executable()
+        if not python_exe:
+            return False
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", pkg],
+            [python_exe, "-m", "pip", "install", pkg],
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=60, cwd=str(project_dir)
@@ -360,7 +426,7 @@ def _fix_files(
     entry_point: str,
 ) -> dict[str, str]:
 
-    model = _get_model(MODEL_PLANNER)
+    model = _get_model(MODEL_PLANNER, "multi_file_refactor")
 
     error_file, error_line = _parse_traceback(error_output, list(file_codes.keys()))
     error_type = _classify_error(error_output)
@@ -456,6 +522,11 @@ def _build_project(
     log("Planning project structure...")
     try:
         plan = _plan_project(description, language)
+    except ModelGenerationError as error:
+        msg = f"Could not plan the project. {error}"
+        if speak:
+            speak(msg)
+        return msg
     except RateLimitError:
         msg = "Rate limit reached, sir. Please try again in a moment."
         if speak: speak(msg)
@@ -509,6 +580,13 @@ def _build_project(
                     time.sleep(20)
                 else:
                     log(f"Rate limit retry failed for {file_path}, skipping.")
+            except ModelGenerationError as error:
+                msg = f"Could not generate {file_path}. {error}"
+                if file_codes:
+                    msg += f" Files already generated are saved in {project_dir}."
+                if speak:
+                    speak(msg)
+                return msg
             except Exception as e:
                 log(f"Failed to write {file_path}: {e}")
                 break
@@ -569,6 +647,11 @@ def _build_project(
         except RateLimitError:
             msg = "Rate limit reached during fix. Project saved, check it manually in VSCode."
             if speak: speak(msg)
+            return msg
+        except ModelGenerationError as error:
+            msg = f"Could not finish fixing the project. {error} Project files remain in {project_dir}."
+            if speak:
+                speak(msg)
             return msg
         except Exception as e:
             log(f"Fix step failed: {e}")

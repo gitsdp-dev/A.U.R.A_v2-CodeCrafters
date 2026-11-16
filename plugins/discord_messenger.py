@@ -369,18 +369,21 @@ def _is_transient_error(e) -> bool:
     return any(s in msg for s in ("503", "unavailable", "overloaded", "429", "rate limit", "resource_exhausted"))
 
 
-def _generate_with_retry(client, model, contents, attempts=_RETRY_ATTEMPTS):
-    last_err = None
-    for attempt in range(attempts):
-        try:
-            return client.models.generate_content(model=model, contents=contents)
-        except Exception as e:
-            last_err = e
-            if _is_transient_error(e) and attempt < attempts - 1:
-                time.sleep(_RETRY_BASE_DELAY_S * (attempt + 1))
-                continue
-            raise
-    raise last_err
+def _generate_with_retry(client, model, contents, attempts=_RETRY_ATTEMPTS,
+                         api_key=None):
+    from core import gemini
+
+    task_type = "file_task" if model == _VISION_MODEL else "intent_parsing"
+    response = gemini.call(
+        contents,
+        tier=model,
+        task_type=task_type,
+        timeout_ms=30_000,
+        key=api_key or gemini.api_key(),
+    )
+    if response is None:
+        raise RuntimeError("Gemini returned no Discord response.")
+    return response
 
 
 # ── Window management & typing ───────────────────────────────────────────────
@@ -495,7 +498,6 @@ def _type_segments(segments):
 
 # ── Parsing for Message Sending ──────────────────────────────────────────────
 def _parse_request(request: str, api_key: str) -> dict:
-    from google import genai
     prompt = (
         "Extract the Discord destination and message content from this "
         "spoken request. The request may have typos (e.g. 'messange' "
@@ -530,8 +532,7 @@ def _parse_request(request: str, api_key: str) -> dict:
         "elements in order must form the full message with no extra "
         "characters between them."
     )
-    client = genai.Client(api_key=api_key)
-    resp = _generate_with_retry(client, _TEXT_MODEL, prompt)
+    resp = _generate_with_retry(None, _TEXT_MODEL, prompt, api_key=api_key)
     text = (resp.text or "").strip()
     if "{" in text and "}" in text:
         text = text[text.find("{"): text.rfind("}") + 1]
@@ -684,7 +685,6 @@ def _find_and_click_channel_by_name(channel: str) -> bool:
 
 
 def _vision_pick_channel_result(channel: str, server: str, api_key: str) -> dict:
-    from google import genai
     from google.genai import types as gtypes
 
     shot = _wait_for_real_content(max_wait=4)
@@ -713,11 +713,11 @@ def _vision_pick_channel_result(channel: str, server: str, api_key: str) -> dict
         "channel with that name in that server, results still loading, "
         "ambiguous/can't tell which server a row belongs to)."
     )
-    client = genai.Client(api_key=api_key)
     resp = _generate_with_retry(
-        client, _VISION_MODEL,
+        None, _VISION_MODEL,
         [gtypes.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"), prompt],
         attempts=1,
+        api_key=api_key,
     )
     text = (resp.text or "").strip()
     if "{" in text and "}" in text:
@@ -797,7 +797,6 @@ def _navigate_discord_destination(server: str, channel: str, contact: str, api_k
 
 # ── Vision Verification Before Sending Message ───────────────────────────────
 def _verify_before_send(destination: str, segments, api_key: str) -> dict:
-    from google import genai
     from google.genai import types as gtypes
 
     shot = _wait_for_real_content()
@@ -836,11 +835,11 @@ def _verify_before_send(destination: str, segments, api_key: str) -> dict:
         "search results still showing, a mention still shown as plain "
         "text instead of a highlighted ping, no Discord window visible)."
     )
-    client = genai.Client(api_key=api_key)
     resp = _generate_with_retry(
-        client, _VISION_MODEL,
+        None, _VISION_MODEL,
         [gtypes.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"), prompt],
         attempts=1,
+        api_key=api_key,
     )
     text = (resp.text or "").strip()
     if "{" in text and "}" in text:
@@ -1044,8 +1043,8 @@ class _RestEngine:
         self._instruction = user_instruction
 
     def check(self, jpg: bytes, recent: list) -> str:
-        from google import genai
         from google.genai import types as gtypes
+        from core import gemini
 
         prompt = (
             "You are an AI that has temporarily taken over the USER's side of "
@@ -1074,11 +1073,14 @@ class _RestEngine:
             "punctuation (no commas, no trailing period); no signatures, no "
             "AI mentions — else null."
         )
-        client = genai.Client(api_key=self._api_key)
-        resp = client.models.generate_content(
-            model=_REST_MODEL,
-            contents=[gtypes.Part.from_bytes(data=jpg, mime_type="image/jpeg"), prompt],
+        resp = gemini.call(
+            [gtypes.Part.from_bytes(data=jpg, mime_type="image/jpeg"), prompt],
+            tier=_REST_MODEL,
+            task_type="file_task",
+            key=self._api_key,
         )
+        if resp is None:
+            raise RuntimeError("Gemini returned no Discord screen analysis.")
         text = (resp.text or "").strip()
         if "{" in text and "}" in text:
             text = text[text.find("{"): text.rfind("}") + 1]
@@ -1314,7 +1316,6 @@ def _has_specific_takeover_target(text: str) -> bool:
 
 
 def _parse_takeover_request(request: str, api_key: str) -> dict:
-    from google import genai
     prompt = (
         "The user wants JARVIS to take over a Discord conversation and auto-reply. "
         "Extract any specific destination to navigate to, and any instructions for "
@@ -1327,8 +1328,7 @@ def _parse_takeover_request(request: str, api_key: str) -> dict:
         ' "instruction": extra instructions for how to reply (e.g. "tell them I am in a meeting", '
         '"be casual"), or null if no extra instructions were given.'
     )
-    client = genai.Client(api_key=api_key)
-    resp = _generate_with_retry(client, _TEXT_MODEL, prompt)
+    resp = _generate_with_retry(None, _TEXT_MODEL, prompt, api_key=api_key)
     text = (resp.text or "").strip()
     if "{" in text and "}" in text:
         text = text[text.find("{"): text.rfind("}") + 1]

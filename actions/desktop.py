@@ -142,7 +142,12 @@ Task: {task}"""
 
     try:
         from core import gemini
-        response = gemini.call(prompt, tier=gemini.SMART, timeout_ms=30_000)
+        response = gemini.call(
+            prompt,
+            tier=gemini.SMART,
+            timeout_ms=30_000,
+            task_type="code",
+        )
         if response is None:
             return "ERROR: every Gemini model on the ladder failed"
         code = (response.text or "").strip()

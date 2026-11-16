@@ -38,6 +38,7 @@ yt-dlp
 # ── Automation / input control ────────────────────────────────────────────────
 pyautogui
 pyperclip
+pynput>=1.7,<2
 
 # ── Vision & media ────────────────────────────────────────────────────────────
 pillow>=10,<13
@@ -74,15 +75,22 @@ pygetwindow                  # game_updater, chat_takeover — window geometry
 # ── Windows-only (pip skips these automatically on macOS / Linux) ─────────────
 comtypes;   sys_platform == "win32"
 pycaw;      sys_platform == "win32"
-win10toast; sys_platform == "win32"
 pywin32;    sys_platform == "win32"
 wmi;        sys_platform == "win32"
-winsdk;     sys_platform == "win32"
 screen-brightness-control; sys_platform == "win32"
+winrt-Windows.Devices.Radios; sys_platform == "win32" and python_version >= "3.11"
+winrt-Windows.ApplicationModel; sys_platform == "win32" and python_version >= "3.11"
+winrt-Windows.UI.Notifications; sys_platform == "win32" and python_version >= "3.11"
+winrt-Windows.UI.Notifications.Management; sys_platform == "win32" and python_version >= "3.11"
 # pywinauto drives the Windows accessibility tree. Three plugins read it:
 # screen_agent (to aim without a model call), the WhatsApp pair, and
 # game_updater (Steam's install dialog).
 pywinauto;  sys_platform == "win32"
+
+# macOS background-mode permissions and native menu-bar/window integration.
+pyobjc-framework-AVFoundation; sys_platform == "darwin"
+pyobjc-framework-Quartz; sys_platform == "darwin"
+pyobjc-framework-Cocoa; sys_platform == "darwin"
 
 # ── Linux-only notification monitoring ───────────────────────────────────────
 dbus-next;  sys_platform == "linux"
@@ -94,24 +102,17 @@ ddgs>=9,<10                  # web_search — the maintained successor to
                              # duckduckgo-search, which is tried first and
                              # falls back to the old name automatically
 pdfplumber                   # file_processor — PDF text and tables
-PyPDF2                       # file_processor — PDF fallback reader
+pypdf                        # file_processor — PDF fallback reader
 python-docx                  # file_processor — .docx reading
 reportlab>=4,<5              # workflows — optional YouTube PDF export
 # NVIDIA GPU metrics use the driver's NVML library directly through ctypes.
 
-# ── Optional: heavy extras, install only if you want the feature ──────────────
-# Left out on purpose — together they are several hundred megabytes, which is a
-# lot to download for a fresh clone that may never use them.
-#
-#   pip install pandas       # file_processor: spreadsheet/CSV analysis
-#   pip install pydub        # file_processor: audio metadata and conversion
-#                            #   (also needs ffmpeg on PATH for most formats)
-#   pip install mediapipe    # pushup_counter: elbow-angle rep detection
+# Optional audio converters and Windows browser/notification bridges live in
+# requirements-optional.txt; FFmpeg itself must be installed as a system binary.
 
-# ── Optional: local wake word ("Hey Jarvis") ──────────────────────────────────
-# Deliberately NOT installed by default — it's opt-in. Enable it (and download
-# the tiny model) with one click from ⚙ → WAKE WORD in the app, or install it
-# yourself with:  pip install openwakeword
+# ── Offline background wake word ("Hey AURA") ─────────────────────────────────
+# Vosk is the CPU-friendly offline recognizer used by background_assistant.py.
+# Wake listening is enabled by default and can be disabled in Customize settings.
 #
 # macOS / Linux OS actions (volume, brightness, reminders) shell out to native
 # tools (pactl / brightnessctl / osascript / systemd), so no extra Python
@@ -119,7 +120,7 @@ reportlab>=4,<5              # workflows — optional YouTube PDF export
 
 vosk>=0.3.45,<1
 av
-kokoro
+kokoro; python_version < "3.13"
 kokoro-onnx
 smolagents
 litellm
@@ -133,10 +134,3 @@ miniaudio
 
 flake8
 ruff
-ffmpeg
-ffprobe
-
-
-# Web Browser integration for Edge and Chrome (Windows only)
-pywebview; sys_platform == "win32"
-pythonnet; sys_platform == "win32"

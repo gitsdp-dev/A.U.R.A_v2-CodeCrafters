@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from compat import get_python_executable
+
 
 def _report_elevation_failure(message: str) -> None:
     if sys.stderr is not None:
@@ -40,7 +42,13 @@ def ensure_windows_administrator() -> None:
 
     arguments = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
     parameters = subprocess.list2cmdline(arguments)
-    executable = sys.executable
+    frozen = bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
+    executable = sys.executable if frozen else get_python_executable()
+    if not executable:
+        _report_elevation_failure(
+            "No Python interpreter is available to restart A.U.R.A."
+        )
+        raise SystemExit(1)
     working_directory = str(Path.cwd())
     shell_execute = ctypes.windll.shell32.ShellExecuteW
     shell_execute.argtypes = [

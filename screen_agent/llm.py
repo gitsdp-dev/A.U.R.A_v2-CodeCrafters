@@ -291,58 +291,65 @@ class GeminiBackend:
 
     def next_action(self, goal: str, observation: Observation) -> dict[str, Any]:
         user_text = _prompt(goal, observation, self.token_budget)
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model}:generateContent"
-        )
-        payload = {
-            "systemInstruction": {"parts": [{"text": STATIC_SYSTEM_PROMPT}]},
-            "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": _GEMINI_ACTION_SCHEMA,
-                "temperature": 0,
-                "maxOutputTokens": 60,
-            },
-        }
-        for attempt in range(3):
+        def generate(model: str, _contents, _config, key: str, timeout_ms: int):
             if self.cancel_event.is_set():
                 raise ScreenLLMError("Screen Agent was stopped.")
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent"
+            )
+            payload = {
+                "systemInstruction": {"parts": [{"text": STATIC_SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "responseSchema": _GEMINI_ACTION_SCHEMA,
+                    "temperature": 0,
+                    "maxOutputTokens": 60,
+                },
+            }
             try:
                 response = _post_cancellable(
                     self.session,
                     self.cancel_event,
-                    self.timeout,
+                    min(self.timeout, max(1.0, timeout_ms / 1000)),
                     url,
-                    params={"key": self.api_key},
+                    params={"key": key},
                     json=payload,
                 )
-            except (requests.RequestException, ScreenLLMError) as exc:
-                if isinstance(exc, ScreenLLMError):
-                    raise
-                raise ScreenLLMError(
-                    f"Gemini request failed ({type(exc).__name__})."
-                ) from exc
-            if response.status_code == 429 or 500 <= response.status_code < 600:
-                if attempt == 2:
-                    raise ScreenLLMError(
-                        f"Gemini is temporarily unavailable (HTTP {response.status_code})."
-                    )
-                if self.cancel_event.wait(min(0.5 * (2**attempt), 2.0)):
-                    raise ScreenLLMError("Screen Agent was stopped.")
-                continue
-            try:
                 response.raise_for_status()
-                body = response.json()
+                return response.json()
+            except ScreenLLMError:
+                raise
             except (requests.RequestException, ValueError) as exc:
+                if isinstance(exc, requests.HTTPError):
+                    raise
                 raise ScreenLLMError(
                     f"Gemini returned an invalid response ({type(exc).__name__})."
                 ) from exc
-            try:
-                content = body["candidates"][0]["content"]["parts"][0]["text"]
-            except (KeyError, IndexError, TypeError) as exc:
-                raise ScreenLLMError("Gemini returned no structured action.") from exc
-            if not isinstance(content, str):
-                raise ScreenLLMError("Gemini returned a non-text action.")
-            return _action_from_json(content, observation)
-        raise ScreenLLMError("Gemini did not return an action.")
+
+        try:
+            from model_router import router
+
+            body, _metadata = router.generate(
+                "tool_output_parsing",
+                user_text,
+                key=self.api_key,
+                timeout_ms=int(self.timeout * 1000),
+                legacy_tier=self.model,
+                generator=generate,
+                allow_local_fallback=False,
+            )
+        except Exception as exc:
+            if isinstance(exc, ScreenLLMError):
+                raise
+            raise ScreenLLMError(
+                f"Gemini is temporarily unavailable ({type(exc).__name__})."
+            ) from exc
+        try:
+            content = body["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ScreenLLMError("Gemini returned no structured action.") from exc
+        if not isinstance(content, str):
+            raise ScreenLLMError("Gemini returned a non-text action.")
+        return _action_from_json(content, observation)

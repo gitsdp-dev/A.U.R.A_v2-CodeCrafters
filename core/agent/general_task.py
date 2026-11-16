@@ -88,7 +88,13 @@ class GeneralTaskService:
             f"Saved plan starting point: {json.dumps(suggestion or {}, default=str)[:4000]}"
         )
         response = await asyncio.to_thread(
-            gemini.text, prompt, gemini.SMART, None, 45_000
+            gemini.text,
+            prompt,
+            gemini.SMART,
+            None,
+            45_000,
+            task_type="long_agent_plan",
+            critical=True,
         )
         if not response:
             raise RuntimeError("planner returned no response")
