@@ -104,3 +104,8 @@ ENV/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+
+# ── Miscellaneous ─────────────────────────────────────────────────────────────
+*.tmp
+neural_cache/
