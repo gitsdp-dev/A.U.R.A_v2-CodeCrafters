@@ -39,7 +39,7 @@ _SERVER_NAME = (
     else "aura-v2-single-instance"
 )
 _WAKE_PATTERN = re.compile(
-    r"\bhey\s+(?:aura|ora|orra|aurora|a\s*u\s*r\s*a)\b",
+    r"\b(?:hey\s+|hi\s+|ok\s+|okay\s+)?(?:aura|ora|orra|aurora|a\s*u\s*r\s*a)\b",
     re.IGNORECASE,
 )
 _WAKE_GREETING = "Hey, how can I help you today?"
@@ -205,6 +205,11 @@ class WakeWordListener:
                         "hey orra",
                         "hey aurora",
                         "hey a u r a",
+                        "aura",
+                        "ora",
+                        "orra",
+                        "aurora",
+                        "a u r a",
                         "[unk]",
                     ]),
                 )
@@ -220,11 +225,20 @@ class WakeWordListener:
             return
 
         frames: queue.Queue[bytes] = queue.Queue(maxsize=24)
+        stream_rate = 16000
 
         def audio_callback(indata, _frames, _time_info, status):
             if status:
                 _LOG.warning("Wake-word microphone status: %s", status)
             data = bytes(indata)
+            # [AURA-FEATURE: clap-detection]
+            try:
+                from aura_features import get_feature_registry
+                _clap = get_feature_registry().clap_detector
+                if _clap is not None:
+                    _clap.process_pcm_frame(data, stream_rate)
+            except Exception:
+                pass
             try:
                 frames.put_nowait(data)
             except queue.Full:
@@ -489,6 +503,7 @@ class BackgroundController(QObject):
             self._background_text_activity
         )
         self.ui._win._background_hidden_sig.connect(self._main_window_hidden)
+        self.ui._win._background_shown_sig.connect(self._main_window_shown)
         self.ui._win._background_settings_sig.connect(self._settings_changed)
         self._timer = QTimer(self)
         self._timer.setInterval(500)
@@ -524,16 +539,47 @@ class BackgroundController(QObject):
 
     def _show_main_window(self) -> None:
         platform_bg.configure_background_app(False)
-        self.ui._win._show_window_sig.emit()
-        self.aura.set_background_idle_mode(False)
-        if self._overlay_active:
-            self._dismiss_overlay("main window opened", cancel_session=False)
-        if (
-            not self.paused
-            and self.aura.is_waiting_for_wake()
-        ):
+        if hasattr(self.aura, "set_background_idle_mode"):
+            self.aura.set_background_idle_mode(False)
+        if hasattr(self, "_stop_wake_listener"):
             self._stop_wake_listener()
+        if hasattr(self.ui, "_win") and hasattr(self.ui._win, "_show_window_sig"):
+            self.ui._win._show_window_sig.emit()
+        if getattr(self, "_overlay_active", False) and hasattr(self, "_dismiss_overlay"):
+            self._dismiss_overlay("main window opened", cancel_session=False)
+        if hasattr(self, "_stop_wake_listener"):
+            self._stop_wake_listener()
+        if (
+            not getattr(self, "paused", False)
+            and hasattr(self.aura, "is_waiting_for_wake")
+            and self.aura.is_waiting_for_wake()
+            and hasattr(self.aura, "wake_from_word")
+        ):
             self.aura.wake_from_word()
+        if hasattr(self.ui, "set_state"):
+            self.ui.set_state("LISTENING")
+
+    def _main_window_shown(self) -> None:
+        if hasattr(self, "app") and self.app.property("_aura_quitting"):
+            return
+        platform_bg.configure_background_app(False)
+        if hasattr(self.aura, "set_background_idle_mode"):
+            self.aura.set_background_idle_mode(False)
+        if hasattr(self, "_stop_wake_listener"):
+            self._stop_wake_listener()
+        if getattr(self, "_overlay_active", False) and hasattr(self, "_dismiss_overlay"):
+            self._dismiss_overlay("main window shown", cancel_session=False)
+        if hasattr(self, "_stop_wake_listener"):
+            self._stop_wake_listener()
+        if (
+            not getattr(self, "paused", False)
+            and hasattr(self.aura, "is_waiting_for_wake")
+            and self.aura.is_waiting_for_wake()
+            and hasattr(self.aura, "wake_from_word")
+        ):
+            self.aura.wake_from_word()
+        if hasattr(self.ui, "set_state"):
+            self.ui.set_state("LISTENING")
 
     def _show_tray_fallback(self) -> None:
         if self.app.property("_aura_quitting"):
@@ -596,8 +642,9 @@ class BackgroundController(QObject):
         if self._overlay_active and active:
             self._overlay_had_session = True
         self._maybe_auto_hide()
+        bg_idle = getattr(self.aura, "_background_idle_mode", False)
         should_listen_for_wake = (
-            (self.background_mode or self.aura.is_waiting_for_wake())
+            bg_idle
             and ready
             and get_wake_word_enabled()
             and not self.paused
@@ -647,10 +694,8 @@ class BackgroundController(QObject):
         if self.paused or self.app.property("_aura_quitting"):
             return False
         orb = self.ui._win._background_orb
-        if self._overlay_active and orb.isVisible():
+        if self._overlay_active and getattr(orb, "isVisible", lambda: False)():
             return True
-        if self.ui._win.isVisible():
-            return False
         self._overlay_active = True
         self._overlay_had_session = self.aura.is_session_active()
         self._overlay_started_at = time.monotonic()
@@ -667,7 +712,7 @@ class BackgroundController(QObject):
             self._hook.orb_visible()
         except Exception:  # noqa: BLE001
             _LOG.exception("orb_visible failed")
-        if not orb.isVisible():
+        if hasattr(orb, "isVisible") and not orb.isVisible():
             _LOG.warning("Background orb was requested but is not visible")
         self._update_tray_status(self.aura.is_session_active())
         return True

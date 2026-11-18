@@ -75,6 +75,6 @@ def ensure_windows_administrator() -> None:
             if error_code == 1223
             else f"Windows could not start A.U.R.A. with administrator rights (code {result})."
         )
-        _report_elevation_failure(reason)
-        raise SystemExit(1)
+        _report_elevation_failure(f"{reason} Continuing with standard user privileges.")
+        return
     raise SystemExit(0)

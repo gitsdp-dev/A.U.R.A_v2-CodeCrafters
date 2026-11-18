@@ -816,3 +816,100 @@ def save_plugin_enabled(plugin_name: str, enabled: bool) -> None:
     plugins_cfg[plugin_name] = enabled
     data["plugins_enabled"] = plugins_cfg
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+# [AURA-FEATURE: presence-awareness]
+def get_presence_config() -> dict:
+    """Return presence awareness settings with backwards-compatible defaults."""
+    cfg = load_api_keys().get("presence_awareness")
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "allow_critical_while_away": bool(cfg.get("allow_critical_while_away", True)),
+        "speak_summary_on_return": bool(cfg.get("speak_summary_on_return", True)),
+        "auto_unlock_enabled": bool(cfg.get("auto_unlock_enabled", True)),
+        "unlock_auth_type": str(cfg.get("unlock_auth_type", "hello")),
+        "unlock_credential": str(cfg.get("unlock_credential", "")),
+    }
+
+
+def save_presence_config(values: dict) -> dict:
+    """Persist presence awareness settings to config."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    cur = data.get("presence_awareness")
+    if not isinstance(cur, dict):
+        cur = {}
+    cur.update(values)
+    data["presence_awareness"] = cur
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    return get_presence_config()
+
+
+# [AURA-FEATURE: conversation-recall]
+def get_chat_memory_config() -> dict:
+    """Return local conversation recall settings with backwards-compatible defaults."""
+    cfg = load_api_keys().get("chat_memory")
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "paused": bool(cfg.get("paused", False)),
+        "retention_days": int(cfg.get("retention_days", 90)),
+    }
+
+
+def save_chat_memory_config(values: dict) -> dict:
+    """Persist conversation recall settings to config."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    cur = data.get("chat_memory")
+    if not isinstance(cur, dict):
+        cur = {}
+    cur.update(values)
+    data["chat_memory"] = cur
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    return get_chat_memory_config()
+
+
+# [AURA-FEATURE: clap-detection]
+def get_clap_config() -> dict:
+    """Return clap detection and animation settings with backwards-compatible defaults."""
+    cfg = load_api_keys().get("clap_settings")
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "sensitivity": float(cfg.get("sensitivity", 0.65)),
+        "allow_in_foreground": bool(cfg.get("allow_in_foreground", False)),
+        "reduce_motion": bool(cfg.get("reduce_motion", False)),
+    }
+
+
+def save_clap_config(values: dict) -> dict:
+    """Persist clap settings to config."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    cur = data.get("clap_settings")
+    if not isinstance(cur, dict):
+        cur = {}
+    cur.update(values)
+    data["clap_settings"] = cur
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    return get_clap_config()

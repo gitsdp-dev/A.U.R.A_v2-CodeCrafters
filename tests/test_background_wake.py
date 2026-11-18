@@ -140,3 +140,101 @@ def test_reconcile_keeps_orb_open_when_connection_takes_longer_than_timeout():
 
     assert controller._overlay_active is True
     assert not hasattr(controller, "dismissed")
+
+
+def test_main_window_shown_stops_wake_listener_and_wakes_engine():
+    stopped = []
+    woken = []
+    state = []
+    controller = SimpleNamespace(
+        app=SimpleNamespace(property=lambda _name: False),
+        ui=SimpleNamespace(set_state=lambda s: state.append(s)),
+        aura=SimpleNamespace(
+            set_background_idle_mode=lambda enabled: setattr(controller, "idle_mode", enabled),
+            is_waiting_for_wake=lambda: True,
+            wake_from_word=lambda: woken.append(True),
+        ),
+        _stop_wake_listener=lambda: stopped.append(True),
+        _overlay_active=False,
+        paused=False,
+    )
+
+    BackgroundController._main_window_shown(controller)
+
+    assert controller.idle_mode is False
+    assert len(stopped) >= 1
+    assert woken == [True]
+    assert state == ["LISTENING"]
+
+
+def test_reconcile_does_not_listen_when_main_window_is_active():
+    started = []
+    window = SimpleNamespace(_ready=True, _face_gate=SimpleNamespace(is_set=lambda: True), isVisible=lambda: True)
+    controller = SimpleNamespace(
+        app=SimpleNamespace(property=lambda _name: False),
+        ui=SimpleNamespace(_win=window),
+        aura=SimpleNamespace(
+            _background_idle_mode=False,
+            is_session_active=lambda: False,
+            is_waiting_for_wake=lambda: False,
+        ),
+        _overlay_active=False,
+        background_mode=True,
+        paused=False,
+        _listener_blocked=False,
+        _wake_listener=None,
+        _maybe_auto_hide=lambda: None,
+        _create_wake_listener=lambda s: started.append(s),
+        _stop_wake_listener=lambda: None,
+        _update_tray_status=lambda _active: None,
+    )
+
+    BackgroundController._reconcile(controller)
+
+    assert len(started) == 0
+
+
+def test_clap_wake_activates_engine_and_hud():
+    from aura_features import FeatureRegistry
+    registry = FeatureRegistry()
+
+    woken = []
+    bg_shown = []
+    hud_timer_started = []
+    state_set = []
+
+    hud_tmr = SimpleNamespace(
+        isActive=lambda: False,
+        start=lambda: hud_timer_started.append(True),
+    )
+    win = SimpleNamespace(
+        isMinimized=lambda: False,
+        isVisible=lambda: True,
+        showNormal=lambda: None,
+        activateWindow=lambda: None,
+        raise_=lambda: None,
+        hud=SimpleNamespace(_tmr=hud_tmr),
+    )
+    ui = SimpleNamespace(
+        _win=win,
+        show_cinematic_opening=lambda: None,
+        set_state=lambda s: state_set.append(s),
+    )
+    aura = SimpleNamespace(
+        set_background_idle_mode=lambda enabled: setattr(aura, "idle_mode", enabled),
+        is_waiting_for_wake=lambda: True,
+        wake_from_word=lambda: woken.append(True),
+        warmup_engine=lambda: None,
+    )
+    bg_controller = SimpleNamespace(
+        _stop_wake_listener=lambda: None,
+        _show_main_window=lambda: bg_shown.append(True),
+    )
+
+    registry._on_double_clap(None, ui, aura, bg_controller)
+
+    assert bg_shown == [True]
+    assert woken == [True]
+    assert aura.idle_mode is False
+    assert hud_timer_started == [True]
+    assert state_set == ["LISTENING"]

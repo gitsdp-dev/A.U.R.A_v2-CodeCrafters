@@ -108,4 +108,4 @@ desktop.ini
 
 # ── Miscellaneous ─────────────────────────────────────────────────────────────
 *.tmp
-neural_cache/
+**/neural_cache/

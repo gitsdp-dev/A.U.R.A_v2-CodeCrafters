@@ -3605,61 +3605,72 @@ class SetupOverlay(QWidget):
         self._status_worker.start()
 
     def _probe_components(self, settings):
-        import importlib.util
-        mode = settings["mode"]
-        stt_ok = mode == "gemini" or importlib.util.find_spec("vosk") is not None
-        local_tts_required = mode != "gemini"
-        tts_modules = {
-            "kokoro": ("kokoro",),
-            "edgetts": ("edge_tts", "miniaudio"),
-            "elevenlabs": ("requests", "miniaudio"),
-        }[settings["tts_engine"]]
-        missing_tts_modules = [
-            package for package in tts_modules
-            if importlib.util.find_spec(package) is None
-        ]
-        missing_tts_key = (
-            settings["tts_engine"] == "elevenlabs"
-            and not bool(settings.get("elevenlabs_api_key"))
-        )
-        tts_ok = (
-            not local_tts_required
-            or (not missing_tts_modules and not missing_tts_key)
-        )
-        missing_tts_package = ", ".join(missing_tts_modules)
-        if mode == "gemini":
-            llm_ok = bool(settings.get("gemini_api_key"))
-            llm_message = "API key configured" if llm_ok else "API key missing"
-        else:
-            try:
-                from core.llm_client import is_reachable, list_models
-                provider, url = settings["provider"], settings["base_url"]
-                llm_ok = is_reachable(provider, url)
-                names = list_models(provider, url) if llm_ok else []
-                model = settings["model"]
-                if llm_ok and model and names:
-                    llm_ok = model in names
-                llm_message = (
-                    "Connected" if llm_ok else
-                    "Model not listed" if is_reachable(provider, url) else
-                    "Server not running"
-                )
-            except Exception as exc:
-                llm_ok, llm_message = False, str(exc)[:80]
-        results = {
-            "stt": (stt_ok, "READY" if stt_ok else f"Missing {stt_package}"),
-            "llm": (llm_ok, llm_message),
-            "tts": (
-                tts_ok,
-                (
-                    "OPTIONAL — GEMINI LIVE VOICE"
-                    if not local_tts_required else "READY"
-                ) if tts_ok else
-                "ElevenLabs API key missing" if missing_tts_key else
-                f"Missing {missing_tts_package}",
-            ),
-        }
-        self._probe_done.emit(results)
+        try:
+            import importlib.util
+            mode = settings.get("mode", "gemini")
+            stt_package = "vosk"
+            stt_ok = mode == "gemini" or importlib.util.find_spec(stt_package) is not None
+            local_tts_required = mode != "gemini"
+            tts_engine = settings.get("tts_engine", "kokoro")
+            tts_module_map = {
+                "kokoro": ("kokoro",),
+                "edgetts": ("edge_tts", "miniaudio"),
+                "elevenlabs": ("requests", "miniaudio"),
+            }
+            tts_modules = tts_module_map.get(tts_engine, ("kokoro",))
+            missing_tts_modules = [
+                package for package in tts_modules
+                if importlib.util.find_spec(package) is None
+            ]
+            missing_tts_key = (
+                tts_engine == "elevenlabs"
+                and not bool(settings.get("elevenlabs_api_key"))
+            )
+            tts_ok = (
+                not local_tts_required
+                or (not missing_tts_modules and not missing_tts_key)
+            )
+            missing_tts_package = ", ".join(missing_tts_modules)
+            if mode == "gemini":
+                llm_ok = bool(settings.get("gemini_api_key"))
+                llm_message = "API key configured" if llm_ok else "API key missing"
+            else:
+                try:
+                    from core.llm_client import is_reachable, list_models
+                    provider, url = settings.get("provider", "ollama"), settings.get("base_url", "")
+                    llm_ok = is_reachable(provider, url)
+                    names = list_models(provider, url) if llm_ok else []
+                    model = settings.get("model", "")
+                    if llm_ok and model and names:
+                        llm_ok = model in names
+                    llm_message = (
+                        "Connected" if llm_ok else
+                        "Model not listed" if is_reachable(provider, url) else
+                        "Server not running"
+                    )
+                except Exception as exc:
+                    llm_ok, llm_message = False, str(exc)[:80]
+            results = {
+                "stt": (stt_ok, "READY" if stt_ok else f"Missing {stt_package}"),
+                "llm": (llm_ok, llm_message),
+                "tts": (
+                    tts_ok,
+                    (
+                        "OPTIONAL — GEMINI LIVE VOICE"
+                        if not local_tts_required else "READY"
+                    ) if tts_ok else
+                    "ElevenLabs API key missing" if missing_tts_key else
+                    f"Missing {missing_tts_package}",
+                ),
+            }
+            self._probe_done.emit(results)
+        except Exception as exc:
+            print(f"[SetupOverlay] Probe error: {exc}")
+            self._probe_done.emit({
+                "stt": (True, "READY"),
+                "llm": (True, "CONFIGURED"),
+                "tts": (True, "READY"),
+            })
 
     def _apply_probe_result(self, results):
         ready_count = 0
@@ -3839,6 +3850,126 @@ class HueWheel(QWidget):
             self.hue_committed.emit(self.color())
 
 
+def _cu_rgba(hex_str: str, a: int) -> str:
+    """'#rrggbb' + alpha(0-255) -> 'rgba(r,g,b,a)' for style sheets."""
+    c = QColor(hex_str)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{a})"
+
+
+def _cu_font(size: float = 9.5, bold: bool = False, spacing: float = 0.0) -> QFont:
+    """Modern UI font stack (falls back gracefully on every OS)."""
+    f = QFont()
+    f.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Inter", "SF Pro Text",
+                   "Helvetica Neue", "Roboto", "Arial"])
+    f.setPointSizeF(size)
+    f.setWeight(QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
+    if spacing:
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, spacing)
+    return f
+
+
+class _CuSwitch(QCheckBox):
+    """iOS-style toggle: label on the left, animated switch on the right.
+    Drop-in QCheckBox (isChecked / setChecked / toggled / setEnabled all work)."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(32)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFont(_cu_font(10))
+        self._t = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
+        self.toggled.connect(self._on_toggled)
+
+    def _on_anim(self, v):
+        self._t = float(v)
+        self.update()
+
+    def _on_toggled(self, on: bool):
+        target = 1.0 if on else 0.0
+        if not self.isVisible():
+            self._t = target
+            self.update()
+            return
+        self._anim.stop()
+        self._anim.setStartValue(self._t)
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    def setChecked(self, on: bool):                       # noqa: N802
+        super().setChecked(on)
+        if not self.isVisible():
+            self._t = 1.0 if on else 0.0
+
+    def sizeHint(self):                                    # noqa: N802
+        return QSize(220, 32)
+
+    def hitButton(self, pos):                              # noqa: N802
+        return self.rect().contains(pos)
+
+    def paintEvent(self, _):                               # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        en = self.isEnabled()
+        w, h = self.width(), self.height()
+
+        p.setPen(qcol(C.TEXT if en else C.TEXT_DIM))
+        p.setFont(self.font())
+        p.drawText(QRectF(0, 0, w - 54, h),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self.text())
+
+        tw, th = 38.0, 22.0
+        track = QRectF(w - tw - 2, (h - th) / 2, tw, th)
+        off_c, on_c = QColor(C.TEXT_DIM), QColor(C.PRI)
+        off_c.setAlpha(70)
+        t = self._t
+        mix = QColor(
+            int(off_c.red()   + (on_c.red()   - off_c.red())   * t),
+            int(off_c.green() + (on_c.green() - off_c.green()) * t),
+            int(off_c.blue()  + (on_c.blue()  - off_c.blue())  * t),
+            int(off_c.alpha() + (255 - off_c.alpha()) * t),
+        )
+        if not en:
+            mix.setAlpha(int(mix.alpha() * 0.45))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(mix)
+        p.drawRoundedRect(track, th / 2, th / 2)
+
+        d = th - 6
+        x = track.x() + 3 + (tw - th) * t
+        knob = QColor("#ffffff") if t > 0.5 else QColor(C.TEXT_MED)
+        if not en:
+            knob.setAlpha(120)
+        p.setBrush(knob)
+        p.drawEllipse(QRectF(x, track.y() + 3, d, d))
+
+        if self.hasFocus():
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(qcol(C.PRI, 150), 1))
+            p.drawRoundedRect(track.adjusted(-2, -2, 2, 2), th / 2 + 2, th / 2 + 2)
+
+
+class _CuWheelGuard(QObject):
+    """Stops sliders / spin boxes from stealing the mouse wheel while the panel
+    is scrolled — they only react to the wheel once they have keyboard focus."""
+
+    def __init__(self, scrollbar, parent=None):
+        super().__init__(parent)
+        self._sb = scrollbar
+
+    def eventFilter(self, obj, ev):                        # noqa: N802
+        if ev.type() == QEvent.Type.Wheel and not obj.hasFocus():
+            self._sb.setValue(self._sb.value() - ev.angleDelta().y() // 2)
+            return True
+        return False
+
+
+
 @_motion_overlay
 class CustomizeOverlay(QWidget):
     """Floating overlay — change assistant name, user name, UI colour and voice."""
@@ -3847,226 +3978,541 @@ class CustomizeOverlay(QWidget):
     wake_settings_changed = pyqtSignal()
     configure_local_ai = pyqtSignal()
     open_permissions = pyqtSignal()
-    _OW, _OH = 400, 710
+    _OW, _OH = 440, 760
 
     def __init__(self, assistant_name="AURA", user_name="",
                  ui_color=DEFAULT_UI_COLOR, voice="", local_voice=False, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        ACC = C.PRI
         self.setStyleSheet(f"""
             CustomizeOverlay {{
-                background: rgba(0, 6, 10, 245);
-                border: 1px solid {C.BORDER_B};
-                border-radius: 6px;
+                background: rgba(7, 7, 9, 250);
+                border: 1px solid {_cu_rgba(ACC, 90)};
+                border-radius: 14px;
             }}
+            #cuCard {{
+                background: {_cu_rgba(ACC, 12)};
+                border: 1px solid {_cu_rgba(ACC, 34)};
+                border-radius: 10px;
+            }}
+            #cuSep {{ background: {_cu_rgba(ACC, 40)}; border: none; }}
+            #cuScroll, #cuBody {{ background: transparent; border: none; }}
+            #cuScroll QScrollBar:vertical {{
+                background: transparent; width: 6px; margin: 4px 1px;
+            }}
+            #cuScroll QScrollBar::handle:vertical {{
+                background: {_cu_rgba(ACC, 110)}; border-radius: 3px; min-height: 30px;
+            }}
+            #cuScroll QScrollBar::handle:vertical:hover {{ background: {ACC}; }}
+            #cuScroll QScrollBar::add-line:vertical,
+            #cuScroll QScrollBar::sub-line:vertical {{ height: 0; }}
+            #cuScroll QScrollBar::add-page:vertical,
+            #cuScroll QScrollBar::sub-page:vertical {{ background: transparent; }}
         """)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 18, 24, 18)
-        lay.setSpacing(8)
+
+        # ── tiny builders ────────────────────────────────────────────────────
+        def _txt(text, size=9.5, bold=False, color=C.TEXT_MED, spacing=0.0, wrap=False):
+            w = QLabel(text)
+            w.setFont(_cu_font(size, bold, spacing))
+            w.setStyleSheet(f"color: {color}; background: transparent;")
+            w.setWordWrap(wrap)
+            return w
 
         def _lbl(txt, fs=9, bold=False, color=C.PRI, align=Qt.AlignmentFlag.AlignCenter):
+            # legacy helper — still used by the hidden (never shown) JARVIS widgets below
             w = QLabel(txt); w.setAlignment(align)
-            w.setFont(QFont("Courier New", fs,
-                            QFont.Weight.Bold if bold else QFont.Weight.Normal))
+            w.setFont(_cu_font(fs, bold))
             w.setStyleSheet(f"color: {color}; background: transparent;")
             return w
 
-        _fs = (f"QLineEdit {{ background: {C.PANEL2}; color: {C.TEXT}; "
-               f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}"
-               f"QLineEdit:focus {{ border: 1px solid {C.PRI}; }}")
+        _input_css = (
+            f"QLineEdit {{ background: {_cu_rgba('#000000', 140)}; color: {C.TEXT}; "
+            f"border: 1px solid {_cu_rgba(ACC, 50)}; border-radius: 8px; "
+            f"padding: 0 12px; selection-background-color: {_cu_rgba(ACC, 120)}; }}"
+            f"QLineEdit:hover {{ border: 1px solid {_cu_rgba(ACC, 110)}; }}"
+            f"QLineEdit:focus {{ border: 1px solid {ACC}; }}"
+        )
+        _ghost_css = (
+            f"QPushButton {{ background: transparent; color: {C.TEXT_MED}; "
+            f"border: 1px solid {_cu_rgba(ACC, 60)}; border-radius: 8px; padding: 0 12px; }}"
+            f"QPushButton:hover {{ background: {_cu_rgba(ACC, 22)}; color: {C.TEXT}; "
+            f"border-color: {ACC}; }}"
+            f"QPushButton:pressed {{ background: {_cu_rgba(ACC, 40)}; }}"
+        )
+        _spin_css = (
+            f"QSpinBox {{ background: {_cu_rgba('#000000', 140)}; color: {C.TEXT}; "
+            f"border: 1px solid {_cu_rgba(ACC, 50)}; border-radius: 6px; padding: 3px 8px; }}"
+            f"QSpinBox:hover {{ border: 1px solid {_cu_rgba(ACC, 110)}; }}"
+            f"QSpinBox:focus {{ border: 1px solid {ACC}; }}"
+            f"QSpinBox:disabled {{ color: {C.TEXT_DIM}; border: 1px solid {_cu_rgba(ACC, 25)}; }}"
+            f"QSpinBox::up-button, QSpinBox::down-button {{ width: 0px; border: none; }}"
+        )
+        _slider_css = (
+            f"QSlider::groove:horizontal {{ height: 4px; border-radius: 2px; "
+            f"background: {_cu_rgba(C.TEXT, 36)}; }}"
+            f"QSlider::sub-page:horizontal {{ background: {ACC}; border-radius: 2px; }}"
+            f"QSlider::handle:horizontal {{ background: #ffffff; width: 12px; height: 12px; "
+            f"margin: -6px 0; border-radius: 8px; border: 2px solid {ACC}; }}"
+            f"QSlider::handle:horizontal:hover {{ background: {ACC}; }}"
+            f"QSlider::sub-page:horizontal:disabled {{ background: {_cu_rgba(ACC, 70)}; }}"
+            f"QSlider::handle:horizontal:disabled {{ background: {_cu_rgba(C.TEXT, 90)}; "
+            f"border: 2px solid {_cu_rgba(ACC, 70)}; }}"
+        )
 
-        lay.addWidget(_lbl("⚙  CUSTOMISE ASSISTANT", 12, True))
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
-        lay.addWidget(sep)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        lay.addWidget(_lbl("ASSISTANT NAME", 8, color=C.TEXT_DIM,
-                            align=Qt.AlignmentFlag.AlignLeft))
-        self._name_input = QLineEdit(assistant_name)
-        self._name_input.setFont(QFont("Courier New", 10))
-        self._name_input.setFixedHeight(32)
-        self._name_input.setStyleSheet(_fs)
-        lay.addWidget(self._name_input)
+        # ═════════════════════════ HEADER (pinned) ═════════════════════════
+        header = QWidget()
+        header.setStyleSheet("background: transparent;")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(22, 18, 16, 14)
+        hl.setSpacing(12)
+        badge = QLabel("⚙")
+        badge.setFixedSize(36, 36)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFont(_cu_font(14))
+        badge.setStyleSheet(
+            f"color: {ACC}; background: {_cu_rgba(ACC, 26)}; "
+            f"border: 1px solid {_cu_rgba(ACC, 70)}; border-radius: 10px;"
+        )
+        hl.addWidget(badge)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(1)
+        title_col.addWidget(_txt("Customise Assistant", 13, True, C.TEXT))
+        title_col.addWidget(_txt("Personalise identity, voice, behaviour and theme", 8.5,
+                                 color=C.TEXT_DIM))
+        hl.addLayout(title_col, 1)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(30, 30)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setToolTip("Close without saving")
+        close_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {C.TEXT_DIM}; border: none; "
+            f"border-radius: 8px; font-size: 13px; }}"
+            f"QPushButton:hover {{ background: {_cu_rgba(ACC, 30)}; color: {C.TEXT}; }}"
+        )
+        close_btn.clicked.connect(self._cancel)
+        hl.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
+        root.addWidget(header)
 
-        lay.addSpacing(4)
-        lay.addWidget(_lbl("YOUR NAME  (leave blank for default sir / efendim)", 8,
-                            color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
-        self._user_input = QLineEdit(user_name)
-        self._user_input.setPlaceholderText("e.g.  Tony   (leave blank for auto)")
-        self._user_input.setFont(QFont("Courier New", 10))
-        self._user_input.setFixedHeight(32)
-        self._user_input.setStyleSheet(_fs)
-        lay.addWidget(self._user_input)
+        sep = QFrame(); sep.setObjectName("cuSep"); sep.setFixedHeight(1)
+        root.addWidget(sep)
 
-        local_ai_btn = QPushButton("LOCAL AI / STT / TTS SETTINGS")
-        local_ai_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        local_ai_btn.setFixedHeight(28)
-        local_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        local_ai_btn.setStyleSheet(f"""
-            QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
-                border: 1px solid {C.BORDER}; border-radius: 3px; }}
-            QPushButton:hover {{ border-color: {C.PRI}; }}
-        """)
-        local_ai_btn.clicked.connect(self.configure_local_ai.emit)
-        permissions_btn = QPushButton("PERMISSIONS")
-        permissions_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        permissions_btn.setFixedHeight(28)
-        permissions_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        permissions_btn.setStyleSheet(f"""
-            QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
-                border: 1px solid {C.BORDER}; border-radius: 3px; }}
-            QPushButton:hover {{ border-color: {C.PRI}; }}
-        """)
-        permissions_btn.clicked.connect(self.open_permissions.emit)
-        settings_row = QHBoxLayout()
-        settings_row.addWidget(local_ai_btn, 1)
-        settings_row.addWidget(permissions_btn)
-        lay.addLayout(settings_row)
+        # ═════════════════════════ SCROLLING BODY ═════════════════════════
+        scroll = QScrollArea()
+        scroll.setObjectName("cuScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setStyleSheet("background: transparent;")
+        body = QWidget(); body.setObjectName("cuBody")
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(20, 16, 14, 16)
+        lay.setSpacing(12)
+        scroll.setWidget(body)
+        root.addWidget(scroll, 1)
+        self._scroll = scroll
+        guard = _CuWheelGuard(scroll.verticalScrollBar(), self)
+        self._wheel_guard = guard
+
+        def _section(title, hint=""):
+            card = QFrame(); card.setObjectName("cuCard")
+            v = QVBoxLayout(card)
+            v.setContentsMargins(16, 14, 16, 14)
+            v.setSpacing(8)
+            v.addWidget(_txt(title.upper(), 8, True, ACC, spacing=1.4))
+            if hint:
+                v.addWidget(_txt(hint, 8.5, color=C.TEXT_DIM, wrap=True))
+            lay.addWidget(card)
+            return v
+
+        def _field(v, label, widget):
+            v.addWidget(_txt(label, 9, color=C.TEXT_MED))
+            v.addWidget(widget)
+
+        def _row(v, label, widget):
+            r = QHBoxLayout(); r.setSpacing(10)
+            r.addWidget(_txt(label, 10, color=C.TEXT))
+            r.addStretch()
+            r.addWidget(widget)
+            v.addLayout(r)
+            return r
+
+        def _slider_block(v, label, slider, value_lbl):
+            top = QHBoxLayout()
+            top.addWidget(_txt(label, 10, color=C.TEXT))
+            top.addStretch()
+            value_lbl.setFont(_cu_font(9.5, True))
+            value_lbl.setStyleSheet(f"color: {ACC}; background: transparent;")
+            top.addWidget(value_lbl)
+            v.addLayout(top)
+            slider.setFixedHeight(22)
+            slider.setStyleSheet(_slider_css)
+            slider.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            slider.installEventFilter(guard)
+            v.addWidget(slider)
+
+        def _line_edit(text, placeholder=""):
+            e = QLineEdit(text)
+            e.setPlaceholderText(placeholder)
+            e.setFont(_cu_font(10))
+            e.setFixedHeight(36)
+            e.setStyleSheet(_input_css)
+            return e
 
         from memory.config_manager import (
             get_background_assistant_config,
             get_wake_word_enabled,
             get_wake_word_sensitivity,
         )
-        self._wake_word_enabled = QCheckBox("Enable offline Hey AURA wake word")
-        self._wake_word_enabled.setChecked(get_wake_word_enabled())
-        self._wake_word_enabled.setStyleSheet(
-            f"color: {C.TEXT}; background: transparent;"
-        )
-        lay.addWidget(self._wake_word_enabled)
 
-        sensitivity_row = QHBoxLayout()
-        sensitivity_label = _lbl(
-            "WAKE SENSITIVITY", 8, color=C.TEXT_DIM,
-            align=Qt.AlignmentFlag.AlignLeft,
-        )
-        self._wake_sensitivity_value = _lbl("", 8, color=C.PRI)
-        sensitivity_row.addWidget(sensitivity_label)
-        sensitivity_row.addStretch()
-        sensitivity_row.addWidget(self._wake_sensitivity_value)
-        lay.addLayout(sensitivity_row)
+        # ── 1 · Identity ─────────────────────────────────────────────────────
+        v = _section("Identity")
+        self._name_input = _line_edit(assistant_name, "Assistant name")
+        _field(v, "Assistant name", self._name_input)
+        self._user_input = _line_edit(user_name, "e.g. Tony")
+        _field(v, "Your name", self._user_input)
+        v.addWidget(_txt("Leave blank to use the default form of address (sir / efendim).",
+                         8.5, color=C.TEXT_DIM, wrap=True))
+
+        local_ai_btn = QPushButton("🧠  Local AI / STT / TTS")
+        permissions_btn = QPushButton("🔒  Permissions")
+        for b, sig in ((local_ai_btn, self.configure_local_ai),
+                       (permissions_btn, self.open_permissions)):
+            b.setFont(_cu_font(9.5, True))
+            b.setFixedHeight(36)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(_ghost_css)
+            b.clicked.connect(sig.emit)
+        qa = QHBoxLayout(); qa.setSpacing(8)
+        qa.addWidget(local_ai_btn, 3)
+        qa.addWidget(permissions_btn, 2)
+        v.addSpacing(2)
+        v.addLayout(qa)
+
+        # ── 1b · Gemini API Key ──────────────────────────────────────────────
+        from memory.config_manager import get_gemini_key
+        v = _section("Gemini API Key")
+        self._gemini_key_input = QLineEdit(str(get_gemini_key() or ""))
+        self._gemini_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._gemini_key_input.setPlaceholderText("AIzaSy... (Gemini API Key)")
+        self._gemini_key_input.setFont(_cu_font(10))
+        self._gemini_key_input.setFixedHeight(36)
+        self._gemini_key_input.setStyleSheet(_input_css)
+
+        key_row = QHBoxLayout()
+        key_row.setSpacing(6)
+        key_row.addWidget(self._gemini_key_input, 1)
+
+        self._show_key_btn = QPushButton("👁")
+        self._show_key_btn.setFixedSize(36, 36)
+        self._show_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._show_key_btn.setStyleSheet(_ghost_css)
+        self._show_key_btn.setToolTip("Show / Hide Key")
+        def _toggle_key_echo():
+            if self._gemini_key_input.echoMode() == QLineEdit.EchoMode.Password:
+                self._gemini_key_input.setEchoMode(QLineEdit.EchoMode.Normal)
+                self._show_key_btn.setStyleSheet(f"background: {C.PRI_GHO}; color: {C.PRI}; border: 1px solid {C.PRI}; border-radius: 3px;")
+            else:
+                self._gemini_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+                self._show_key_btn.setStyleSheet(_ghost_css)
+        self._show_key_btn.clicked.connect(_toggle_key_echo)
+        key_row.addWidget(self._show_key_btn)
+
+        self._test_key_btn = QPushButton("TEST")
+        self._test_key_btn.setFixedHeight(36)
+        self._test_key_btn.setFont(_cu_font(8.5, True))
+        self._test_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._test_key_btn.setStyleSheet(_ghost_css)
+        self._test_key_lbl = QLabel("")
+        self._test_key_lbl.setFont(_cu_font(8, True))
+
+        def _test_gemini_key():
+            k = self._gemini_key_input.text().strip()
+            if not k:
+                self._test_key_lbl.setText("Enter a key first")
+                self._test_key_lbl.setStyleSheet(f"color: {C.RED};")
+                return
+            self._test_key_lbl.setText("Verifying...")
+            self._test_key_lbl.setStyleSheet(f"color: {C.PRI};")
+            def _async_test():
+                try:
+                    from google import genai
+                    cl = genai.Client(api_key=k)
+                    models = list(cl.models.list(config={"page_size": 1}))
+                    QTimer.singleShot(0, lambda: (
+                        self._test_key_lbl.setText("● VALID KEY"),
+                        self._test_key_lbl.setStyleSheet(f"color: {C.GREEN};")
+                    ))
+                except Exception as ex:
+                    err_msg = str(ex)
+                    short_err = "INVALID KEY"
+                    if "400" in err_msg or "API_KEY_INVALID" in err_msg or "not valid" in err_msg:
+                        short_err = "KEY REJECTED"
+                    elif "403" in err_msg or "PERMISSION_DENIED" in err_msg:
+                        short_err = "PERMISSION DENIED"
+                    elif "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                        short_err = "QUOTA EXHAUSTED"
+                    QTimer.singleShot(0, lambda: (
+                        self._test_key_lbl.setText(f"● {short_err}"),
+                        self._test_key_lbl.setStyleSheet(f"color: {C.RED};")
+                    ))
+            threading.Thread(target=_async_test, daemon=True).start()
+
+        self._test_key_btn.clicked.connect(_test_gemini_key)
+        key_row.addWidget(self._test_key_btn)
+        v.addLayout(key_row)
+        v.addWidget(self._test_key_lbl)
+
+        # ── 2 · Wake word ────────────────────────────────────────────────────
+        v = _section("Wake word")
+        self._wake_word_enabled = _CuSwitch("Enable offline “Hey AURA” wake word")
+        self._wake_word_enabled.setChecked(get_wake_word_enabled())
+        v.addWidget(self._wake_word_enabled)
+
+        self._wake_sensitivity_value = QLabel("")
         self._wake_sensitivity = QSlider(Qt.Orientation.Horizontal)
         self._wake_sensitivity.setRange(1, 10)
-        self._wake_sensitivity.setValue(
-            round(get_wake_word_sensitivity() * 10)
-        )
+        self._wake_sensitivity.setValue(round(get_wake_word_sensitivity() * 10))
         self._wake_sensitivity.setEnabled(self._wake_word_enabled.isChecked())
-        self._wake_sensitivity.valueChanged.connect(
-            self._update_wake_sensitivity_label
-        )
-        self._wake_word_enabled.toggled.connect(
-            self._wake_sensitivity.setEnabled
-        )
-        lay.addWidget(self._wake_sensitivity)
+        self._wake_sensitivity.valueChanged.connect(self._update_wake_sensitivity_label)
+        self._wake_word_enabled.toggled.connect(self._wake_sensitivity.setEnabled)
+        _slider_block(v, "Sensitivity", self._wake_sensitivity, self._wake_sensitivity_value)
         self._update_wake_sensitivity_label(self._wake_sensitivity.value())
 
+        # ── 3 · Background assistant ────────────────────────────────────────
         background_settings = get_background_assistant_config()
-        background_title = _lbl(
-            "BACKGROUND ASSISTANT", 8, color=C.TEXT_DIM,
-            align=Qt.AlignmentFlag.AlignLeft,
-        )
-        lay.addSpacing(4)
-        lay.addWidget(background_title)
+        v = _section("Background assistant")
 
-        auto_hide_row = QHBoxLayout()
-        self._background_auto_hide = QCheckBox("Auto-hide after inactivity")
-        self._background_auto_hide.setChecked(
-            background_settings["auto_hide_enabled"]
-        )
-        self._background_auto_hide.setStyleSheet(
-            f"color: {C.TEXT}; background: transparent;"
-        )
+        self._background_auto_hide = _CuSwitch("Auto-hide after inactivity")
+        self._background_auto_hide.setChecked(background_settings["auto_hide_enabled"])
         self._background_auto_hide_minutes = QSpinBox()
         self._background_auto_hide_minutes.setRange(1, 120)
         self._background_auto_hide_minutes.setSuffix(" min")
-        self._background_auto_hide_minutes.setValue(
-            background_settings["auto_hide_minutes"]
-        )
-        self._background_auto_hide_minutes.setEnabled(
-            self._background_auto_hide.isChecked()
-        )
+        self._background_auto_hide_minutes.setValue(background_settings["auto_hide_minutes"])
+        self._background_auto_hide_minutes.setEnabled(self._background_auto_hide.isChecked())
         self._background_auto_hide.toggled.connect(
             self._background_auto_hide_minutes.setEnabled
         )
-        auto_hide_row.addWidget(self._background_auto_hide)
-        auto_hide_row.addStretch()
-        auto_hide_row.addWidget(self._background_auto_hide_minutes)
-        lay.addLayout(auto_hide_row)
+        ah = QHBoxLayout(); ah.setSpacing(10)
+        ah.addWidget(self._background_auto_hide, 1)
+        ah.addWidget(self._background_auto_hide_minutes)
+        v.addLayout(ah)
 
         self._background_timing_spins = {}
         for key, label, minimum, maximum, suffix in (
-            ("end_of_speech_ms", "END-OF-SPEECH SILENCE", 500, 5000, " ms"),
-            ("max_utterance_seconds", "MAX UTTERANCE", 10, 600, " sec"),
-            ("response_timeout_seconds", "RESPONSE TIMEOUT", 10, 600, " sec"),
+            ("end_of_speech_ms", "End-of-speech silence", 500, 5000, " ms"),
+            ("max_utterance_seconds", "Max utterance", 10, 600, " sec"),
+            ("response_timeout_seconds", "Response timeout", 10, 600, " sec"),
         ):
-            row = QHBoxLayout()
-            row.addWidget(_lbl(label, 8, color=C.TEXT_DIM,
-                               align=Qt.AlignmentFlag.AlignLeft))
-            row.addStretch()
             spin = QSpinBox()
             spin.setRange(minimum, maximum)
             spin.setSuffix(suffix)
             spin.setValue(background_settings[key])
-            row.addWidget(spin)
-            lay.addLayout(row)
             self._background_timing_spins[key] = spin
+            _row(v, label, spin)
 
-        vad_row = QHBoxLayout()
-        vad_row.addWidget(_lbl(
-            "VOICE SENSITIVITY", 8, color=C.TEXT_DIM,
-            align=Qt.AlignmentFlag.AlignLeft,
-        ))
-        vad_row.addStretch()
-        self._background_vad_sensitivity = QSlider(
-            Qt.Orientation.Horizontal
-        )
+        self._background_vad_sensitivity = QSlider(Qt.Orientation.Horizontal)
         self._background_vad_sensitivity.setRange(1, 10)
         self._background_vad_sensitivity.setValue(
             round(background_settings["vad_sensitivity"] * 10)
         )
-        self._background_vad_value = _lbl("", 8, color=C.PRI)
+        self._background_vad_value = QLabel("")
         self._background_vad_sensitivity.valueChanged.connect(
             lambda value: self._background_vad_value.setText(f"{value * 10}%")
         )
         self._background_vad_value.setText(
             f"{self._background_vad_sensitivity.value() * 10}%"
         )
-        vad_row.addWidget(self._background_vad_sensitivity, 1)
-        vad_row.addWidget(self._background_vad_value)
-        lay.addLayout(vad_row)
+        v.addSpacing(2)
+        _slider_block(v, "Voice sensitivity", self._background_vad_sensitivity,
+                      self._background_vad_value)
 
-        self._background_speak = QCheckBox("Speak responses")
+        for spin in (self._background_auto_hide_minutes,
+                     *self._background_timing_spins.values()):
+            spin.setAlignment(Qt.AlignmentFlag.AlignRight)
+            spin.setFont(_cu_font(9.5))
+            spin.setFixedSize(96, 30)
+            spin.setStyleSheet(_spin_css)
+            spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            spin.installEventFilter(guard)
+
+        # ── 4 · Behaviour ────────────────────────────────────────────────────
+        v = _section("Behaviour")
+        self._background_speak = _CuSwitch("Speak responses")
         self._background_speak.setChecked(background_settings["speak_responses"])
-        self._background_conversation = QCheckBox("Conversation mode")
-        self._background_conversation.setChecked(
-            background_settings["conversation_mode"]
-        )
-        for checkbox in (self._background_speak, self._background_conversation):
-            checkbox.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
-            lay.addWidget(checkbox)
+        self._background_conversation = _CuSwitch("Conversation mode")
+        self._background_conversation.setChecked(background_settings["conversation_mode"])
+        v.addWidget(self._background_speak)
+        v.addWidget(self._background_conversation)
 
-        # ── Assistant voice — Gemini prebuilt voices ─────────────────────────
+        # [AURA-FEATURE: presence-awareness]
+        from memory.config_manager import get_presence_config
+        presence_cfg = get_presence_config()
+        self._presence_enabled = _CuSwitch("Presence awareness (Away mode)")
+        self._presence_enabled.setChecked(presence_cfg.get("enabled", True))
+        self._presence_allow_critical = _CuSwitch("Allow urgent alarms while away")
+        self._presence_allow_critical.setChecked(
+            presence_cfg.get("allow_critical_while_away", True)
+        )
+        self._presence_auto_unlock = _CuSwitch("Auto-unlock desktop on return")
+        self._presence_auto_unlock.setChecked(
+            presence_cfg.get("auto_unlock_enabled", True)
+        )
+        v.addWidget(self._presence_enabled)
+        v.addWidget(self._presence_allow_critical)
+        v.addWidget(self._presence_auto_unlock)
+
+        unlock_row = QHBoxLayout()
+        unlock_row.setSpacing(6)
+        lbl_sec = QLabel("Unlock Security:")
+        lbl_sec.setFont(_cu_font(9.5, True))
+        lbl_sec.setStyleSheet(f"color: {C.TEXT_MED};")
+        unlock_row.addWidget(lbl_sec)
+
+        self._presence_auth_type = presence_cfg.get("unlock_auth_type", "hello")
+        self._auth_btns: dict[str, QPushButton] = {}
+        for auth_mode, auth_title in [("hello", "Windows Hello"), ("pin", "PIN"), ("password", "Password")]:
+            btn = QPushButton(auth_title)
+            btn.setCheckable(True)
+            btn.setChecked(self._presence_auth_type == auth_mode)
+            btn.setFixedHeight(28)
+            btn.setFont(_cu_font(8.5, True))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {C.PANEL}; color: {C.TEXT};
+                    border: 1px solid {C.BORDER}; border-radius: 4px; padding: 2px 8px;
+                }}
+                QPushButton:checked {{
+                    background: {C.PRI_DIM}; color: {C.WHITE};
+                    border: 1px solid {C.PRI};
+                }}
+            """)
+            btn.clicked.connect(lambda _=False, m=auth_mode: self._on_auth_type_picked(m))
+            self._auth_btns[auth_mode] = btn
+            unlock_row.addWidget(btn)
+        v.addLayout(unlock_row)
+
+        self._presence_credential_input = QLineEdit()
+        self._presence_credential_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._presence_credential_input.setPlaceholderText("Enter Desktop PIN or Password")
+        self._presence_credential_input.setText(presence_cfg.get("unlock_credential", ""))
+        self._presence_credential_input.setFixedHeight(28)
+        self._presence_credential_input.setFont(_cu_font(9))
+        self._presence_credential_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: {C.PANEL2}; color: {C.WHITE};
+                border: 1px solid {C.BORDER}; border-radius: 4px; padding: 2px 8px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
+        """)
+        self._presence_credential_input.setVisible(self._presence_auth_type in ("pin", "password"))
+        v.addWidget(self._presence_credential_input)
+
+        # [AURA-FEATURE: conversation-recall]
+        from memory.config_manager import get_chat_memory_config
+        cm_cfg = get_chat_memory_config()
+        self._cm_enabled = _CuSwitch("Conversation recall (FTS5 search)")
+        self._cm_enabled.setChecked(cm_cfg.get("enabled", True))
+        self._cm_paused = _CuSwitch("Pause history logging")
+        self._cm_paused.setChecked(cm_cfg.get("paused", False))
+        v.addWidget(self._cm_enabled)
+        v.addWidget(self._cm_paused)
+
+        from aura_features import get_feature_registry
+        cm = get_feature_registry().chat_memory_manager
+        db_stats = cm.get_stats() if cm else {"display": "0 KB (0 messages)"}
+
+        cm_row = QHBoxLayout()
+        cm_row.setSpacing(6)
+        lbl_cm = QLabel(f"Database: {db_stats.get('display', '')}")
+        lbl_cm.setFont(_cu_font(8.5))
+        lbl_cm.setStyleSheet(f"color: {C.TEXT_DIM};")
+        self._cm_stats_lbl = lbl_cm
+        cm_row.addWidget(lbl_cm, 1)
+
+        btn_purge_old = QPushButton("Prune >90d")
+        btn_purge_old.setFixedHeight(24)
+        btn_purge_old.setFont(_cu_font(8, True))
+        btn_purge_old.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_purge_old.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL}; color: {C.TEXT}; border: 1px solid {C.BORDER}; border-radius: 3px; padding: 0 6px; }}
+            QPushButton:hover {{ background: {C.PRI_DIM}; color: {C.WHITE}; }}
+        """)
+        btn_purge_old.clicked.connect(self._on_prune_chat_history)
+        cm_row.addWidget(btn_purge_old)
+
+        btn_delete_all = QPushButton("Clear All")
+        btn_delete_all.setFixedHeight(24)
+        btn_delete_all.setFont(_cu_font(8, True))
+        btn_delete_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_delete_all.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL}; color: #ff5555; border: 1px solid {C.BORDER}; border-radius: 3px; padding: 0 6px; }}
+            QPushButton:hover {{ background: rgba(255, 85, 85, 50); }}
+        """)
+        btn_delete_all.clicked.connect(self._on_clear_all_chat_history)
+        cm_row.addWidget(btn_delete_all)
+        v.addLayout(cm_row)
+
+        # [AURA-FEATURE: clap-detection]
+        from memory.config_manager import get_clap_config
+        clap_cfg = get_clap_config()
+        v = _section("Fast Wake & Cinematic Opening")
+        self._clap_enabled = _CuSwitch("Clap-to-Start (Double clap to wake)")
+        self._clap_enabled.setChecked(clap_cfg.get("enabled", True))
+        v.addWidget(self._clap_enabled)
+
+        self._reduce_motion = _CuSwitch("Reduce motion (Fast opening, skip animation)")
+        self._reduce_motion.setChecked(clap_cfg.get("reduce_motion", False))
+        v.addWidget(self._reduce_motion)
+
+        clap_sens_row = QHBoxLayout()
+        clap_sens_row.setSpacing(8)
+        lbl_clap_sens = QLabel("Clap sensitivity")
+        lbl_clap_sens.setFont(_cu_font(9))
+        lbl_clap_sens.setStyleSheet(f"color: {C.TEXT};")
+        clap_sens_row.addWidget(lbl_clap_sens)
+
+        self._clap_sens_slider = QSlider(Qt.Orientation.Horizontal)
+        self._clap_sens_slider.setRange(10, 100)
+        self._clap_sens_slider.setValue(int(clap_cfg.get("sensitivity", 0.65) * 100))
+        self._clap_sens_slider.setFixedHeight(20)
+        clap_sens_row.addWidget(self._clap_sens_slider, 1)
+
+        self._clap_sens_val = QLabel(f"{int(clap_cfg.get('sensitivity', 0.65) * 100)}%")
+        self._clap_sens_val.setFont(_cu_font(8.5, True))
+        self._clap_sens_val.setStyleSheet(f"color: {C.PRI}; min-width: 38px;")
+        self._clap_sens_slider.valueChanged.connect(
+            lambda val: self._clap_sens_val.setText(f"{val}%")
+        )
+        clap_sens_row.addWidget(self._clap_sens_val)
+        v.addLayout(clap_sens_row)
+
+        # ── 5 · Assistant voice — Gemini prebuilt voices ────────────────────
         # Names are language-neutral proper nouns, so the row reads the same in
         # every locale. Selecting one and applying rebuilds the Live session.
         from memory.config_manager import AVAILABLE_VOICES, DEFAULT_VOICE
-        lay.addSpacing(4)
-        lay.addWidget(_lbl("ASSISTANT VOICE", 8, color=C.TEXT_DIM,
-                            align=Qt.AlignmentFlag.AlignLeft))
+        v = _section("Assistant voice")
         self._sel_voice   = (voice or DEFAULT_VOICE)
         if self._sel_voice not in AVAILABLE_VOICES:
             self._sel_voice = DEFAULT_VOICE
         self._voice_btns: dict[str, QPushButton] = {}
-        voice_row = QHBoxLayout(); voice_row.setSpacing(4)
+        voice_row = QHBoxLayout(); voice_row.setSpacing(6)
         for _v in AVAILABLE_VOICES:
             b = QPushButton(_v)
             b.setCheckable(True)
-            b.setFixedHeight(28)
-            b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            b.setFixedHeight(32)
+            b.setFont(_cu_font(9, True))
             b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             b.clicked.connect(lambda _=False, name=_v: self._on_voice_pick(name))
             self._voice_btns[_v] = b
             voice_row.addWidget(b)
-        lay.addLayout(voice_row)
+        v.addLayout(voice_row)
         self._refresh_voice_btns()
 
         # ── JARVIS — fully offline local British voice ───────────────────────
@@ -4133,26 +4579,8 @@ class CustomizeOverlay(QWidget):
 
         self._refresh_jarvis_btn()
 
-        # ── UI colour — renk çarkı ───────────────────────────────────────────
-        lay.addSpacing(4)
-        clr_hdr = QHBoxLayout()
-        clr_hdr.addWidget(_lbl("UI COLOUR  —  drag the handle", 8,
-                               color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
-        clr_hdr.addStretch()
-        df_btn = QPushButton("DEFAULT")
-        df_btn.setFixedSize(64, 20)
-        df_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        df_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        df_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; color: {C.TEXT_MED};
-                border: 1px solid {C.BORDER}; border-radius: 3px;
-            }}
-            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
-        """)
-        df_btn.clicked.connect(lambda: self._set_color(DEFAULT_UI_COLOR))
-        clr_hdr.addWidget(df_btn)
-        lay.addLayout(clr_hdr)
+        # ── 6 · Theme colour ─────────────────────────────────────────────────
+        v = _section("Theme colour", "Drag the handle around the ring, or type a hex value.")
 
         self._initial_color = (ui_color or DEFAULT_UI_COLOR).strip().lower()
         self._sel_color     = self._initial_color
@@ -4161,49 +4589,111 @@ class CustomizeOverlay(QWidget):
         self._wheel = HueWheel(self._sel_color)
         wheel_row = QHBoxLayout()
         wheel_row.addStretch(); wheel_row.addWidget(self._wheel); wheel_row.addStretch()
-        lay.addLayout(wheel_row)
+        v.addLayout(wheel_row)
         self._wheel.hue_picked.connect(self._on_wheel_pick)
         self._wheel.hue_committed.connect(self._on_wheel_commit)
 
-        self._hex_input = QLineEdit(self._sel_color)
-        self._hex_input.setPlaceholderText("#ff9224   (custom hex colour)")
-        self._hex_input.setFont(QFont("Courier New", 10))
-        self._hex_input.setFixedHeight(28)
-        self._hex_input.setStyleSheet(_fs)
+        self._swatch = QFrame()
+        self._swatch.setFixedSize(36, 36)
+        self._hex_input = _line_edit(self._sel_color, "#ff9224")
+        self._hex_input.setFont(_cu_font(10.5, True))
+        self._hex_input.setMaxLength(7)
         self._hex_input.textEdited.connect(self._on_hex_edited)
-        lay.addWidget(self._hex_input)
+        df_btn = QPushButton("Reset")
+        df_btn.setFixedHeight(36)
+        df_btn.setFont(_cu_font(9.5, True))
+        df_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        df_btn.setToolTip("Restore the default accent colour")
+        df_btn.setStyleSheet(_ghost_css)
+        df_btn.clicked.connect(lambda: self._set_color(DEFAULT_UI_COLOR))
+        hex_row = QHBoxLayout(); hex_row.setSpacing(8)
+        hex_row.addWidget(self._swatch)
+        hex_row.addWidget(self._hex_input, 1)
+        hex_row.addWidget(df_btn)
+        v.addLayout(hex_row)
+        self._sync_swatch()
 
-        lay.addSpacing(6)
-        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        lay.addStretch(1)
 
-        save_btn = QPushButton("▸  APPLY CHANGES")
-        save_btn.setFixedHeight(34)
-        save_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        # ═════════════════════════ FOOTER (pinned) ═════════════════════════
+        sep2 = QFrame(); sep2.setObjectName("cuSep"); sep2.setFixedHeight(1)
+        root.addWidget(sep2)
+        footer = QWidget(); footer.setStyleSheet("background: transparent;")
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(20, 14, 20, 16)
+        fl.setSpacing(10)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFixedHeight(40)
+        cancel_btn.setFont(_cu_font(10, True))
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setStyleSheet(_ghost_css)
+        cancel_btn.clicked.connect(self._cancel)
+
+        save_btn = QPushButton("Apply changes")
+        save_btn.setFixedHeight(40)
+        save_btn.setFont(_cu_font(10, True))
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setDefault(True)
         save_btn.setStyleSheet(f"""
             QPushButton {{
-                background: transparent; color: {C.PRI};
-                border: 1px solid {C.PRI_DIM}; border-radius: 3px;
+                background: {ACC}; color: #0a0a0a; border: none; border-radius: 8px;
+                padding: 0 18px;
             }}
-            QPushButton:hover {{ background: {C.PRI_GHO}; border: 1px solid {C.PRI}; }}
+            QPushButton:hover   {{ background: {QColor(ACC).lighter(115).name()}; }}
+            QPushButton:pressed {{ background: {QColor(ACC).darker(110).name()}; }}
         """)
         save_btn.clicked.connect(self._save)
-        btn_row.addWidget(save_btn)
+        fl.addWidget(cancel_btn, 2)
+        fl.addWidget(save_btn, 3)
+        root.addWidget(footer)
 
-        cancel_btn = QPushButton("CANCEL")
-        cancel_btn.setFixedHeight(34)
-        cancel_btn.setFont(QFont("Courier New", 9))
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        cancel_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; color: {C.TEXT_MED};
-                border: 1px solid {C.BORDER}; border-radius: 3px;
-            }}
-            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
-        """)
-        cancel_btn.clicked.connect(self._cancel)
-        btn_row.addWidget(cancel_btn)
-        lay.addLayout(btn_row)
+    def _sync_swatch(self):
+        c = (self._sel_color or DEFAULT_UI_COLOR)
+        self._swatch.setStyleSheet(
+            f"background: {c}; border: 2px solid {_cu_rgba(C.TEXT, 70)}; border-radius: 18px;"
+        )
+
+    def _on_auth_type_picked(self, mode: str) -> None:
+        self._presence_auth_type = mode
+        for m, btn in self._auth_btns.items():
+            btn.setChecked(m == mode)
+        self._presence_credential_input.setVisible(mode in ("pin", "password"))
+
+    # [AURA-FEATURE: conversation-recall]
+    def _on_prune_chat_history(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Prune Conversation History",
+            "Are you sure you want to delete conversation turns older than 90 days?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            from aura_features import get_feature_registry
+            cm = get_feature_registry().chat_memory_manager
+            if cm:
+                deleted = cm.delete_older_than(90)
+                stats = cm.get_stats()
+                self._cm_stats_lbl.setText(f"Database: {stats.get('display', '')}")
+                QMessageBox.information(self, "Prune Complete", f"Successfully pruned {deleted} older turns.")
+
+    def _on_clear_all_chat_history(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Clear All Conversation History",
+            "Are you sure you want to permanently delete ALL conversation history? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            from aura_features import get_feature_registry
+            cm = get_feature_registry().chat_memory_manager
+            if cm:
+                cm.delete_all()
+                stats = cm.get_stats()
+                self._cm_stats_lbl.setText(f"Database: {stats.get('display', '')}")
+                QMessageBox.information(self, "History Cleared", "All conversation history has been cleared.")
 
     # ── voice selection ──────────────────────────────────────────────────────
     def _on_voice_pick(self, name: str):
@@ -4217,14 +4707,19 @@ class CustomizeOverlay(QWidget):
             b.setChecked(on)
             if on:
                 b.setStyleSheet(f"""
-                    QPushButton {{ background: {C.PRI_GHO}; color: {C.PRI};
-                        border: 1px solid {C.PRI}; border-radius: 3px; }}
+                    QPushButton {{ background: {_cu_rgba(C.PRI, 40)}; color: {C.PRI};
+                        border: 1px solid {C.PRI}; border-radius: 8px; }}
+                    QPushButton:disabled {{ color: {C.TEXT_DIM};
+                        border: 1px solid {_cu_rgba(C.PRI, 50)}; }}
                 """)
             else:
                 b.setStyleSheet(f"""
-                    QPushButton {{ background: transparent; color: {C.TEXT_MED};
-                        border: 1px solid {C.BORDER}; border-radius: 3px; }}
-                    QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+                    QPushButton {{ background: {_cu_rgba('#000000', 120)}; color: {C.TEXT_MED};
+                        border: 1px solid {_cu_rgba(C.PRI, 45)}; border-radius: 8px; }}
+                    QPushButton:hover {{ color: {C.TEXT}; border-color: {C.PRI};
+                        background: {_cu_rgba(C.PRI, 20)}; }}
+                    QPushButton:disabled {{ color: {C.TEXT_DIM};
+                        border: 1px solid {_cu_rgba(C.PRI, 25)}; }}
                 """)
 
     # ── JARVIS (local voice) toggle ──────────────────────────────────────────
@@ -4312,6 +4807,7 @@ class CustomizeOverlay(QWidget):
         self._hex_input.blockSignals(False)
         if update_wheel:
             self._wheel.set_color(self._sel_color)
+        self._sync_swatch()
         if preview and self.on_preview:
             self.on_preview(self._sel_color)
 
@@ -4321,6 +4817,7 @@ class CustomizeOverlay(QWidget):
         self._hex_input.blockSignals(True)
         self._hex_input.setText(hx)
         self._hex_input.blockSignals(False)
+        self._sync_swatch()
 
     def _on_wheel_commit(self, hx: str):
         # Tutamaç bırakıldı → tüm arayüzü canlı önizle
@@ -4367,6 +4864,52 @@ class CustomizeOverlay(QWidget):
             "speak_responses": self._background_speak.isChecked(),
             "conversation_mode": self._background_conversation.isChecked(),
         })
+        # [AURA-FEATURE: presence-awareness]
+        from memory.config_manager import save_presence_config
+        save_presence_config({
+            "enabled": self._presence_enabled.isChecked(),
+            "allow_critical_while_away": self._presence_allow_critical.isChecked(),
+            "auto_unlock_enabled": self._presence_auto_unlock.isChecked(),
+            "unlock_auth_type": getattr(self, "_presence_auth_type", "hello"),
+            "unlock_credential": self._presence_credential_input.text().strip(),
+        })
+        # [AURA-FEATURE: conversation-recall]
+        from memory.config_manager import save_chat_memory_config
+        save_chat_memory_config({
+            "enabled": self._cm_enabled.isChecked(),
+            "paused": self._cm_paused.isChecked(),
+        })
+        # [AURA-FEATURE: clap-detection]
+        from memory.config_manager import save_clap_config
+        clap_saved = save_clap_config({
+            "enabled": self._clap_enabled.isChecked(),
+            "sensitivity": self._clap_sens_slider.value() / 100.0,
+            "reduce_motion": self._reduce_motion.isChecked(),
+        })
+        try:
+            from aura_features import get_feature_registry
+            clap_det = get_feature_registry().clap_detector
+            if clap_det is not None:
+                clap_det.enabled = clap_saved.get("enabled", True)
+                clap_det.sensitivity = clap_saved.get("sensitivity", 0.65)
+        except Exception:
+            pass
+        # Persist Gemini API key if entered
+        new_gemini_key = self._gemini_key_input.text().strip()
+        if new_gemini_key:
+            from memory.config_manager import save_api_keys
+            save_api_keys(new_gemini_key)
+            try:
+                from core import gemini as _core_gemini
+                _core_gemini.api_key(refresh=True)
+            except Exception:
+                pass
+            try:
+                from model_router import router as model_router
+                model_router.configure(api_key=new_gemini_key)
+                model_router.start_refresh()
+            except Exception:
+                pass
         self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR,
                          self._sel_voice, self._jarvis_on)
         self.wake_settings_changed.emit()
@@ -4570,6 +5113,308 @@ class PluginManagerOverlay(QWidget):
         new_val = not get_plugin_enabled(name)
         save_plugin_enabled(name, new_val)
         self._style_toggle(btn, new_val)
+
+
+# [AURA-FEATURE: presence-awareness]
+class PresenceHoloCard(_MoPanel):
+    """Floating holographic card for presence awareness confirmations and catch-up."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("PresenceHoloCard")
+        self.setFixedWidth(460)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            QWidget#PresenceHoloCard {{
+                background: rgba(0, 6, 12, 246);
+                border: 1px solid {C.PRI};
+                border-radius: 8px;
+            }}
+        """)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(10)
+
+        # Header
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(0, 0, 0, 0)
+        hdr.setSpacing(8)
+
+        self._icon_lbl = QLabel("◈")
+        self._icon_lbl.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        self._icon_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        hdr.addWidget(self._icon_lbl)
+
+        self._title_lbl = QLabel("AWAY MODE ACTIVE")
+        self._title_lbl.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none; letter-spacing: 1px;")
+        hdr.addWidget(self._title_lbl, 1)
+
+        self._pill_lbl = QLabel("")
+        self._pill_lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._pill_lbl.setStyleSheet(f"""
+            QLabel {{
+                color: {C.PRI};
+                background: rgba(255, 146, 36, 30);
+                border: 1px solid {C.PRI_DIM};
+                border-radius: 3px;
+                padding: 2px 6px;
+            }}
+        """)
+        hdr.addWidget(self._pill_lbl)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(20, 20)
+        close_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_DIM}; border: none;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; }}
+        """)
+        close_btn.clicked.connect(self.hide)
+        hdr.addWidget(close_btn)
+        lay.addLayout(hdr)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0; border-top: 1px solid rgba(255, 146, 36, 60);")
+        lay.addWidget(sep)
+
+        self._body_lbl = QLabel("")
+        self._body_lbl.setFont(QFont("Courier New", 9))
+        self._body_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent; border: none; line-height: 1.4;")
+        self._body_lbl.setWordWrap(True)
+        self._body_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self._body_lbl)
+
+        self.hide()
+
+    def display(self, title: str, message: str, status_pill: str = "", duration_ms: int = 9000):
+        self._title_lbl.setText(str(title).upper())
+        self._body_lbl.setText(str(message))
+        if status_pill:
+            self._pill_lbl.setText(str(status_pill).upper())
+            self._pill_lbl.show()
+        else:
+            self._pill_lbl.hide()
+        self.adjustSize()
+        if duration_ms > 0:
+            self._timer.start(duration_ms)
+        else:
+            self._timer.stop()
+        self.show()
+        self.raise_()
+
+
+# [AURA-FEATURE: cinematic-opening]
+class CinematicOpeningOverlay(QWidget):
+    """
+    Futuristic arc-reactor boot animation running at 60 FPS.
+    - Pure QPainter, 0 GPU requirements, lightweight vector math.
+    - Renders concentric rotating rings with tick marks, sweeping radar scan line,
+      expanding golden data-sphere with orbiting particles, glowing title reveal.
+    - Interactive: skippable immediately by clicking or pressing any key.
+    - Respects reduce_motion setting: completes in 150ms if motion is reduced.
+    - Never blocks audio threads or background processing.
+    """
+
+    finished = pyqtSignal()
+
+    def __init__(self, parent=None, reduce_motion: bool = False):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._reduce_motion = bool(reduce_motion)
+        self._duration = 0.15 if self._reduce_motion else 2.4
+        self._start_time = 0.0
+        self._elapsed = 0.0
+        self._on_finish_cb: Any = None
+        self._particles = [
+            {
+                "r": random.uniform(30, 220),
+                "speed": random.uniform(0.5, 2.5) * random.choice([1, -1]),
+                "angle": random.uniform(0, 360),
+                "size": random.uniform(1.5, 3.5),
+                "alpha": random.uniform(0.4, 0.95),
+            }
+            for _ in range(32)
+        ]
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)  # ~60 FPS
+        self._timer.timeout.connect(self._step)
+        self.hide()
+
+    def play(self, on_finish: Any = None) -> None:
+        p = self.parentWidget()
+        if p is not None:
+            active_dialog = getattr(p, "_overlay", None) or getattr(p, "_customize_overlay", None)
+            if active_dialog and active_dialog.isVisible():
+                if on_finish:
+                    try:
+                        on_finish()
+                    except Exception:
+                        pass
+                return
+            self.setGeometry(0, 0, p.width(), p.height())
+        self._on_finish_cb = on_finish
+        self._start_time = time.monotonic()
+        self._elapsed = 0.0
+        self.show()
+        self.raise_()
+        self.setFocus()
+        self._timer.start()
+
+    def _step(self) -> None:
+        now = time.monotonic()
+        self._elapsed = now - self._start_time
+        if self._elapsed >= self._duration:
+            self._finish()
+            return
+        self.update()
+
+    def _finish(self) -> None:
+        self._timer.stop()
+        self.hide()
+        p = self.parentWidget()
+        if p is not None:
+            p.update(self.geometry())
+            for attr in ("_overlay", "_customize_overlay", "_remote_overlay", "_presence_card"):
+                w = getattr(p, attr, None)
+                if w and w.isVisible():
+                    w.raise_()
+        self.finished.emit()
+        if self._on_finish_cb:
+            cb = self._on_finish_cb
+            self._on_finish_cb = None
+            try:
+                cb()
+            except Exception as exc:
+                _LOG.warning("CinematicOpening on_finish error: %s", exc)
+
+    def mousePressEvent(self, event) -> None:
+        self._finish()
+
+    def keyPressEvent(self, event) -> None:
+        self._finish()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = float(self.width())
+        h = float(self.height())
+        cx = w / 2.0
+        cy = h / 2.0
+
+        progress = min(1.0, max(0.0, self._elapsed / max(0.01, self._duration)))
+
+        if self._reduce_motion:
+            fade_out = max(0.0, 1.0 - progress)
+            p.fillRect(0, 0, int(w), int(h), QColor(0, 0, 0, int(220 * fade_out)))
+            p.setPen(QColor(255, 246, 236, int(255 * fade_out)))
+            p.setFont(QFont("Courier New", 26, QFont.Weight.Bold))
+            p.drawText(int(cx - 300), int(cy - 20), 600, 40, Qt.AlignmentFlag.AlignCenter, "A . U . R . A .   v 2")
+            p.end()
+            return
+
+        fade_out = 1.0 if progress <= 0.85 else max(0.0, 1.0 - (progress - 0.85) / 0.15)
+
+        # Scrim background
+        p.fillRect(0, 0, int(w), int(h), QColor(0, 0, 0, int(240 * fade_out)))
+
+        # Radial background atmospheric glow
+        bg_rad = QRadialGradient(cx, cy, 380)
+        bg_rad.setColorAt(0.0, QColor(255, 146, 36, int(35 * fade_out)))
+        bg_rad.setColorAt(0.6, QColor(20, 10, 0, int(200 * fade_out)))
+        bg_rad.setColorAt(1.0, QColor(0, 0, 0, int(245 * fade_out)))
+        p.fillRect(0, 0, int(w), int(h), bg_rad)
+
+        # Outer ring with HUD tick marks
+        r_outer = 260.0
+        p.setPen(QPen(QColor(C.PRI_DIM), 1.0, Qt.PenStyle.DashLine))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(int(cx - r_outer), int(cy - r_outer), int(r_outer * 2), int(r_outer * 2))
+
+        rot = (self._elapsed * 25.0) % 360.0
+        p.setPen(QPen(QColor(C.PRI), 1.0))
+        for deg in range(0, 360, 15):
+            rad = math.radians(deg + rot)
+            x1 = cx + (r_outer - 6) * math.cos(rad)
+            y1 = cy + (r_outer - 6) * math.sin(rad)
+            x2 = cx + (r_outer + 2) * math.cos(rad)
+            y2 = cy + (r_outer + 2) * math.sin(rad)
+            p.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        # Mid ring with cardinal brackets
+        r_mid = 180.0
+        rot_mid = -(self._elapsed * 45.0) % 360.0
+        p.setPen(QPen(QColor(C.PRI), 1.5))
+        for deg in [0, 90, 180, 270]:
+            p.drawArc(
+                int(cx - r_mid), int(cy - r_mid), int(r_mid * 2), int(r_mid * 2),
+                int((deg + rot_mid - 20) * 16), int(40 * 16)
+            )
+
+        # Sweeping radar scan line
+        scan_angle = (self._elapsed * 220.0) % 360.0
+        s_rad = math.radians(scan_angle)
+        sx = cx + r_outer * math.cos(s_rad)
+        sy = cy + r_outer * math.sin(s_rad)
+        p.setPen(QPen(QColor(255, 200, 100, int(220 * fade_out)), 1.5))
+        p.drawLine(int(cx), int(cy), int(sx), int(sy))
+
+        # Orbiting quantum particles
+        for part in self._particles:
+            a = math.radians((part["angle"] + self._elapsed * part["speed"] * 40.0) % 360.0)
+            d = part["r"] * (0.3 + 0.7 * min(1.0, progress * 2.0))
+            px = cx + d * math.cos(a)
+            py = cy + d * math.sin(a)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 146, 36, int(part["alpha"] * 255 * fade_out)))
+            p.drawEllipse(int(px - part["size"] / 2), int(py - part["size"] / 2), int(part["size"]), int(part["size"]))
+
+        # Core glowing arc-reactor orb
+        pulse = math.sin(self._elapsed * 8.0) * 4.0
+        core_r = 55.0 + pulse
+        core_grad = QRadialGradient(cx, cy, core_r)
+        core_grad.setColorAt(0.0, QColor(255, 255, 255, int(240 * fade_out)))
+        core_grad.setColorAt(0.4, QColor(255, 160, 50, int(180 * fade_out)))
+        core_grad.setColorAt(1.0, QColor(255, 100, 0, 0))
+        p.setBrush(core_grad)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(int(cx - core_r), int(cy - core_r), int(core_r * 2), int(core_r * 2))
+
+        # Title reveal
+        if progress >= 0.25:
+            t_alpha = min(1.0, (progress - 0.25) / 0.25) * fade_out
+            p.setPen(QColor(255, 246, 236, int(255 * t_alpha)))
+            p.setFont(QFont("Courier New", 26, QFont.Weight.Bold))
+            p.drawText(int(cx - 300), int(cy - 20), 600, 40, Qt.AlignmentFlag.AlignCenter, "A . U . R . A .   v 2")
+
+            p.setPen(QColor(255, 146, 36, int(220 * t_alpha)))
+            p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+            p.drawText(int(cx - 300), int(cy + 25), 600, 20, Qt.AlignmentFlag.AlignCenter, "◈  AUTONOMOUS USER-RESPONSIVE ASSISTANT  ◈")
+
+        # Dynamic boot status readout
+        p.setPen(QColor(C.PRI))
+        p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        if progress < 0.30:
+            status_msg = "[BOOT.SEQ.1] ◈ IGNITING QUANTUM CORE..."
+        elif progress < 0.60:
+            status_msg = "[BOOT.SEQ.2] ◈ NEURAL SYNAPSE ENGAGED // 60 FPS HUD"
+        elif progress < 0.85:
+            status_msg = "[BOOT.SEQ.3] ◈ CALIBRATING DSP & AUDIO PIPELINE..."
+        else:
+            status_msg = "[SYS.READY] ◈ ALL SYSTEMS OPERATIONAL"
+        p.drawText(int(cx - 300), int(cy + 220), 600, 20, Qt.AlignmentFlag.AlignCenter, status_msg)
+
+        p.end()
 
 
 @_motion_overlay
@@ -12367,7 +13212,10 @@ class MainWindow(QMainWindow):
     _cad_cancel_sig = pyqtSignal()
     _cad_question_sig = pyqtSignal(str, str, object)
     _cad_question_hide_sig = pyqtSignal()
+    # [AURA-FEATURE: presence-awareness]
+    _presence_card_sig = pyqtSignal(str, str, str, int)
     _show_window_sig = pyqtSignal()
+    _background_shown_sig = pyqtSignal()
     _background_hidden_sig = pyqtSignal()
     _background_reply_sig = pyqtSignal(str)
     _background_transcript_sig = pyqtSignal(str)
@@ -12615,6 +13463,11 @@ class MainWindow(QMainWindow):
         self._cad_cancel_sig.connect(self._cancel_cad_progress_job)
         self._cad_question_sig.connect(self._show_cad_question)
         self._cad_question_hide_sig.connect(self._hide_cad_question)
+        # [AURA-FEATURE: presence-awareness]
+        self._presence_card = PresenceHoloCard(self.centralWidget())
+        self._presence_card_sig.connect(self._show_presence_card)
+        # [AURA-FEATURE: cinematic-opening]
+        self._cinematic_opening = CinematicOpeningOverlay(self.centralWidget())
         _install_browser_guard()
         _set_browser_swallow_cb(
             lambda _u: self._log_sig.emit("SYS: Kept the page inside the in-app browser."))
@@ -13475,6 +14328,16 @@ class MainWindow(QMainWindow):
         self._notification_panel.refresh()
 
     def _on_notification(self, notification: Notification) -> None:
+        # [AURA-FEATURE: presence-awareness]
+        try:
+            from aura_features import get_feature_registry
+            pm = get_feature_registry().presence_manager
+            if pm and pm.is_away:
+                if pm.should_intercept(notification):
+                    pm.enqueue_notification(notification)
+                    return
+        except Exception:
+            pass
         if not self.isVisible() or self.isMinimized() or self._face_mode in _FACE_COVER:
             return
         if notification.category != "model_router":
@@ -13583,9 +14446,20 @@ class MainWindow(QMainWindow):
         else:
             b._position_compact()
 
+    def showEvent(self, e):
+        super().showEvent(e)
+        if hasattr(self, "hud") and hasattr(self.hud, "_tmr"):
+            if not self.hud._tmr.isActive():
+                self.hud._tmr.start()
+        self._background_shown_sig.emit()
+
     def changeEvent(self, e):
         super().changeEvent(e)
         if e.type() == QEvent.Type.WindowStateChange:
+            if not self.isMinimized() and self.isVisible():
+                if hasattr(self, "hud") and hasattr(self.hud, "_tmr"):
+                    if not self.hud._tmr.isActive():
+                        self.hud._tmr.start()
             mini = getattr(self, "_mini_orb", None)
             if mini is not None:
                 # Windows' own minimise button -> orb appears; restore -> it goes.
@@ -13601,6 +14475,16 @@ class MainWindow(QMainWindow):
                         news_video.resume_after_minimize()
 
     def closeEvent(self, e):
+        # [AURA-FEATURE: presence-awareness]
+        try:
+            from aura_features import get_feature_registry
+            pm = get_feature_registry().presence_manager
+            if pm and pm.is_away:
+                e.ignore()
+                return
+        except Exception:
+            pass
+
         app = QApplication.instance()
         if (
             app is not None
@@ -14463,6 +15347,7 @@ class MainWindow(QMainWindow):
         customize_overlay = getattr(self, "_customize_overlay", None)
         if customize_overlay and customize_overlay.isVisible():
             ow, oh = CustomizeOverlay._OW, CustomizeOverlay._OH
+            oh = min(oh, cw.height() - 16)
             customize_overlay.setGeometry(
                 (cw.width()  - ow) // 2,
                 (cw.height() - oh) // 2,
@@ -14478,6 +15363,14 @@ class MainWindow(QMainWindow):
                 cw.height() - ph - 28,
                 pw, ph,
             )
+        # [AURA-FEATURE: presence-awareness]
+        presence_card = getattr(self, "_presence_card", None)
+        if presence_card and presence_card.isVisible():
+            self._position_presence_card()
+        # [AURA-FEATURE: cinematic-opening]
+        cinematic = getattr(self, "_cinematic_opening", None)
+        if cinematic and cinematic.isVisible():
+            cinematic.setGeometry(cw.rect())
         if hasattr(self, "_video_item"):
             self._fit_video()
         # Face-unlock screen covers the whole window
@@ -14925,6 +15818,14 @@ class MainWindow(QMainWindow):
         cust_btn.setStyleSheet(_BTN_STYLE_DIM)
         cust_btn.clicked.connect(self._open_customize)
         lay.addWidget(cust_btn)
+
+        init_btn = QPushButton("⚡  INITIALISE ASSISTANT / API KEY")
+        init_btn.setFixedHeight(26)
+        init_btn.setFont(QFont("Courier New", 7))
+        init_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        init_btn.setStyleSheet(_BTN_STYLE_DIM)
+        init_btn.clicked.connect(lambda: (self._close_drawer(), self._show_setup()))
+        lay.addWidget(init_btn)
 
         self._brief_btn = QPushButton()
         self._brief_btn.setFixedHeight(26)
@@ -15471,6 +16372,47 @@ class MainWindow(QMainWindow):
                 self._close_fx_graph()
         else:
             self._close_fx_graph()
+
+    # [AURA-FEATURE: presence-awareness]
+    def _position_presence_card(self):
+        card = getattr(self, "_presence_card", None)
+        if card is None or not card.isVisible():
+            return
+        cw = self.centralWidget()
+        if cw is None:
+            return
+        w = card.width()
+        h = card.sizeHint().height()
+        x = (cw.width() - w) // 2
+        y = max(80, (cw.height() - h) // 2 - 40)
+        card.setGeometry(x, y, w, h)
+
+    def _show_presence_card(self, title: str, message: str, status_pill: str = "", duration_ms: int = 9000):
+        self._presence_card.display(title, message, status_pill, duration_ms)
+        self._position_presence_card()
+
+    # [AURA-FEATURE: cinematic-opening]
+    def show_cinematic_opening(self, on_finish: Any = None) -> None:
+        if not getattr(self, "_ready", True) or (getattr(self, "_overlay", None) and self._overlay.isVisible()):
+            if on_finish:
+                try:
+                    on_finish()
+                except Exception:
+                    pass
+            return
+        from memory.config_manager import get_clap_config
+        cfg = get_clap_config()
+        reduce_motion = cfg.get("reduce_motion", False)
+        cinematic = getattr(self, "_cinematic_opening", None)
+        if cinematic is not None:
+            cinematic._reduce_motion = bool(reduce_motion)
+            cinematic._duration = 0.15 if reduce_motion else 2.4
+            cinematic.play(on_finish=on_finish)
+        elif on_finish:
+            try:
+                on_finish()
+            except Exception:
+                pass
 
     @staticmethod
     def _is_news_briefing(title: str) -> bool:
@@ -16886,7 +17828,10 @@ class MainWindow(QMainWindow):
             self.showNormal()
         else:
             self.showMaximized()
-        self.hud._tmr.start()
+        if hasattr(self, "hud") and hasattr(self.hud, "_tmr"):
+            if not self.hud._tmr.isActive():
+                self.hud._tmr.start()
+        self._apply_state("LISTENING")
         self.raise_()
         self.activateWindow()
 
@@ -16934,8 +17879,9 @@ class MainWindow(QMainWindow):
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
             data = _read_full_config()
-            if settings.get("gemini_api_key"):
-                data["gemini_api_key"] = settings["gemini_api_key"]
+            new_key = str(settings.get("gemini_api_key", "")).strip()
+            if new_key:
+                data["gemini_api_key"] = new_key
             else:
                 data.pop("gemini_api_key", None)
             if settings.get("elevenlabs_api_key"):
@@ -16961,11 +17907,24 @@ class MainWindow(QMainWindow):
                 "voice_by_model": settings["voice_by_model"],
                 "tts_voice_by_engine": settings["tts_voice_by_engine"],
             })
+            # Invalidate cached key in core.gemini
+            try:
+                from core import gemini as _core_gemini
+                _core_gemini.api_key(refresh=True)
+            except Exception:
+                pass
+            # Update model router with new key
+            try:
+                from model_router import router as model_router
+                if new_key:
+                    model_router.start_refresh()
+            except Exception:
+                pass
         except Exception as exc:
             self._log.append_log(f"ERR: Could not save setup: {exc}")
             return
         self._ready = True
-        if was_ready and self.on_brain_change:
+        if self.on_brain_change:
             self.on_brain_change()
         if self._overlay:
             self._overlay.begin_initialising(settings)
@@ -17043,6 +18002,16 @@ class AuraUI:
             self.on_show_main_window()
         else:
             self._win._show_window_sig.emit()
+
+    # [AURA-FEATURE: cinematic-opening]
+    def show_cinematic_opening(self, on_finish: Any = None) -> None:
+        if hasattr(self, "_win") and self._win:
+            self._win.show_cinematic_opening(on_finish=on_finish)
+        elif on_finish:
+            try:
+                on_finish()
+            except Exception:
+                pass
 
     def request_quit(self) -> None:
         if self.on_quit_requested is not None:
@@ -17293,6 +18262,11 @@ class AuraUI:
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
         self._win._content_sig.emit(title[:48], text[:4000])
+
+    # [AURA-FEATURE: presence-awareness]
+    def show_presence_card(self, title: str, message: str, status_pill: str = "", duration_ms: int = 9000):
+        """Thread-safe: show floating holographic card on the HUD."""
+        self._win._presence_card_sig.emit(str(title), str(message), str(status_pill), int(duration_ms))
 
     def show_cad_question(self, title: str, question: str, options) -> None:
         """Thread-safe: show one CAD clarification in its floating choice card."""

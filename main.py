@@ -104,6 +104,9 @@ from core.viseme               import VisemeStream
 from core.agent.registry       import AgentToolRegistry
 from screen_agent.config import settings_section as screen_agent_settings_section
 from screen_agent.fastpath import is_screen_agent_request
+# [AURA-FEATURE: presence-awareness]
+from aura_features import get_feature_registry
+from aura_presence import match_presence_intent
 
 _OPEN_AURA_COMMAND = re.compile(
     r"^\s*(?:(?:hey|hi)\s+(?:aura|ora|aurora)[, ]+)?"
@@ -217,7 +220,6 @@ def _open_input_stream(callback, device=None):
 
     last_error = None
     for rate in rates:
-        stream_callback = callback
         if rate != SEND_SAMPLE_RATE:
             def stream_callback(indata, _frames, time_info, status, _rate=rate):
                 samples = np.asarray(indata, dtype=np.float32)
@@ -228,7 +230,26 @@ def _open_input_stream(callback, device=None):
                 converted = np.interp(
                     target_x, source_x, samples[:, 0]
                 ).astype(np.int16).reshape(-1, 1)
+                # [AURA-FEATURE: clap-detection]
+                try:
+                    from aura_features import get_feature_registry
+                    _clap = get_feature_registry().clap_detector
+                    if _clap is not None:
+                        _clap.process_pcm_frame(converted, SEND_SAMPLE_RATE)
+                except Exception:
+                    pass
                 callback(converted, target_len, time_info, status)
+        else:
+            def stream_callback(indata, frames, time_info, status):
+                # [AURA-FEATURE: clap-detection]
+                try:
+                    from aura_features import get_feature_registry
+                    _clap = get_feature_registry().clap_detector
+                    if _clap is not None:
+                        _clap.process_pcm_frame(indata, SEND_SAMPLE_RATE)
+                except Exception:
+                    pass
+                callback(indata, frames, time_info, status)
         try:
             extra_settings = None
             if platform.system() == "Windows" and hasattr(sd, "WasapiSettings"):
@@ -460,8 +481,15 @@ def _render_prompt(template: str, values: dict) -> str:
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    from memory.config_manager import get_gemini_key
+    key = get_gemini_key()
+    if not key:
+        try:
+            with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+                key = str(json.load(f).get("gemini_api_key", ""))
+        except Exception:
+            key = ""
+    return str(key or "").strip().strip('"').strip("'")
 
 
 def _load_system_prompt() -> str:
@@ -640,6 +668,30 @@ TOOL_DECLARATIONS = [
                 },
             },
             "required": [],
+        },
+    },
+    # [AURA-FEATURE: conversation-recall]
+    {
+        "name": "recall_conversation",
+        "description": (
+            "Search past conversation history across turns, days, or weeks by keywords and date range. "
+            "Call this whenever the user asks about something mentioned earlier, in past sessions, or past days "
+            "(e.g. 'what was that book I mentioned last week?', 'what did we discuss yesterday?', 'recall our chat about X'). "
+            "Never invent a past conversation: if nothing is returned, report honestly that you could not find it."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {
+                    "type": "STRING",
+                    "description": "Topic, keyword, or phrase to search for in past chat history.",
+                },
+                "date_range": {
+                    "type": "STRING",
+                    "description": "Optional natural language date or timeframe, e.g. 'yesterday', 'last week', 'in March', 'two days ago'.",
+                },
+            },
+            "required": ["query"],
         },
     },
             {
@@ -1091,14 +1143,14 @@ class AuraLive:
             await asyncio.sleep(0.15)
 
     def _close_to_background(self) -> None:
-        """Hide the window and return to wake-word standby WITHOUT quitting.
+        # [AURA-FEATURE: presence-awareness]
+        try:
+            pm = get_feature_registry().presence_manager
+            if pm and pm.is_away:
+                return
+        except Exception:
+            pass
 
-        This is the same path as clicking the window's X while tray-resident:
-        MainWindow.closeEvent hides the window, BackgroundController ends the
-        live session and restarts the offline wake-word listener. Only a real
-        tray "Quit" terminates the process. If there is no system tray, hiding
-        would leave an invisible, unreachable process, so we really quit then.
-        """
         try:
             from PyQt6.QtCore import QMetaObject, Qt
             from PyQt6.QtWidgets import QApplication
@@ -1116,10 +1168,165 @@ class AuraLive:
 
     def close(self) -> None:
         self.request_shutdown()
+        # [AURA-FEATURE: presence-awareness]
+        try:
+            get_feature_registry().shutdown()
+        except Exception:
+            pass
         if self._ptt is not None:
             self._ptt.stop()
             self._ptt = None
         self.stop_notification_readout()
+
+    # [AURA-FEATURE: presence-awareness]
+    def speak_presence_reply(self, text: str, butler_instruction: str = "") -> None:
+        """Deliver spoken presence confirmations and catch-up through the active AI engine."""
+        ai_prompt = butler_instruction or text
+
+        # 1. Route to the active AI engine (Gemini Live or Local AI)
+        if self._local_mode_active and self._local_brain is not None and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self._local_turn(ai_prompt, log_user=False, record_user=False), self._loop
+            )
+            return
+
+        if self._loop and self.session:
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": ai_prompt}]},
+                    turn_complete=True
+                ),
+                self._loop
+            )
+            return
+
+        # 2. Offline fallback: Kokoro ONNX neural engine (Never Windows Voice Settings/pyttsx3)
+        def _speak_kokoro():
+            try:
+                self._notification_stop.clear()
+                self._notification_skip.clear()
+                engine = self._make_notification_tts()
+                if engine:
+                    self.ui.set_state("SPEAKING")
+                    from core.tts import _play_np
+                    output_device = audio_devices.resolve(get_output_device(), "output")
+                    for samples in engine.audio_chunks(text):
+                        if self._notification_stop.is_set():
+                            break
+                        _play_np(samples, 24_000, device=output_device)
+                    self.ui.set_state("LISTENING")
+            except Exception as exc:
+                print(f"[AURA-PRESENCE] Kokoro speech error: {exc}")
+
+        threading.Thread(target=_speak_kokoro, name="aura-presence-kokoro", daemon=True).start()
+
+    def speak_catchup(self, text: str) -> None:
+        """Alias for speak_presence_reply."""
+        self.speak_presence_reply(text)
+
+    # [AURA-FEATURE: faster-response-warmup]
+    def warmup_engine(self) -> None:
+        """Pre-warm neural speech or local models for instant response."""
+        try:
+            if self._local_mode_active:
+                if self._loop and not self._loop.is_closed():
+                    asyncio.run_coroutine_threadsafe(self._preload_local_tts(), self._loop)
+        except Exception:
+            pass
+
+    def _handle_presence_command(self, intent: str) -> None:
+        pm = get_feature_registry().presence_manager
+        if not pm:
+            return
+
+        if intent == "away":
+            pm.enter_away("User command: heading out")
+            reply = "Understood. Away Mode is now active. I am holding all notifications, reminders, and background tasks safely until you return. Locking workstation."
+            directive = "[SYSTEM NOTIFICATION - ACT AS AURA BUTLER]: The user is heading out. Respond aloud immediately as AURA, their loyal AI assistant and butler: in one short, polished sentence, confirm that Away Mode is engaged, all notifications and tasks are safely held, and you are locking the workstation now."
+            # Display holographic card (no chat display clutter)
+            self.ui.show_presence_card(
+                "AWAY MODE ACTIVE",
+                "Away Mode is active.\nAll notifications, reminders, and background tasks are safely held.\nWorkstation is locked.\n\nSay 'I\\'m back' or unlock Windows when you return.",
+                status_pill="LOCKED",
+                duration_ms=8000,
+            )
+            self.ui.show_background_reply("Away Mode active. Notifications held.")
+            self.speak_presence_reply(reply, butler_instruction=directive)
+
+            # Lock the Windows workstation (Win + L) while keeping AURA running
+            def _lock():
+                import platform, ctypes
+                if platform.system() == "Windows":
+                    try:
+                        ctypes.windll.user32.LockWorkStation()
+                    except Exception as err:
+                        print(f"[AURA-PRESENCE] LockWorkStation error: {err}")
+
+            threading.Timer(2.8, _lock).start()
+
+        elif intent == "back":
+            from aura_presence import is_workstation_locked
+            if is_workstation_locked():
+                unlocked = pm.unlock_desktop()
+                if not unlocked:
+                    prompt = "Welcome back. I have awakened your sign-in screen. Please complete authentication to unlock your workstation."
+                    auth_directive = "[SYSTEM NOTIFICATION - ACT AS AURA BUTLER]: The user is returning to their locked workstation. Respond aloud immediately as AURA: in one short polite sentence, let them know you have awakened the sign-in screen and are ready to verify their authentication to unlock."
+                    self.ui.show_presence_card(
+                        "SIGN-IN SCREEN AWAKENED",
+                        "Sign-in screen awakened.\nPlease authenticate via Windows Hello, PIN, or Password to unlock.",
+                        status_pill="AUTHENTICATING",
+                        duration_ms=8000,
+                    )
+                    self.ui.show_background_reply(prompt)
+                    self.speak_presence_reply(prompt, butler_instruction=auth_directive)
+                    return
+
+            catchup = pm.exit_away("User command: returned")
+            count = catchup.get("count", 0) if catchup else 0
+            if count > 0:
+                summary = catchup.get("summary", "")
+                reply = f"{summary} Say 'read details' to hear everything."
+                card_body = f"{summary}\n\nSay 'read details' to hear the itemized breakdown."
+                status_pill = f"{count} HELD"
+                directive = f"[SYSTEM NOTIFICATION - ACT AS AURA BUTLER]: The user has returned. Greet them warmly like a loyal butler and deliver this catch-up summary: '{summary}'. Ask if they would like you to read the details."
+            else:
+                reply = "Welcome back! I kept watch while you were away. You have no missed notifications or reminders—all systems are quiet and up to date."
+                card_body = "Welcome back!\nNo missed notifications, reminders, or tasks while you were away.\nAll systems are quiet and up to date."
+                status_pill = "ALL CAUGHT UP"
+                directive = "[SYSTEM NOTIFICATION - ACT AS AURA BUTLER]: The user has returned. Greet them warmly and respectfully like a loyal butler, and let them know all systems remained quiet with no missed notifications or tasks while they were away."
+
+            # Display holographic card (no chat display clutter)
+            self.ui.show_presence_card(
+                "WELCOME BACK",
+                card_body,
+                status_pill=status_pill,
+                duration_ms=9000,
+            )
+            self.ui.show_background_reply(reply)
+            self.speak_presence_reply(reply, butler_instruction=directive)
+
+        elif intent == "read_details":
+            details = pm.get_last_catchup_details()
+            if details:
+                text_content = "Here is what arrived while you were away:\n\n" + "\n".join(f"• {d}" for d in details)
+                speech_text = "Here are the details from while you were away: " + ". ".join(details)
+                status_pill = f"{len(details)} ITEMS"
+                directive = f"[SYSTEM NOTIFICATION - ACT AS AURA BUTLER]: The user requested their away catch-up details. Read these itemized items aloud in a refined, organized butler style: '{speech_text}'."
+            else:
+                text_content = "There are no unread away notifications or tasks to detail.\nYour queue is completely clear and up to date."
+                speech_text = "There are no unread away notifications or tasks to detail. Your queue is completely clear."
+                status_pill = "CLEAR"
+                directive = "[SYSTEM NOTIFICATION - ACT AS AURA BUTLER]: Inform the user politely like a loyal butler that their away queue is completely clear with no unread items to report."
+
+            # Display holographic card (no chat display clutter)
+            self.ui.show_presence_card(
+                "CATCH-UP DETAILS",
+                text_content,
+                status_pill=status_pill,
+                duration_ms=12000,
+            )
+            self.ui.show_background_reply(speech_text)
+            self.speak_presence_reply(speech_text, butler_instruction=directive)
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -1185,7 +1392,8 @@ class AuraLive:
         self._local_tts_engine = None
         self._local_tts_init_task = None
         self._local_tts_failed = False
-        self.request_reconnect(keep_context=True, reason="local AI settings")
+        self._resume_handle = None
+        self.request_reconnect(keep_context=False, reason="brain/API key change")
 
     async def _preload_local_tts(self):
         try:
@@ -1474,6 +1682,25 @@ class AuraLive:
         if _is_open_aura_command(text):
             self._open_aura_window()
             return
+        # [AURA-FEATURE: presence-awareness]
+        presence_intent = match_presence_intent(text)
+        if presence_intent:
+            self._handle_presence_command(presence_intent)
+            return
+        # [AURA-FEATURE: conversation-recall]
+        from aura_chat_memory import match_conversation_recall_intent
+        recall_intent = match_conversation_recall_intent(text)
+        if recall_intent:
+            cm = get_feature_registry().chat_memory_manager
+            if cm:
+                context_snippet = cm.recall_formatted(
+                    recall_intent["query"], date_range=recall_intent["date_range"], limit=5
+                )
+                text = (
+                    f"User asked: '{text}'\n\n"
+                    f"Retrieved from local conversation history:\n{context_snippet}\n\n"
+                    "Answer directly based strictly on the past conversation above. If nothing was found, state so honestly."
+                )
         if self._local_brain is None:
             self.ui.write_log("SYS: Local brain is not ready.")
             return
@@ -1547,6 +1774,12 @@ class AuraLive:
                     if record_user:
                         self._session_log.append(f"User: {text}")
                     self._session_log.append(f"{self._asst_name}: {reply}")
+                    # [AURA-FEATURE: conversation-recall]
+                    cm = get_feature_registry().chat_memory_manager
+                    if cm:
+                        if record_user:
+                            cm.log_turn("user", text)
+                        cm.log_turn("assistant", reply)
                 else:
                     self.ui.show_background_reply(
                         "AURA couldn't produce a response. Please try again."
@@ -1747,7 +1980,7 @@ class AuraLive:
                         transcript_parts = []
                         if transcript.strip():
                             if re.search(
-                                r"\bhey\s+(?:aura|ora|aurora)\b",
+                                r"\b(?:hey\s+|hi\s+|ok\s+|okay\s+)?(?:aura|ora|aurora)\b",
                                 transcript,
                                 re.IGNORECASE,
                             ):
@@ -1967,6 +2200,25 @@ class AuraLive:
         if _is_open_aura_command(text):
             self._open_aura_window()
             return
+        # [AURA-FEATURE: presence-awareness]
+        presence_intent = match_presence_intent(text)
+        if presence_intent:
+            self._handle_presence_command(presence_intent)
+            return
+        # [AURA-FEATURE: conversation-recall]
+        from aura_chat_memory import match_conversation_recall_intent
+        recall_intent = match_conversation_recall_intent(text)
+        if recall_intent:
+            cm = get_feature_registry().chat_memory_manager
+            if cm:
+                context_snippet = cm.recall_formatted(
+                    recall_intent["query"], date_range=recall_intent["date_range"], limit=5
+                )
+                text = (
+                    f"User asked: '{text}'\n\n"
+                    f"Retrieved from local conversation history:\n{context_snippet}\n\n"
+                    "Answer directly based strictly on the past conversation above. If nothing was found, state so honestly."
+                )
         system_intent = match_system_control_intent(text)
         if system_intent:
             threading.Thread(
@@ -2699,11 +2951,16 @@ class AuraLive:
         # the host, the capability list from the registries that were just
         # discovered. Rename the assistant, add a plugin or move to another OS
         # and this follows without anyone editing a prompt.
-        _all_decls = (TOOL_DECLARATIONS
+        _raw_decls = (TOOL_DECLARATIONS
                       + self._action_registry.get_tool_declarations()
                       + self._plugin_registry.get_tool_declarations())
-        _names = {(d.get("name") if isinstance(d, dict) else getattr(d, "name", ""))
-                  for d in _all_decls}
+        _all_decls = []
+        _names = set()
+        for d in _raw_decls:
+            n = d.get("name") if isinstance(d, dict) else getattr(d, "name", "")
+            if n and n not in _names:
+                _names.add(n)
+                _all_decls.append(d)
         local_settings = get_local_llm_config()
         coding_task_routing = ""
         if (
@@ -2941,6 +3198,18 @@ class AuraLive:
                 # the work itself.
                 result = search_memory(args.get("query", ""), limit=8)
 
+            elif name == "recall_conversation":
+                # [AURA-FEATURE: conversation-recall]
+                cm = get_feature_registry().chat_memory_manager
+                if cm:
+                    result = cm.recall_formatted(
+                        args.get("query", ""),
+                        date_range=args.get("date_range", ""),
+                        limit=5,
+                    )
+                else:
+                    result = "Conversation history memory is currently disabled."
+
             elif name == "undo":
                 if str(args.get("action", "")).lower().strip() == "list":
                     items = undo_stack.history()
@@ -3008,35 +3277,41 @@ class AuraLive:
                     result = "Specify action (add/remove/list) and a topic."
 
             elif name == "shutdown_aura":
-                self.ui.write_log("SYS: Shutdown requested.")
-                async def _do_shutdown():
-                    await self._save_session_summary()
-                    if self.session:
-                        try:
-                            await self.session.send_client_content(
-                                turns={"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]},
-                                turn_complete=True,
-                            )
-                        except Exception as exc:
-                            self.ui.write_log(
-                                f"SYS: Could not send the shutdown goodbye: {exc}"
-                            )
-                    # Let the goodbye finish before the window hides (hiding
-                    # ends the session and would cut the speech off).
-                    await asyncio.sleep(2.0)
-                    _waited = 0.0
-                    while self._is_speaking and _waited < 8.0:
-                        await asyncio.sleep(0.2)
-                        _waited += 0.2
-                    # Like "Hey Google" on Android: close the window and go back
-                    # to waiting for the wake word. The background process, tray
-                    # icon and wake-word listener keep running.
-                    self._close_to_background()
-                asyncio.create_task(_do_shutdown())
-                result = (
-                    "A.U.R.A. is closing its window and going back to the "
-                    "background; it will wake again on 'Hey AURA'. Say a brief goodbye."
-                )
+                # [AURA-FEATURE: presence-awareness]
+                pm = get_feature_registry().presence_manager
+                if pm and pm.is_away:
+                    self.ui.write_log("SYS: Away Mode is active — ignoring shutdown request so AURA stays on guard.")
+                    result = "Away Mode is currently active and the workstation is secure. AURA remains running on watch."
+                else:
+                    self.ui.write_log("SYS: Shutdown requested.")
+                    async def _do_shutdown():
+                        await self._save_session_summary()
+                        if self.session:
+                            try:
+                                await self.session.send_client_content(
+                                    turns={"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]},
+                                    turn_complete=True,
+                                )
+                            except Exception as exc:
+                                self.ui.write_log(
+                                    f"SYS: Could not send the shutdown goodbye: {exc}"
+                                )
+                        # Let the goodbye finish before the window hides (hiding
+                        # ends the session and would cut the speech off).
+                        await asyncio.sleep(2.0)
+                        _waited = 0.0
+                        while self._is_speaking and _waited < 8.0:
+                            await asyncio.sleep(0.2)
+                            _waited += 0.2
+                        # Like "Hey Google" on Android: close the window and go back
+                        # to waiting for the wake word. The background process, tray
+                        # icon and wake-word listener keep running.
+                        self._close_to_background()
+                    asyncio.create_task(_do_shutdown())
+                    result = (
+                        "A.U.R.A. is closing its window and going back to the "
+                        "background; it will wake again on 'Hey AURA'. Say a brief goodbye."
+                    )
 
             elif self._action_registry.has(name):
                 if name == "cad_design":
@@ -3473,7 +3748,7 @@ class AuraLive:
                                             )
                                         )
                                 if re.search(
-                                    r"\bhey\s+(?:aura|ora|aurora)\b",
+                                    r"\b(?:hey\s+|hi\s+|ok\s+|okay\s+)?(?:aura|ora|aurora)\b",
                                     txt,
                                     re.IGNORECASE,
                                 ):
@@ -3507,6 +3782,16 @@ class AuraLive:
                                     continue
                                 if _is_open_aura_command(full_in):
                                     self._open_aura_window()
+                                # [AURA-FEATURE: presence-awareness]
+                                presence_intent = match_presence_intent(full_in)
+                                if presence_intent:
+                                    self._handle_presence_command(presence_intent)
+                                    in_buf = []
+                                    out_buf = []
+                                    gemini_audio_buffer.clear()
+                                    if self._turn_done_event:
+                                        self._turn_done_event.set()
+                                    continue
                                 notification_intent = match_notification_intent(full_in)
                                 if (notification_intent in {"stop", "skip"}
                                         and self._notification_read_active()):
@@ -3528,6 +3813,10 @@ class AuraLive:
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
+                                # [AURA-FEATURE: conversation-recall]
+                                cm = get_feature_registry().chat_memory_manager
+                                if cm:
+                                    cm.log_turn("user", full_in)
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
@@ -3550,6 +3839,10 @@ class AuraLive:
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self.ui.show_background_reply(full_out)
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
+                                # [AURA-FEATURE: conversation-recall]
+                                cm = get_feature_registry().chat_memory_manager
+                                if cm:
+                                    cm.log_turn("assistant", full_out)
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "aura",
@@ -4026,6 +4319,11 @@ class AuraLive:
             if speaking:
                 continue
 
+            # [AURA-FEATURE: presence-awareness]
+            pm = get_feature_registry().presence_manager
+            if pm and pm.is_away:
+                continue
+
             if not self._proactive.should_trigger(self._last_user_speech):
                 continue
 
@@ -4361,14 +4659,15 @@ class AuraLive:
                     continue
 
                 # Invalid API key — stop hammering the API, prompt re-configuration
-                if "API key not valid" in err_str or "1007" in err_str:
+                if "API key not valid" in err_str or "API_KEY_INVALID" in err_str:
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
                     self.ui.set_state("SLEEPING")
                     self.ui.prompt_reconfig()
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
                     print("[AURA] New API key saved — reconnecting...")
-                    _conn_backoff = 3
+                    self._conn_backoff = 3
+                    self._resume_handle = None
                     continue
 
                 # Quota exhaustion is not transient. Retrying the same key
@@ -4504,6 +4803,12 @@ def main():
             background_mode=args.background,
             runner_done=runner_done,
         )
+        # [AURA-FEATURE: presence-awareness]
+        feature_registry = get_feature_registry()
+        feature_registry.initialize(app, ui, aura, app._aura_background_controller)
+        # [AURA-FEATURE: cinematic-opening]
+        if not args.background and ui and getattr(ui._win, "_ready", True):
+            ui.show_cinematic_opening()
     except Exception as exc:
         _startup_log("init failed:\n" + traceback.format_exc())
         if aura is not None:
