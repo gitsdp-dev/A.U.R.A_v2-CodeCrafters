@@ -1,0 +1,11 @@
+[
+ {
+  "role": "user",
+  "text": "[TASK]\nWrite one short sentence about A.U.R.A."
+ },
+ {
+  "role": "model",
+  "text": "A.U.R.A. is a background assistant that handles longer tasks while you continue your conversation.",
+  "calls": []
+ }
+]

@@ -1,0 +1,56 @@
+{
+ "id": "t111931b64a",
+ "agent": "general",
+ "title": "Write one short sentence about A.U.R.A.",
+ "task": "Write one short sentence about A.U.R.A.",
+ "origin": "desk",
+ "deliver": "silent",
+ "status": "done",
+ "created": 1795089344.7937832,
+ "started": 1795089344.9532888,
+ "finished": 1795089388.5424068,
+ "not_before": 0.0,
+ "budget": {
+  "minutes": 1,
+  "rounds": 40
+ },
+ "used": {
+  "rounds": 1,
+  "seconds": 5.1
+ },
+ "attempts": 1,
+ "quota_until": 0.0,
+ "wrap_up": false,
+ "notes_in": [],
+ "events": [
+  {
+   "t": 1795089344.7951877,
+   "kind": "state",
+   "text": "queued"
+  },
+  {
+   "t": 1795089344.9543989,
+   "kind": "state",
+   "text": "running"
+  },
+  {
+   "t": 1795089383.3083937,
+   "kind": "state",
+   "text": "resuming after an interruption"
+  },
+  {
+   "t": 1795089383.4213574,
+   "kind": "state",
+   "text": "running"
+  },
+  {
+   "t": 1795089388.5435479,
+   "kind": "state",
+   "text": "done"
+  }
+ ],
+ "files": [],
+ "result": "A.U.R.A. is an autonomous assistant that carries out tasks in the background, providing results to the user.",
+ "report": "F:\\A.U.R.A. PROJECT FOLDERS\\v2_main\\reports\\2026-11-19-write-one-short-sentence-about-a-u-r-a-t111931b64a.md",
+ "error": ""
+}

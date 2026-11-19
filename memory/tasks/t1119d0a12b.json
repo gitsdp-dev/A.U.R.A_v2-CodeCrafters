@@ -1,0 +1,46 @@
+{
+ "id": "t1119d0a12b",
+ "agent": "general",
+ "title": "Write one short sentence about A.U.R.A.",
+ "task": "Write one short sentence about A.U.R.A.",
+ "origin": "desk",
+ "deliver": "silent",
+ "status": "done",
+ "created": 1795089383.3119287,
+ "started": 1795089383.4151685,
+ "finished": 1795089388.4134247,
+ "not_before": 0.0,
+ "budget": {
+  "minutes": 1,
+  "rounds": 40
+ },
+ "used": {
+  "rounds": 1,
+  "seconds": 5.0
+ },
+ "attempts": 0,
+ "quota_until": 0.0,
+ "wrap_up": false,
+ "notes_in": [],
+ "events": [
+  {
+   "t": 1795089383.314326,
+   "kind": "state",
+   "text": "queued"
+  },
+  {
+   "t": 1795089383.416167,
+   "kind": "state",
+   "text": "running"
+  },
+  {
+   "t": 1795089388.4146223,
+   "kind": "state",
+   "text": "done"
+  }
+ ],
+ "files": [],
+ "result": "A.U.R.A. is a background assistant that handles longer tasks while you continue your conversation.",
+ "report": "F:\\A.U.R.A. PROJECT FOLDERS\\v2_main\\reports\\2026-11-19-write-one-short-sentence-about-a-u-r-a-t1119d0a12b.md",
+ "error": ""
+}
