@@ -30,14 +30,14 @@ click an option or answer with its ordinal (for example, "the second option");
 typed replies are accepted through the same clarification flow.
 
 Complex CAD requests use the deep task route. It checks the API key's model list
-and only attempts `gemini-3.8-flash`, `gemini-3.6-flash`, and the free-tier
+and prioritizes `gemini-4-hydrogen`, `gemini-3.8-flash`, `gemini-3.6-flash`, and the free-tier
 `gemini-3.5-flash-lite` fallback when those exact model IDs are listed as
 supporting content generation. If discovery fails, the route fails closed to
 local fallback/retry; it does not hand deep requests to the older legacy Gemini
 ladder.
 
 Google's [current pricing page](https://aistudio.google.com/docs/pricing) lists
-Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite as free of charge on its Standard
+Gemini 4 Hydrogen, Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite as free of charge on its Standard
 Free Tier. This is not a promise that those prices or limits will remain
 unchanged. A.U.R.A. cannot inspect whether the API key's Google project has
 billing enabled. To avoid charges, use a project that remains on the Free Tier

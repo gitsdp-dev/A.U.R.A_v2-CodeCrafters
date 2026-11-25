@@ -1,45 +1,42 @@
 """
-aura_clap.py — Double-Clap / Snap Wake Detection & DSP for A.U.R.A. v2
+aura_clap.py — Double-Clap Wake Detection & Transient DSP for A.U.R.A. v2
 
 Pure-numpy transient classifier that subscribes to existing audio streams
 (no competing audio device streams).
 
-Why the old version woke on mouse / keyboard clicks
----------------------------------------------------
-Mouse and key clicks are sharp, broadband transients too, so a detector based
-only on peak / crest factor / zero-crossing rate cannot tell them apart from a
-clap.  This version adds several independent rejection layers:
+Optimized for Clap-Only Wake & Anti-Doubling Rejection
+-----------------------------------------------------
+Mechanical clicks (keyboard, mouse), finger snaps, desk taps, and pen clicks
+produce sharp acoustic transients. This detector uses multi-layer discrimination
+to wake STRICTLY on deliberate human hand claps and reject any doubling-up of
+frequent sharp sounds:
 
-  1. OS input guard   - if the OS reports keyboard/mouse input at the moment of
-                        the sound, it is a click, not a clap (Windows built in,
-                        other platforms via set_input_activity_callback()).
-  2. Envelope shape   - fast attack, a minimum duration (mechanical clicks are
-                        only a few ms long) and a decay (speech, music, fans,
-                        scraping are sustained and are rejected).
-  3. Spectrum         - claps carry real low-mid energy; snaps are band-limited
-                        around 1.5-4 kHz; mechanical clicks are dominated by
-                        >4 kHz (>65 %); thumps (desk/door) are dominated by <600 Hz;
-                        tonal sounds (beeps, whistles) are rejected.
-  4. Isolation        - the first clap/snap must be preceded by ~0.5 s without
-                        other transients and nothing else may happen between
-                        the two claps.  Typing bursts, double-clicks and
-                        applause therefore never form a valid pattern.
-  5. Pair consistency - the two claps must have similar loudness.
-  6. Adaptive floor   - a noise floor tracks the room, so thresholds scale.
+  1. OS input guard      - If keyboard/mouse input occurred near the transient
+                           moment, it is typing or clicking, not a clap.
+  2. Strict envelope     - Fast attack (<12 ms) with acoustic body duration
+                           (3.5-38 ms) and exponential decay. Mechanical clicks
+                           (<3.5 ms) and sustained sounds (>38 ms or slow decay)
+                           are rejected.
+  3. Body spectrum       - Human claps have significant acoustic body resonance
+                           in 600-2600 Hz (Helmholtz cavity & palm resonance).
+                           Snaps and pen clicks concentrate in 2600-5000 Hz;
+                           mechanical switches and metal concentrate in >4000 Hz;
+                           desk thumps concentrate in <600 Hz; whistles/tones are
+                           rejected via spectral flatness.
+  4. Isolation & quiet   - The first clap requires preceding quiet (_PRE_QUIET_S)
+                           and a low recent transient density. Typing bursts,
+                           frequent clicks, and clapping along never start a pair.
+  5. Pattern integrity  - Any non-clap sound (or weak transient) between the two
+                           claps immediately resets the detector.
+  6. Pair consistency    - The two claps must have consistent loudness (ratio
+                           0.35-2.8) and matching acoustic duration.
+  7. Adaptive floor      - Dynamic noise tracking ensures thresholds scale with
+                           room ambient noise.
 
-Wake patterns
--------------
-  * two claps (or two snaps) 0.15-0.85 s apart
-  * one clearly isolated snap (confirmed after ~0.35 s of "nothing else")
-
-Both emit ``double_clap_detected`` (backward compatible, this is the wake
-signal AURA already listens to) and ``wake_detected(kind)`` where kind is
-"double_clap", "double_snap" or "snap".
-
-Tuning: set ``"debug": true`` in the clap config to log every classified
-transient (loudness, spectrum, reason for rejection).  Optional config keys:
-enabled, sensitivity, allow_in_foreground, snap_enabled, input_guard,
-input_guard_ms, min_gap_s, max_gap_s, cooldown_s, debug.
+Wake pattern
+------------
+  * Two deliberate claps 0.18-0.85 s apart.
+  * Emits ``double_clap_detected`` and ``wake_detected("double_clap")``.
 """
 
 from __future__ import annotations
@@ -63,16 +60,16 @@ _EVENT_MS = 48.0         # observation window after an onset
 _PRE_EMPH = 0.90         # pre-emphasis coefficient (suppresses desk rumble)
 _WARMUP_BLOCKS = 250     # ~0.5 s of noise-floor calibration, no detections
 _REFRACTORY_S = 0.09     # ignore re-triggers inside one clap's reverb
-_PRE_QUIET_S = 0.5       # required silence before the first clap / snap
-_SNAP_CONFIRM_S = 0.35   # wait this long for a 2nd event before accepting a snap
+_PRE_QUIET_S = 0.40      # required silence before the first clap
+_MAX_RECENT_TRANSIENTS = 2  # max allowed transients in the recent 2.0 s window before the 1st clap
 
 _DEFAULTS = {
     "enabled": True,
     "allow_in_foreground": False,
-    "snap_enabled": True,
+    "snap_enabled": False,   # Strictly claps only; snaps disabled
     "input_guard": True,
-    "input_guard_ms": 150,
-    "min_gap_s": 0.15,
+    "input_guard_ms": 200,   # Keyboard/mouse input window
+    "min_gap_s": 0.18,       # Min gap (180 ms) - excludes mouse double-clicks & key bounces
     "max_gap_s": 0.85,
     "cooldown_s": 2.0,
     "debug": False,
@@ -113,9 +110,10 @@ class _Candidate:
 @dataclass
 class _Event:
     t: float              # onset time on the stream's sample clock (s)
-    kind: str             # "clap" | "snap" | "weak" | "rejected"
+    kind: str             # "clap" | "weak" | "rejected"
     peak: float
     snr: float
+    dur_ms: float = 0.0
     reason: str = ""
     info: str = ""
 
@@ -123,12 +121,12 @@ class _Event:
 class ClapDetector(QObject):
     """
     Subscribes to audio frames from the active microphone stream and emits
-    double_clap_detected when a double clap or an isolated finger snap is heard.
+    double_clap_detected when a double clap is heard.
     """
 
-    double_clap_detected = pyqtSignal()      # wake (double clap OR snap)
+    double_clap_detected = pyqtSignal()      # wake (double clap)
     single_clap_detected = pyqtSignal()      # first clap of a possible pair
-    wake_detected = pyqtSignal(str)          # "double_clap" | "double_snap" | "snap"
+    wake_detected = pyqtSignal(str)          # "double_clap"
 
     def __init__(
         self,
@@ -235,15 +233,15 @@ class ClapDetector(QObject):
     def _build_params(self, cfg: dict) -> dict:
         sens = float(np.clip(cfg.get("sensitivity", self._sensitivity), 0.1, 1.0))
         return {
-            # higher sensitivity -> lower thresholds
-            "snr": 4.0 + (1.0 - sens) * 6.0,
-            "peak_min": 700.0 + (1.0 - sens) * 2200.0,
-            "min_gap": float(cfg.get("min_gap_s", 0.15)),
+            # Robust thresholds: friendly to mid-setup hardware / CPU fan noise
+            "snr": 1.8 + (1.0 - sens) * 3.0,
+            "peak_min": 500.0 + (1.0 - sens) * 1600.0,
+            "min_gap": float(cfg.get("min_gap_s", 0.18)),
             "max_gap": float(cfg.get("max_gap_s", 0.85)),
             "cooldown": float(cfg.get("cooldown_s", 2.0)),
-            "snap": bool(cfg.get("snap_enabled", True)),
+            "snap": bool(cfg.get("snap_enabled", False)),
             "guard": bool(cfg.get("input_guard", True)),
-            "guard_s": float(cfg.get("input_guard_ms", 150)) / 1000.0,
+            "guard_s": float(cfg.get("input_guard_ms", 200)) / 1000.0,
             "fg": bool(cfg.get("allow_in_foreground", False)),
             "debug": bool(cfg.get("debug", False)),
         }
@@ -347,8 +345,8 @@ class ClapDetector(QObject):
             not warm
             and start >= self._refractory_until
             and peak >= 150.0
-            and rms >= floor * 3.0
-            and rms >= 3.0 * base
+            and rms >= floor * 2.2
+            and rms >= 2.2 * base
         )
         if is_onset:
             self._cand = _Candidate(start, wall, floor, [rms], [peak])
@@ -390,8 +388,8 @@ class ClapDetector(QObject):
         flat = float(np.exp(np.mean(np.log(sp))) / np.mean(sp))
         return {
             "low": band(150, 600) / tot,
-            "lowmid": band(600, 1500) / tot,
-            "mid": band(1500, 4000) / tot,
+            "body": band(600, 2600) / tot,
+            "sharp": band(2600, 5000) / tot,
             "high": band(4000, cap) / tot if cap > 4000 else 0.0,
             "centroid": centroid,
             "flat": flat,
@@ -405,7 +403,12 @@ class ClapDetector(QObject):
         pi = int(rms.argmax())
         snr = peak_rms / max(c.floor, 1.0)
         blk_ms = self._blk * 1000.0 / sr
-        ev = _Event(t=c.onset / float(sr), kind="rejected", peak=raw_peak, snr=snr)
+
+        # Baseline-relative excess: prevents CPU/fan ambient noise floor from inflating duration & masking decay
+        peak_excess = max(1.0, peak_rms - c.floor)
+        dur_thresh = c.floor + 0.25 * peak_excess
+        dur_ms = float((rms >= dur_thresh).sum()) * blk_ms
+        ev = _Event(t=c.onset / float(sr), kind="rejected", peak=raw_peak, snr=snr, dur_ms=dur_ms)
 
         if raw_peak < p["peak_min"] or snr < p["snr"]:
             ev.kind, ev.reason = "weak", "below loudness threshold"
@@ -414,12 +417,15 @@ class ClapDetector(QObject):
             ev.reason = "slow attack (not impulsive)"
             return ev
         late = float(rms[(len(rms) * 2) // 3:].mean())
-        if late > 0.40 * peak_rms:
+        late_excess = max(0.0, late - c.floor)
+        if late_excess > 0.40 * peak_excess:
             ev.reason = "sustained sound (speech/music/noise)"
             return ev
-        dur_ms = float((rms >= 0.25 * peak_rms).sum()) * blk_ms
-        if dur_ms < 4.0:
+        if dur_ms < 3.5:
             ev.reason = "too short (mechanical click)"
+            return ev
+        if dur_ms > 38.0:
+            ev.reason = "too long (rub/scrape/voice)"
             return ev
 
         sp = self._spectrum(c)
@@ -428,34 +434,28 @@ class ClapDetector(QObject):
             return ev
         ev.info = (
             f"peak={raw_peak:.0f} snr={snr:.1f} dur={dur_ms:.0f}ms "
-            f"low={sp['low']:.2f} lm={sp['lowmid']:.2f} mid={sp['mid']:.2f} "
+            f"low={sp['low']:.2f} body={sp['body']:.2f} sharp={sp['sharp']:.2f} "
             f"high={sp['high']:.2f} cen={sp['centroid']:.0f}Hz flat={sp['flat']:.2f}"
         )
-        low_part = sp["low"] + sp["lowmid"]
 
+        # Spectral classification for clap vs non-clap sounds:
         if sp["flat"] < 0.015:
             ev.reason = "tonal sound"
-        elif sp["low"] > 0.55:
+        elif sp["low"] > 0.50:
             ev.reason = "low-frequency thump"
-        elif sp["high"] > 0.65:
-            ev.reason = "high-frequency click"
-        elif (
-            p["snap"]
-            and low_part < 0.15
-            and sp["mid"] >= 0.55
-            and sp["high"] <= 0.38
-            and 1800.0 <= sp["centroid"] <= 4800.0
-            and snr >= p["snr"] * 1.6
-            and raw_peak >= p["peak_min"] * 1.5
-        ):
-            ev.kind = "snap"       # narrow-band 1.5-4 kHz pop
-        elif low_part >= 0.06 and 700.0 <= sp["centroid"] <= 4600.0:
-            ev.kind = "clap"       # broadband with real low-mid body
+        elif sp["high"] > 0.68:
+            ev.reason = "high-frequency click / switch"
+        elif sp["sharp"] > 0.60:
+            ev.reason = "sharp snap / click / tap"
+        elif sp["body"] < 0.10:
+            ev.reason = "insufficient clap body resonance (600-2600 Hz)"
+        elif not (700.0 <= sp["centroid"] <= 4800.0):
+            ev.reason = f"centroid {sp['centroid']:.0f}Hz outside clap range"
         else:
-            ev.reason = "spectrum does not match clap/snap"
+            ev.kind = "clap"
 
-        # Layer 1: physical keyboard/mouse activity at the same moment
-        if ev.kind in ("clap", "snap") and p["guard"] and self._input_near(c.wall):
+        # OS input guard: reject if physical keyboard/mouse activity was detected near onset
+        if ev.kind == "clap" and p["guard"] and self._input_near(c.wall):
             ev.kind, ev.reason = "rejected", "keyboard/mouse input at the same moment"
         return ev
 
@@ -467,14 +467,16 @@ class ClapDetector(QObject):
         if idle is None:
             return False
         last_input = time.monotonic() - float(idle)
-        return last_input >= onset_wall - self._p["guard_s"]
+        guard = self._p["guard_s"]
+        return (onset_wall - guard) <= last_input <= (onset_wall + guard + 0.1)
 
     # ── gesture logic ───────────────────────────────────────────────────────
     def _handle_event(self, ev: _Event) -> bool:
         p = self._p
         prior = [e for e in self._events if ev.t - _PRE_QUIET_S <= e.t < ev.t]
+        recent = [e for e in self._events if ev.t - 2.0 <= e.t < ev.t]
         self._events.append(ev)
-        while self._events and ev.t - self._events[0].t > 3.0:
+        while self._events and ev.t - self._events[0].t > 4.0:
             self._events.popleft()
 
         _LOG.log(
@@ -487,8 +489,9 @@ class ClapDetector(QObject):
         if first is not None and ev.t - first.t > p["max_gap"]:
             first = self._first = None
 
-        if ev.kind not in ("clap", "snap"):
-            if first is not None:  # something else happened mid-pattern
+        # WAKE ONLY ON CLAPS: Any non-clap transient immediately aborts an in-flight pair
+        if ev.kind != "clap":
+            if first is not None:
                 self._first = None
             return False
 
@@ -502,17 +505,22 @@ class ClapDetector(QObject):
                 self._first = None
                 return False
             ratio = ev.peak / max(first.peak, 1.0)
-            if 0.2 <= ratio <= 5.0:
-                kind = "double_snap" if first.kind == ev.kind == "snap" else "double_clap"
-                _LOG.info("%s detected (gap=%.3fs, ratio=%.2f)", kind, gap, ratio)
-                return self._fire(kind)
-            self._first = None  # loudness mismatch -> not a deliberate pair
-
-        if prior:  # first event must be isolated
+            dur_diff = abs(ev.dur_ms - first.dur_ms)
+            # Require clap pair consistency in both amplitude (ratio) and duration
+            if 0.35 <= ratio <= 2.8 and dur_diff <= 22.0:
+                _LOG.info("double_clap detected (gap=%.3fs, ratio=%.2f, dur_diff=%.1fms)", gap, ratio, dur_diff)
+                return self._fire("double_clap")
+            self._first = None  # loudness or duration mismatch -> not a deliberate pair
             return False
+
+        # First clap validation:
+        # 1. Pre-quiet silence: no transients within _PRE_QUIET_S
+        # 2. Frequent sound rejection: no burst of recent transients in the last 2.0s
+        if prior or len(recent) > _MAX_RECENT_TRANSIENTS:
+            return False
+
         self._first = ev
-        if ev.kind == "clap":
-            self.single_clap_detected.emit()
+        self.single_clap_detected.emit()
         return False
 
     def _tick(self, t_now: float) -> bool:
@@ -520,9 +528,6 @@ class ClapDetector(QObject):
         if f is None:
             return False
         age = t_now - f.t
-        if f.kind == "snap" and age >= _SNAP_CONFIRM_S:
-            _LOG.info("snap detected (isolated, peak=%.0f)", f.peak)
-            return self._fire("snap")
         if age > self._p["max_gap"] + 0.05:
             self._first = None
         return False
@@ -546,6 +551,6 @@ class ClapDetector(QObject):
             except Exception:
                 pass
         self._cooldown_until = now + p["cooldown"]
-        self.wake_detected.emit(kind)
+        self.wake_detected.emit("double_clap")
         self.double_clap_detected.emit()
         return True

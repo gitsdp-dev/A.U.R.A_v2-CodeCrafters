@@ -139,9 +139,22 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(metadata.model_used, TIERS["fast"][1])
         self.assertEqual(metadata.reason, "rate_limit")
 
-    def test_deep_task_starts_on_38_when_available(self):
+    def test_deep_task_starts_on_hydrogen_when_available(self):
         router, clients = self._router(
             lambda _model, _kwargs: SimpleNamespace(text="done")
+        )
+
+        self._generate(router, "cad_design", "Design the part")
+
+        self.assertEqual(
+            clients[0].models.calls[0]["model"], "gemini-4-hydrogen"
+        )
+
+    def test_deep_task_falls_back_to_38_when_hydrogen_unavailable(self):
+        available = set().union(*TIERS.values()) - {"gemini-4-hydrogen"}
+        router, clients = self._router(
+            lambda _model, _kwargs: SimpleNamespace(text="done"),
+            available=available,
         )
 
         self._generate(router, "cad_design", "Design the part")
@@ -170,7 +183,7 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_missing_deep_models_use_remaining_deep_chain(self):
         available = set().union(*TIERS.values()) - {
-            "gemini-3.8-flash", "gemini-3.6-flash"
+            "gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.6-flash"
         }
         router, clients = self._router(
             lambda _model, _kwargs: SimpleNamespace(text="done"),
@@ -275,6 +288,7 @@ class ModelRouterTests(unittest.TestCase):
             },
         )
         router._daily_counts[date.today().isoformat()] = {
+            "gemini-4-hydrogen": 1,
             "gemini-3.8-flash": 1,
         }
 
@@ -470,6 +484,115 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(selected, ["configured-model"])
         self.assertEqual(response.text, "legacy answer")
         self.assertFalse(metadata.switched)
+
+    def test_gemini_4_hydrogen_coding_and_cad_routing(self):
+        router, clients = self._router(
+            lambda _model, _kwargs: SimpleNamespace(text="code generated")
+        )
+        for task in ("cad_design", "vibe_coding", "coding", "code"):
+            self._generate(router, task, f"Perform {task}")
+        calls = [c["model"] for client in clients for c in client.models.calls]
+        self.assertEqual(calls, ["gemini-4-hydrogen"] * 4)
+
+    def test_gemini_4_hydrogen_full_potential_under_budget_and_strict_exhaustion(self):
+        # When near limit (>= 80% but < 100%), critical tasks (cad/coding) can still use hydrogen
+        import os
+        temp_budget = "temp-hydrogen-budget.json"
+        try:
+            router, clients = self._router(
+                lambda _model, _kwargs: SimpleNamespace(text="done"),
+                settings={
+                    "auto_model_switching": True,
+                    "deep_daily_budget": 50,
+                },
+                budget_file=temp_budget,
+            )
+            # 42 is > 80% (40) but < 50
+            router._daily_counts[date.today().isoformat()] = {
+                "gemini-4-hydrogen": 42,
+            }
+            # Non-critical deep task should yield to gemini-3.8-flash to preserve quota
+            self._generate(router, "long_document_generation", "Draft report")
+            self.assertEqual(clients[-1].models.calls[-1]["model"], "gemini-3.8-flash")
+
+            # But critical CAD or coding task can use gemini-4-hydrogen to full potential
+            self._generate(router, "cad_design", "Design the part")
+            self.assertEqual(clients[-1].models.calls[-1]["model"], "gemini-4-hydrogen")
+
+            # When strictly exhausted (>= 50), even critical tasks must strictly respect free tier
+            router._daily_counts[date.today().isoformat()]["gemini-4-hydrogen"] = 50
+            self._generate(router, "cad_design", "Design another part")
+            self.assertEqual(clients[-1].models.calls[-1]["model"], "gemini-3.8-flash")
+        finally:
+            if os.path.exists(temp_budget):
+                try:
+                    os.remove(temp_budget)
+                except Exception:
+                    pass
+
+    def test_stream_chunks_with_thinking_parts_do_not_break(self):
+        class _Candidate:
+            def __init__(self, parts):
+                self.content = SimpleNamespace(parts=parts)
+
+        class _Chunk:
+            def __init__(self, parts=None, text_raises=False, text_val=None):
+                self._text_raises = text_raises
+                self._text_val = text_val
+                if parts:
+                    self.candidates = [_Candidate(parts)]
+
+            @property
+            def text(self):
+                if self._text_raises:
+                    raise ValueError("Content has no parts with text")
+                return self._text_val
+
+        def handler(model, _kwargs):
+            # Stream: chunk 1 thinking only (raises on .text), chunk 2 code, chunk 3 code
+            c1 = _Chunk(parts=[SimpleNamespace(thought=True, text="thinking")], text_raises=True)
+            c2 = _Chunk(parts=[SimpleNamespace(thought=False, text="import cad\n")], text_val="import cad\n")
+            c3 = _Chunk(parts=[SimpleNamespace(thought=False, text="cad.build()\n")], text_val="cad.build()\n")
+            return iter([c1, c2, c3])
+
+        router, _clients = self._router(handler)
+        chunks = []
+        response, metadata = self._generate(
+            router,
+            "cad_design",
+            "Design bracket",
+            on_chunk=chunks.append,
+        )
+        self.assertEqual(response.text, "import cad\ncad.build()\n")
+        self.assertEqual("".join(chunks), "import cad\ncad.build()\n")
+        self.assertEqual(metadata.model_used, "gemini-4-hydrogen")
+
+    def test_stream_rate_limit_handoff_from_hydrogen_to_flash(self):
+        attempts = []
+
+        def handler(model, _kwargs):
+            attempts.append(model)
+            if model == "gemini-4-hydrogen":
+                def interrupted():
+                    yield "def build_model():\n"
+                    raise _ApiError(429, "rate limit exceeded")
+                return interrupted()
+            return iter(["    return Part()\n"])
+
+        router, _clients = self._router(handler)
+        visible = []
+        response, metadata = self._generate(
+            router,
+            "coding",
+            "Write the builder",
+            on_chunk=visible.append,
+        )
+        self.assertEqual(response.text, "def build_model():\n    return Part()\n")
+        self.assertEqual("".join(visible), "def build_model():\n    return Part()\n")
+        self.assertEqual(attempts, ["gemini-4-hydrogen", "gemini-3.8-flash"])
+        self.assertEqual(metadata.model_used, "gemini-3.8-flash")
+        self.assertEqual(metadata.previous_model, "gemini-4-hydrogen")
+        self.assertEqual(metadata.reason, "rate_limit")
 
 
 if __name__ == "__main__":

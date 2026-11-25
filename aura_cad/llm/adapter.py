@@ -54,6 +54,7 @@ class CadLLMAdapter:
             tier=gemini.SMART,
             task_type="cad_design",
             timeout_ms=180_000,
+            critical=True,
             raise_errors=True,
         )
 

@@ -4949,6 +4949,35 @@ class PermissionsOverlay(QWidget):
         self._enabled.toggled.connect(self._set_enabled)
         root.addWidget(self._enabled)
 
+        # [AURA-FEATURE: advanced-vision]
+        from memory.config_manager import get_vision_config
+        vcfg = get_vision_config()
+        v_hdr = QLabel("VISION PERMISSIONS")
+        v_hdr.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        v_hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; margin-top: 6px;")
+        root.addWidget(v_hdr)
+
+        self._v_cam = QCheckBox("Camera vision (on-demand only)")
+        self._v_cam.setChecked(bool(vcfg.get("camera_enabled", True)))
+        self._v_scr = QCheckBox("Screen capture (on-demand only)")
+        self._v_scr.setChecked(bool(vcfg.get("screen_enabled", True)))
+        self._v_fil = QCheckBox("File / image / PDF analysis")
+        self._v_fil.setChecked(bool(vcfg.get("file_enabled", True)))
+        self._v_ask = QCheckBox("Ask every time before capturing (safest)")
+        self._v_ask.setChecked(bool(vcfg.get("ask_every_time", True)))
+        self._v_rem = QCheckBox("Remember permission for this session")
+        self._v_rem.setChecked(bool(vcfg.get("remember_for_session", False)))
+
+        for chk in (self._v_cam, self._v_scr, self._v_fil, self._v_ask, self._v_rem):
+            chk.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+            root.addWidget(chk)
+
+        self._v_cam.toggled.connect(lambda _v: self._save_vision_prefs())
+        self._v_scr.toggled.connect(lambda _v: self._save_vision_prefs())
+        self._v_fil.toggled.connect(lambda _v: self._save_vision_prefs())
+        self._v_ask.toggled.connect(self._on_vision_ask_toggled)
+        self._v_rem.toggled.connect(self._on_vision_remember_toggled)
+
         grants_label = QLabel("Active read-folder grants (this session only)")
         grants_label.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         root.addWidget(grants_label)
@@ -4981,6 +5010,35 @@ class PermissionsOverlay(QWidget):
 
     def _set_enabled(self, enabled: bool):
         self._broker.enabled = bool(enabled)
+
+    def _on_vision_ask_toggled(self, checked: bool):
+        if checked and self._v_rem.isChecked():
+            self._v_rem.blockSignals(True)
+            self._v_rem.setChecked(False)
+            self._v_rem.blockSignals(False)
+        self._save_vision_prefs()
+
+    def _on_vision_remember_toggled(self, checked: bool):
+        if checked and self._v_ask.isChecked():
+            self._v_ask.blockSignals(True)
+            self._v_ask.setChecked(False)
+            self._v_ask.blockSignals(False)
+        self._save_vision_prefs()
+
+    def _save_vision_prefs(self):
+        from memory.config_manager import save_vision_config
+        save_vision_config({
+            "camera_enabled": self._v_cam.isChecked(),
+            "screen_enabled": self._v_scr.isChecked(),
+            "file_enabled": self._v_fil.isChecked(),
+            "ask_every_time": self._v_ask.isChecked(),
+            "remember_for_session": self._v_rem.isChecked(),
+        })
+        try:
+            from core.vision.service import get_vision_service
+            get_vision_service().permissions.clear_session_grants()
+        except Exception:
+            pass
 
     def _refresh_grants(self):
         self._grants.clear()
@@ -13180,6 +13238,7 @@ class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
+    _agenda_sig     = pyqtSignal(str, str)   # (title, text) — thread-safe agenda panel
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
@@ -13198,10 +13257,15 @@ class MainWindow(QMainWindow):
     _earth_command_sig = pyqtSignal(str, str, str)
     _face_cam_sig   = pyqtSignal(bool)       # first camera check: suitable camera present?
     _face_ready_sig = pyqtSignal(bool)       # face engine loaded (True) / unavailable (False)
+    _learning_sig   = pyqtSignal()           # Adaptive Intelligence review dialog
     _face_evt_sig   = pyqtSignal(str, int, str)  # (kind, n, message) from the face worker
     _notification_sig = pyqtSignal(object)
     _notification_unavailable_sig = pyqtSignal(str)
     _notification_reading_sig = pyqtSignal(str)
+    # [AURA-FEATURE: advanced-vision]
+    _vision_indicator_sig = pyqtSignal(str, bool)
+    _vision_result_sig = pyqtSignal(str, str, str)
+    _vision_preview_sig = pyqtSignal(bytes, str, object)
     _notification_read_sig = pyqtSignal(str)
     _notification_command_sig = pyqtSignal(str)
     _system_panel_sig = pyqtSignal(str)
@@ -13230,6 +13294,8 @@ class MainWindow(QMainWindow):
         self._face_path = face_path
         self._background_mode = bool(background_mode)
         self._news_video_panel = None
+        self._agenda_panel = None
+        self._calendar_dialog = None
         self._news_shutting_down = False
         self._fx_graph_panel = None
         self._fx_graph_request_id = 0
@@ -13429,6 +13495,11 @@ class MainWindow(QMainWindow):
         self._update_autostart_btn(self._check_autostart())
         from memory.config_manager import get_brief_enabled as _gbe
         self._update_brief_btn(_gbe())
+        try:
+            from memory.config_manager import get_learning_config as _glc
+            self._update_learning_btn(_glc().get("enabled", True))
+        except Exception:
+            pass
 
         self._clock_tmr = QTimer(self)
         self._clock_tmr.timeout.connect(self._tick_clock)
@@ -13473,6 +13544,7 @@ class MainWindow(QMainWindow):
             lambda _u: self._log_sig.emit("SYS: Kept the page inside the in-app browser."))
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
+        self._agenda_sig.connect(self._show_agenda_panel)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
         self._cam_stream_sig.connect(self._on_cam_stream)
@@ -13486,6 +13558,17 @@ class MainWindow(QMainWindow):
         self._quiz_sig.connect(self._show_quiz)
         self._quiz_hide_sig.connect(self._hide_quiz)
         self._review_sig.connect(self._show_review)
+        self._learning_sig.connect(self._show_learning_dialog)
+        # [AURA-FEATURE: advanced-vision]
+        self._vision_indicator_sig.connect(self._on_vision_indicator)
+        self._vision_result_sig.connect(self._on_vision_result)
+        self._vision_preview_sig.connect(self._on_vision_preview)
+        self._vision_pill = self._build_vision_pill()
+        self._vision_pulse_state = False
+        self._vision_pulse_timer = QTimer(self)
+        self._vision_pulse_timer.setInterval(550)
+        self._vision_pulse_timer.timeout.connect(self._pulse_vision_pill)
+        self._last_vision_hash = ""
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -13630,6 +13713,8 @@ class MainWindow(QMainWindow):
         sc_intr.activated.connect(self._do_interrupt)
         sc_neural = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
         sc_neural.activated.connect(self._toggle_hud_mode)
+        sc_learning = QShortcut(QKeySequence("Ctrl+Shift+L"), self)
+        sc_learning.activated.connect(self._show_learning_dialog)
 
         self._set_hud_mode(self._hud_mode, persist=False)
         self._mini_orb = MiniOrbWidget(self)
@@ -14233,6 +14318,15 @@ class MainWindow(QMainWindow):
                                  "(press F8 to turn the room watch back on).")
             return
         self._face_begin("reenroll")
+
+    def _show_learning_dialog(self) -> None:
+        """Open the Adaptive Intelligence review dialog."""
+        try:
+            from ui_learning import LearningReviewDialog
+            dlg = LearningReviewDialog(self)
+            dlg.exec()
+        except Exception as exc:
+            self._log.append_log(f"SYS: Learning dialog unavailable: {exc}")
 
     def _toggle_weather_widget(self) -> None:
         """F9 — show / hide the weather pop-up."""
@@ -15877,6 +15971,30 @@ class MainWindow(QMainWindow):
         mem_btn.clicked.connect(self._open_memory_panel)
         lay.addWidget(mem_btn)
 
+        cal_btn = QPushButton("📅  CALENDAR")
+        cal_btn.setFixedHeight(26)
+        cal_btn.setFont(QFont("Courier New", 7))
+        cal_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cal_btn.setStyleSheet(_BTN_STYLE_DIM)
+        cal_btn.clicked.connect(self._open_calendar_settings)
+        lay.addWidget(cal_btn)
+
+        self._learning_btn = QPushButton()
+        self._learning_btn.setFixedHeight(26)
+        self._learning_btn.setFont(QFont("Courier New", 7))
+        self._learning_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._learning_btn.clicked.connect(self._toggle_learning_mode)
+        lay.addWidget(self._learning_btn)
+
+        matrix_btn = QPushButton("◈  KNOWLEDGE MATRIX")
+        matrix_btn.setFixedHeight(26)
+        matrix_btn.setFont(QFont("Courier New", 7))
+        matrix_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        matrix_btn.setStyleSheet(_BTN_STYLE_DIM)
+        matrix_btn.setToolTip("View and review learned skills, preferences, and experiences [Ctrl+Shift+L]")
+        matrix_btn.clicked.connect(self._show_learning_dialog)
+        lay.addWidget(matrix_btn)
+
         plugin_btn = QPushButton("🧩  PLUGINS")
         plugin_btn.setFixedHeight(26)
         plugin_btn.setFont(QFont("Courier New", 7))
@@ -16228,6 +16346,41 @@ class MainWindow(QMainWindow):
         """)
         lay.addWidget(self._content_display)
 
+        # [AURA-FEATURE: advanced-vision] Action bar for vision results
+        self._vision_actions_bar = QWidget()
+        self._vision_actions_bar.setStyleSheet("background: transparent;")
+        v_bar = QHBoxLayout(self._vision_actions_bar)
+        v_bar.setContentsMargins(0, 4, 0, 0)
+        v_bar.setSpacing(6)
+        _btn_css = (
+            f"QPushButton {{ background: transparent; color: {C.PRI}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 8px; }}"
+            f"QPushButton:hover {{ border-color: {C.PRI}; background: {C.PRI_GHO}; }}"
+        )
+        _copy_btn = QPushButton("COPY")
+        _copy_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        _copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _copy_btn.setStyleSheet(_btn_css)
+        _copy_btn.clicked.connect(self._copy_vision_text)
+        v_bar.addWidget(_copy_btn)
+
+        _note_btn = QPushButton("SAVE AS NOTE")
+        _note_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        _note_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _note_btn.setStyleSheet(_btn_css)
+        _note_btn.clicked.connect(self._save_vision_note)
+        v_bar.addWidget(_note_btn)
+
+        _follow_btn = QPushButton("ASK FOLLOW-UP")
+        _follow_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        _follow_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _follow_btn.setStyleSheet(_btn_css)
+        _follow_btn.clicked.connect(self._followup_vision)
+        v_bar.addWidget(_follow_btn)
+        v_bar.addStretch()
+        self._vision_actions_bar.hide()
+        lay.addWidget(self._vision_actions_bar)
+
         return w
 
     def _show_cad_progress(
@@ -16351,6 +16504,8 @@ class MainWindow(QMainWindow):
     def _show_content(self, title: str, text: str):
         """Slot — runs on Qt main thread. Updates and shows the content panel."""
         import time as _time
+        if hasattr(self, "_vision_actions_bar") and not title.upper().startswith("VISION"):
+            self._vision_actions_bar.hide()
         self._content_title_lbl.setText(title.upper()[:48])
         self._content_ts_lbl.setText(_time.strftime("%H:%M:%S"))
         self._content_display.setPlainText(text)
@@ -16372,6 +16527,160 @@ class MainWindow(QMainWindow):
                 self._close_fx_graph()
         else:
             self._close_fx_graph()
+
+    # [AURA-FEATURE: advanced-vision]
+    def _build_vision_pill(self) -> QWidget:
+        pill = QWidget(self.centralWidget())
+        pill.setObjectName("VisionLivePill")
+        pill.setStyleSheet(f"""
+            QWidget#VisionLivePill {{
+                background: rgba(12, 6, 0, 238);
+                border: 1px solid {C.PRI};
+                border-radius: 14px;
+            }}
+        """)
+        lay = QHBoxLayout(pill)
+        lay.setContentsMargins(12, 4, 8, 4)
+        lay.setSpacing(8)
+        self._vision_pill_lbl = QLabel("● CAMERA LIVE")
+        self._vision_pill_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._vision_pill_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
+        lay.addWidget(self._vision_pill_lbl)
+
+        stop_btn = QPushButton("✕ STOP")
+        stop_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        stop_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 80, 30, 38);
+                color: #ff6b35;
+                border: 1px solid #ff6b35;
+                border-radius: 9px;
+                padding: 2px 8px;
+            }}
+            QPushButton:hover {{ background: rgba(255, 80, 30, 90); color: #ffffff; }}
+        """)
+        stop_btn.clicked.connect(self._stop_vision_clicked)
+        lay.addWidget(stop_btn)
+        pill.hide()
+        return pill
+
+    def _pulse_vision_pill(self) -> None:
+        self._vision_pulse_state = not self._vision_pulse_state
+        dot = "●" if self._vision_pulse_state else "○"
+        base = getattr(self, "_vision_pill_base", "CAMERA LIVE")
+        self._vision_pill_lbl.setText(f"{dot} {base}")
+
+    def _on_vision_indicator(self, mode: str, active: bool) -> None:
+        if active:
+            label = "CAMERA LIVE" if mode.upper() == "CAMERA" else "SCREEN CAPTURE"
+            self._vision_pill_base = label
+            self._vision_pill_lbl.setText(f"● {label}")
+            self._vision_pill.adjustSize()
+            cw = self.centralWidget()
+            x = max(12, (cw.width() - self._vision_pill.width()) // 2)
+            self._vision_pill.move(x, 66)
+            self._vision_pill.show()
+            self._vision_pill.raise_()
+            if not self._vision_pulse_timer.isActive():
+                self._vision_pulse_timer.start()
+        else:
+            self._vision_pulse_timer.stop()
+            self._vision_pill.hide()
+
+    def _stop_vision_clicked(self) -> None:
+        try:
+            from core.vision.service import get_vision_service
+            get_vision_service().stop_active()
+        except Exception:
+            pass
+        self.stop_camera_stream()
+        self._on_vision_indicator("", False)
+        self._log_sig.emit("SYS: Vision capture stopped.")
+
+    def _on_vision_result(self, title: str, text: str, image_hash: str) -> None:
+        self._last_vision_hash = image_hash
+        if hasattr(self, "_vision_actions_bar"):
+            self._vision_actions_bar.show()
+        self._show_content(title, text)
+
+    def _copy_vision_text(self) -> None:
+        try:
+            QApplication.clipboard().setText(self._content_display.toPlainText())
+            self._log_sig.emit("SYS: Vision output copied to clipboard.")
+        except Exception:
+            pass
+
+    def _save_vision_note(self) -> None:
+        try:
+            from core.vision.service import get_vision_service
+            svc = get_vision_service()
+            last = svc._last_result
+            if last is not None and last.ok:
+                msg = svc.save_result_to_memory(last)
+                self._log_sig.emit(f"SYS: Saved vision summary to memory ({msg}).")
+            else:
+                self._log_sig.emit("SYS: No vision result available to save.")
+        except Exception as exc:
+            self._log_sig.emit(f"SYS: Could not save note ({type(exc).__name__}).")
+
+    def _followup_vision(self) -> None:
+        self._input.setFocus()
+        self._input.setText("About that image: ")
+        self._input.setCursorPosition(len(self._input.text()))
+
+    def _on_vision_preview(self, img_bytes: bytes, label: str, state: object) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Vision Capture Preview")
+        dlg.setModal(True)
+        dlg.setStyleSheet(f"""
+            QDialog {{
+                background: {C.DARK};
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        hdr = QLabel(f"◈  PREVIEW · {label}")
+        hdr.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        lay.addWidget(hdr)
+
+        thumb = QLabel()
+        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pix = QPixmap()
+        pix.loadFromData(img_bytes)
+        if not pix.isNull():
+            thumb.setPixmap(pix.scaled(360, 220, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        lay.addWidget(thumb)
+
+        row = QHBoxLayout()
+        cancel_btn = QPushButton("CANCEL")
+        send_btn = QPushButton("ANALYZE")
+        for btn, primary in ((cancel_btn, False), (send_btn, True)):
+            btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            color = C.PRI if primary else C.TEXT_DIM
+            btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {color}; "
+                f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 5px 12px; }}"
+                f"QPushButton:hover {{ border-color: {C.PRI}; }}"
+            )
+        cancel_btn.clicked.connect(dlg.reject)
+        send_btn.clicked.connect(dlg.accept)
+        row.addStretch()
+        row.addWidget(cancel_btn)
+        row.addWidget(send_btn)
+        lay.addLayout(row)
+
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        if isinstance(state, dict):
+            state["approved"] = accepted
+            ev = state.get("event")
+            if ev is not None:
+                ev.set()
 
     # [AURA-FEATURE: presence-awareness]
     def _position_presence_card(self):
@@ -16460,11 +16769,15 @@ class MainWindow(QMainWindow):
     def _news_video_closed(self, panel: NewsVideoPanel) -> None:
         if self._news_video_panel is panel:
             self._news_video_panel = None
+        self._agenda_panel = None
+        self._calendar_dialog = None
 
     def _close_news_video(self) -> None:
         self._open_seq.cancel("video")
         panel = self._news_video_panel
         self._news_video_panel = None
+        self._agenda_panel = None
+        self._calendar_dialog = None
         if panel is not None:
             try:
                 panel.close()
@@ -16770,7 +17083,7 @@ class MainWindow(QMainWindow):
 
     def _earth_float_panels(self):
         out = []
-        for p in (self._news_video_panel, self._fx_graph_panel):
+        for p in (self._news_video_panel, self._fx_graph_panel, self._agenda_panel):
             if p is not None and _mo_alive(p) and not getattr(p, "_closed", False):
                 out.append(p)
         return out
@@ -16846,7 +17159,7 @@ class MainWindow(QMainWindow):
 
     def _earth_restore_panel(self, p, rect) -> None:
         if (not _mo_alive(p) or getattr(p, "_closed", True)
-                or p not in (self._news_video_panel, self._fx_graph_panel)):
+                or p not in (self._news_video_panel, self._fx_graph_panel, self._agenda_panel)):
             return                          # closed by the user / replaced meanwhile
         if self._earth_cover_on:
             self._earth_hidden_wins.append((p, rect))   # covered again: keep parked
@@ -17411,6 +17724,48 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
             """)
 
+    def _toggle_learning_mode(self):
+        try:
+            from memory.config_manager import get_learning_config, save_learning_config
+            from core.learning import get_learning_engine
+            cfg = get_learning_config()
+            new_val = not cfg.get("enabled", True)
+            cfg["enabled"] = new_val
+            save_learning_config(cfg)
+            engine = get_learning_engine()
+            if engine and hasattr(engine, "settings"):
+                engine.settings.enabled = new_val
+            self._update_learning_btn(new_val)
+            self._log.append_log(f"SYS: Learning Mode {'enabled' if new_val else 'disabled'}.")
+        except Exception as e:
+            self._log.append_log(f"ERR: Failed to toggle Learning Mode — {e}")
+
+    def _update_learning_btn(self, enabled: bool):
+        if not hasattr(self, '_learning_btn'):
+            return
+        if enabled:
+            self._learning_btn.setText("◈  LEARNING MODE: ON")
+            self._learning_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #001a08; color: {C.GREEN};
+                    border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ background: #002010; }}
+            """)
+            self._learning_btn.setToolTip("Self-learning intelligence active. Adapts behavior from experience and user preferences.")
+        else:
+            self._learning_btn.setText("◈  LEARNING MODE: OFF")
+            self._learning_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; color: {C.TEXT_DIM};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
+            """)
+            self._learning_btn.setToolTip("Self-learning intelligence paused. No new experiences or preferences will be learned.")
+
     def _refresh_talk_btns(self):
         """Repaint the push-to-talk row from the saved setting."""
         if not hasattr(self, "_ptt_btn"):
@@ -17684,6 +18039,43 @@ class MainWindow(QMainWindow):
         ov.raise_()
         ov.activateWindow()
         self._memory_dialog = ov
+
+    def _open_calendar_settings(self):
+        try:
+            from ui_calendar import CalendarSettingsDialog
+            existing = getattr(self, "_calendar_dialog", None)
+            if existing is not None and existing.isVisible():
+                existing.raise_()
+                existing.activateWindow()
+                return
+            dlg = CalendarSettingsDialog(parent=self)
+            dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        except Exception as e:
+            self._log.append_log(f"ERR: Calendar settings unavailable — {e}")
+            return
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        self._calendar_dialog = dlg
+
+    def _show_agenda_panel(self, title: str, text: str):
+        try:
+            from ui_calendar import AgendaPanel
+        except Exception as e:
+            self._log.append_log(f"ERR: Agenda panel unavailable — {e}")
+            return
+        panel = getattr(self, "_agenda_panel", None)
+        if panel is None or not _mo_alive(panel):
+            panel = AgendaPanel(self)
+            self._agenda_panel = panel
+        panel.set_agenda(title, text)
+        def _open():
+            if not _mo_alive(panel):
+                return
+            panel.show()
+            panel.raise_()
+            self._earth_hold_cover() if self._earth_is_covering() else None
+        self._open_seq.enqueue(_open)
 
     # ── Irreversible-action confirmation ─────────────────────────────────────
 
@@ -18263,6 +18655,10 @@ class AuraUI:
         """Thread-safe: display content in the panel below the HUD."""
         self._win._content_sig.emit(title[:48], text[:4000])
 
+    def show_agenda_panel(self, title: str, text: str):
+        """Thread-safe: display the floating Agenda panel."""
+        self._win._agenda_sig.emit(title[:48], text[:8000])
+
     # [AURA-FEATURE: presence-awareness]
     def show_presence_card(self, title: str, message: str, status_pill: str = "", duration_ms: int = 9000):
         """Thread-safe: show floating holographic card on the HUD."""
@@ -18382,6 +18778,24 @@ class AuraUI:
         """Thread-safe: stop the live camera feed."""
         self._win.stop_camera_stream()
 
+    # [AURA-FEATURE: advanced-vision]
+    def show_vision_indicator(self, mode: str, active: bool) -> None:
+        """Thread-safe: show or hide the pulsing live capture HUD pill."""
+        self._win._vision_indicator_sig.emit(str(mode or ""), bool(active))
+
+    def show_vision_result(self, title: str, text: str, image_hash: str = "") -> None:
+        """Thread-safe: display vision output with Copy / Save as note / Follow-up."""
+        self._win._vision_result_sig.emit(str(title or "VISION")[:48], str(text or "")[:12000], str(image_hash or ""))
+
+    def confirm_vision_preview(self, img_bytes: bytes, label: str, timeout_s: float = 30.0) -> bool:
+        """Thread-safe: show capture thumbnail with Cancel before sending."""
+        ev = threading.Event()
+        state: dict = {"approved": False, "event": ev}
+        self._win._vision_preview_sig.emit(bytes(img_bytes), str(label or "Capture"), state)
+        if not ev.wait(timeout_s):
+            return False
+        return bool(state.get("approved", False))
+
     def pause_room_watch(self) -> None:
         """Thread-safe: briefly release the camera for a one-off capture."""
         self._win.pause_room_watch()
@@ -18400,3 +18814,11 @@ class AuraUI:
     def stop_speaking(self):
         if not self.muted:
             self.set_state("LISTENING")
+
+    def show_learning_dialog(self) -> None:
+        """Thread-safe: open the Adaptive Intelligence review dialog."""
+        self._win._learning_sig.emit()
+
+    def toggle_learning_mode(self) -> None:
+        """Thread-safe: toggle the Learning Mode setting."""
+        self._win._toggle_learning_mode()

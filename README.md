@@ -1094,6 +1094,62 @@ https://instagram.com/_codecrafters._org_
 
 ---
 
+# A.U.R.A Adaptive Intelligence (Self-Learning Subsystem)
+
+A.U.R.A Adaptive Intelligence provides a high-performance, provider-agnostic, zero-hot-path-LLM learning layer that allows A.U.R.A to continuously adapt and improve from experience without model retraining, fine-tuning, or modifying any source code. Both the Gemini Live engine and the Local engine share one unified learning database, enabling offline local models to benefit from lessons learned during cloud sessions and vice versa.
+
+> **Official GitHub Version**: Optimized for GitHub releases. All learned experiences, skills, and preferences are stored portably and locally in `memory/learning.db` inside your repository directory alongside existing local state.
+
+---
+
+### How to Use & Controls
+
+1. **Learning Mode Toggle (Settings Drawer)**:
+   - Click the **⚙ Gear Icon** in the top navigation bar to open the Quick Drawer.
+   - Click **`◈  LEARNING MODE: ON`** to toggle self-learning on or off at any time (**enabled by default**).
+   - When toggled OFF, self-learning is paused: no new experiences are recorded, and no background maintenance or reflection is executed.
+
+2. **Knowledge Matrix HUD (`Ctrl+Shift+L`)**:
+   - Access via the **`◈  KNOWLEDGE MATRIX`** button in the Settings Drawer or press **`Ctrl+Shift+L`**.
+   - Inspect live statistics: total experiences, verified preferences, active skills, average confidence, and database size.
+   - Browse the knowledge table, promote provisional observations to verified rules, manually edit lessons, or delete obsolete entries with a single click.
+   - Run manual maintenance or purge all learned data safely at any time.
+
+---
+
+### Key Capabilities & Architecture
+
+- **Levels 1–3 Self-Learning**: Covers episodic memory (Level 1), experience learning (Level 2), and behavioral adaptation (Level 3). The assistant adapts to your habits, corrects mistaken tool choices, and retains your explicit instructions without touching model weights.
+- **Natural Language Correction Detection**:
+  - Automatically identifies corrections and explicit instructions in English and Hinglish (`"always"`, `"never"`, `"remember"`, `"from now on"`, `"hamesha"`, `"kabhi mat"`, `"yaad rakhna"`).
+  - Automatically infers rule scope: `global`, `project:<name>`, or `task_type:<type>`.
+- **Zero Extra LLM Calls on Hot Path**:
+  - Correction detection, outcome evaluation, confidence scoring, retrieval, and consolidation are 100% deterministic (regex/rules, SQLite FTS5 BM25, and mathematical models).
+  - Voice responses and chat latency remain lightning-fast without burning API tokens.
+- **Sub-30ms Hybrid Retrieval**:
+  - Blends BM25 full-text matching, Bayesian Beta-distribution confidence scores, exponential recency decay, and scope specificity.
+  - Benchmarked at `< 30ms` over 10,000+ stored records.
+- **Prompt Injection Defense & Token Capping**:
+  - Injected experience blocks are strictly capped at ~400 tokens (`chars/4` heuristic) and prioritized by score.
+  - Anti-override sanitization strips adversarial instructions, ensuring third-party content or tool output never hijacks assistant instructions.
+- **Automated Secret & PII Scrubbing**:
+  - Every record passes through `core/learning/redaction.py` before hitting disk.
+  - Google/Gemini API keys, OpenAI keys, GitHub tokens, AWS credentials, bearer tokens, passwords, and high-entropy base16/base64 strings are permanently scrubbed.
+- **Optional Free-Tier Background Reflection**:
+  - LLM-assisted reflection runs strictly in the background during idle periods and is disabled by default.
+  - Protected by `LearningBudget`: token-bucket rate limiter, daily call caps, and exponential backoff with jitter on HTTP 429 quota exhaustion. Quota errors are handled silently without disturbing the user.
+
+---
+
+### Non-Negotiable Safety Guarantees
+
+1. **Source Code is Immutable**: The self-learning engine writes solely to `memory/learning.db` and configuration. It never modifies application source code.
+2. **Permissions Cannot Be Elevated**: Learned routines and procedures can never grant permissions, bypass user confirmation dialogs, or auto-execute dangerous operations (file deletions, system setting edits, terminal execution). A.U.R.A's native confirmation dialogs always take precedence.
+3. **Transparent Curation**: Every learned preference and skill is fully user-viewable, editable, and deletable from the Knowledge Matrix. Deletions are real database deletions that remove entries from SQLite and FTS tables.
+4. **Resilient Storage**: Features SQLite WAL mode, foreign keys, busy timeouts, automated periodic VACUUM/pruning, and auto-recovery with timestamped backups in case of sudden power loss.
+
+---
+
 # License
 
 This project is licensed under the **MIT License**.

@@ -152,7 +152,7 @@ class TaskTools:
         try:
             if name == "fetch_page":
                 return self._fetch(args)
-            if name == ("search_web", "web_search"):
+            if name in ("search_web", "web_search"):
                 return self._search(args)
             if name == "notes":
                 return self._notes(args)

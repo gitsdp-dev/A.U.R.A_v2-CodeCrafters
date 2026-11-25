@@ -134,3 +134,11 @@ miniaudio
 
 flake8
 ruff
+
+# ── Calendar & Schedule Intelligence (pure-Python, zero-cost) ───────────────
+icalendar>=6,<8
+recurring-ical-events>=3,<4
+python-dateutil>=2.8,<3
+tzdata>=2024.1
+dateparser>=1.2,<2
+keyring>=25,<26

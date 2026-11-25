@@ -81,6 +81,7 @@ _KEY_FILE = _BASE / "config" / "api_keys.json"
 # Ladders, tried left to right. Change a model HERE and the whole app follows.
 FAST = "fast"      # short classification, extraction, one-line decisions
 SMART = "smart"    # reasoning, generation, long documents, images
+DEEP = "deep"      # complex coding, CAD designing, multi-step planning
 SEARCH = "search"  # grounded search — REST only, see below
 
 # A rung that means "ask the Live model instead", through a short throwaway
@@ -115,7 +116,8 @@ LIVE = "live"
 
 _LADDERS = {
     FAST: (LIVE, "gemini-2.5-flash-lite", "gemini-2.5-flash"),
-    SMART: (LIVE, "gemini-2.5-flash", "gemini-2.5-flash-lite"),
+    SMART: (LIVE, "gemini-4-hydrogen", "gemini-2.5-flash", "gemini-2.5-flash-lite"),
+    DEEP: ("gemini-4-hydrogen", "gemini-3.8-flash", "gemini-2.5-flash"),
     # Grounded search needs response.candidates[...].grounding_metadata, which a
     # Live turn does not produce. REST only, and it says so rather than silently
     # returning an answer with no sources behind it.

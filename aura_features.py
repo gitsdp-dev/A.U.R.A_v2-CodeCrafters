@@ -271,6 +271,13 @@ class FeatureRegistry:
                 pass
             self.chat_memory_manager = None
 
+        # [AURA-FEATURE: adaptive-learning]
+        try:
+            from core.learning import get_learning_engine
+            get_learning_engine().shutdown()
+        except Exception as exc:
+            _LOG.warning("Error shutting down learning engine: %s", exc)
+
         self._initialized = False
         _LOG.info("FeatureRegistry shutdown complete.")
 

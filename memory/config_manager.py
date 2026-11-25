@@ -913,3 +913,76 @@ def save_clap_config(values: dict) -> dict:
     data["clap_settings"] = cur
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
     return get_clap_config()
+
+
+# [AURA-FEATURE: adaptive-learning]
+def get_learning_config() -> dict:
+    """Return adaptive learning settings with backwards-compatible defaults."""
+    cfg = load_api_keys().get("adaptive_learning")
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "retrieval_limit": int(cfg.get("retrieval_limit", 5)),
+        "max_injected_tokens": int(cfg.get("max_injected_tokens", 400)),
+        "provisional_evidence_threshold": int(cfg.get("provisional_evidence_threshold", 3)),
+        "reflection_enabled": bool(cfg.get("reflection_enabled", False)),
+        "max_reflections_per_day": int(cfg.get("max_reflections_per_day", 10)),
+    }
+
+
+def save_learning_config(values: dict) -> dict:
+    """Persist adaptive learning settings to config."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    cur = data.get("adaptive_learning")
+    if not isinstance(cur, dict):
+        cur = {}
+    cur.update(values)
+    data["adaptive_learning"] = cur
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    return get_learning_config()
+
+
+# [AURA-FEATURE: advanced-vision]
+def get_vision_config() -> dict:
+    """Return Advanced Vision permission and behavior settings with safe defaults."""
+    cfg = load_api_keys().get("vision")
+    if not isinstance(cfg, dict):
+        cfg = {}
+    ask_every_time = bool(cfg.get("ask_every_time", True))
+    remember_for_session = bool(cfg.get("remember_for_session", False)) and not ask_every_time
+    return {
+        "camera_enabled": bool(cfg.get("camera_enabled", True)),
+        "screen_enabled": bool(cfg.get("screen_enabled", True)),
+        "file_enabled": bool(cfg.get("file_enabled", True)),
+        "ask_every_time": ask_every_time,
+        "remember_for_session": remember_for_session,
+        "preview_before_send": bool(cfg.get("preview_before_send", True)),
+    }
+
+
+def save_vision_config(values: dict) -> dict:
+    """Persist Advanced Vision permission settings to config."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    cur = data.get("vision")
+    if not isinstance(cur, dict):
+        cur = {}
+    if isinstance(values, dict):
+        cur.update(values)
+    data["vision"] = cur
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    return get_vision_config()
+
+

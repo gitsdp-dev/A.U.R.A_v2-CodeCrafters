@@ -1168,6 +1168,12 @@ class AuraLive:
 
     def close(self) -> None:
         self.request_shutdown()
+        # [AURA-FEATURE: advanced-vision]
+        try:
+            from core.vision.service import get_vision_service
+            get_vision_service().shutdown()
+        except Exception:
+            pass
         # [AURA-FEATURE: presence-awareness]
         try:
             get_feature_registry().shutdown()
@@ -1701,6 +1707,14 @@ class AuraLive:
                     f"Retrieved from local conversation history:\n{context_snippet}\n\n"
                     "Answer directly based strictly on the past conversation above. If nothing was found, state so honestly."
                 )
+        # [AURA-FEATURE: adaptive-learning]
+        try:
+            from core.learning import get_learning_engine
+            _l_ctx = get_learning_engine().retrieve_relevant_experience(text)
+            if _l_ctx:
+                text = f"{text}\n\n{_l_ctx}"
+        except Exception:
+            pass
         if self._local_brain is None:
             self.ui.write_log("SYS: Local brain is not ready.")
             return
@@ -1732,6 +1746,19 @@ class AuraLive:
             if result:
                 await self._local_speak_sentence(str(result)[:320])
             return
+        try:
+            from core.calendar.intents import match_and_run_calendar_intent
+
+            cal_reply = await asyncio.to_thread(
+                match_and_run_calendar_intent, text, player=self.ui
+            )
+            if cal_reply:
+                self.ui.write_log(f"{self._asst_name}: {cal_reply}")
+                self.ui.show_background_reply(cal_reply)
+                await self._local_speak_sentence(cal_reply[:320])
+                return
+        except Exception:
+            pass
         if not hasattr(self, "_local_turn_lock"):
             self._local_turn_lock = asyncio.Lock()
         async with self._local_turn_lock:
@@ -1780,6 +1807,18 @@ class AuraLive:
                         if record_user:
                             cm.log_turn("user", text)
                         cm.log_turn("assistant", reply)
+                    # [AURA-FEATURE: adaptive-learning]
+                    try:
+                        from core.learning import get_learning_engine
+                        _le = get_learning_engine()
+                        _le.process_feedback(text)
+                        _le.record_experience(
+                            task=text, outcome=reply, task_type="local_turn",
+                            duration_ms=int((time.perf_counter() - self._local_turn_started_at) * 1000),
+                            success=True,
+                        )
+                    except Exception:
+                        pass
                 else:
                     self.ui.show_background_reply(
                         "AURA couldn't produce a response. Please try again."
@@ -2233,6 +2272,29 @@ class AuraLive:
             self.ui.handle_notification_command(intent)
             return
         if self._cad_hooks.handle_text(text, speak=self.speak):
+            return
+        # [AURA-FEATURE: advanced-vision]
+        from core.vision.intents import match_vision_intent
+        from core.vision.service import get_vision_service
+        _cur_file = self.ui.current_file() or ""
+        _vision_intent = match_vision_intent(text, has_selected_file=bool(_cur_file))
+        if _vision_intent is not None:
+            def _run_vision():
+                get_vision_service().run_task(
+                    source=_vision_intent.source,
+                    task=_vision_intent.task,
+                    prompt=_vision_intent.prompt,
+                    file_path=_cur_file,
+                    window_title=_vision_intent.window_title,
+                    remember_summary=_vision_intent.remember_summary,
+                    ui=self.ui,
+                    speak=self.speak,
+                )
+            threading.Thread(
+                target=_run_vision,
+                name="aura-vision-task",
+                daemon=True,
+            ).start()
             return
         if is_screen_agent_request(text):
             threading.Thread(
@@ -3004,6 +3066,14 @@ class AuraLive:
             )
         if mem_str:
             parts.append(mem_str)
+        # [AURA-FEATURE: adaptive-learning]
+        try:
+            from core.learning import get_learning_engine
+            learning_context = get_learning_engine().retrieve_relevant_experience("")
+            if learning_context:
+                parts.append(learning_context)
+        except Exception as _le_exc:
+            print(f"[AURA] Learning context retrieval skipped: {_le_exc}")
         parts.append(sys_prompt)
 
         cfg = dict(
@@ -3228,32 +3298,59 @@ class AuraLive:
                     print(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
                     result = "Vision is still processing the previous request. I will not call this again."
                 else:
-                    self._vision_busy      = True
-                    self._vision_last_time = _now
-                    angle     = args.get("angle", "screen").lower()
+                    from core.vision.models import VisionCapability
+                    from core.vision.permissions import VisionPermissionDeniedError
+                    from core.vision.service import get_vision_service
+
+                    angle = args.get("angle", "screen").lower()
                     user_text = args.get("text", "What do you see?")
-                    if angle == "camera":
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera_shared, self.ui)
-                        self.ui.start_camera_stream()
-                        self._vision_cam_active = True
-                        print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
-                        _stall = "camera"
+                    _cap = VisionCapability.CAMERA if angle == "camera" else VisionCapability.SCREEN
+                    _mode_lbl = "CAMERA" if angle == "camera" else "SCREEN"
+                    try:
+                        await loop.run_in_executor(
+                            None,
+                            lambda: get_vision_service().permissions.ensure_allowed(
+                                _cap,
+                                source_label=angle,
+                                task_label="live_vision",
+                            ),
+                        )
+                    except VisionPermissionDeniedError as _perm_err:
+                        result = str(_perm_err)
+                        continue_vision = False
                     else:
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
-                        print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
-                        _stall = "screen"
-                    self._pending_vision = (img_b, mime_t, user_text, angle)
-                    # The image is attached to this same exchange, so there is
-                    # nothing to stall for and nothing to announce. Asking for an
-                    # acknowledgement here is what produced two spoken answers —
-                    # the model filled that turn by answering the question from
-                    # imagination, then answered it again once it could see.
-                    result = (
-                        f"[VISION_ACTIVE] {_stall.capitalize()} captured and attached to this "
-                        f"same exchange. Do not acknowledge and do not answer yet — the image "
-                        f"is arriving with this result. Reply once, from what you actually see "
-                        f"in it."
-                    )
+                        continue_vision = True
+
+                    if continue_vision:
+                        self._vision_busy = True
+                        self._vision_last_time = _now
+                        _ind = getattr(self.ui, "show_vision_indicator", None)
+                        if callable(_ind):
+                            _ind(_mode_lbl, True)
+                        try:
+                            if angle == "camera":
+                                img_b, mime_t = await loop.run_in_executor(None, _capture_camera_shared, self.ui)
+                                self.ui.start_camera_stream()
+                                self._vision_cam_active = True
+                                print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                                _stall = "camera"
+                            else:
+                                img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
+                                print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
+                                _stall = "screen"
+                            self._pending_vision = (img_b, mime_t, user_text, angle)
+                            result = (
+                                f"[VISION_ACTIVE] {_stall.capitalize()} captured and attached to this "
+                                f"same exchange. Do not acknowledge and do not answer yet — the image "
+                                f"is arriving with this result. Reply once, from what you actually see "
+                                f"in it."
+                            )
+                        except Exception as _cap_err:
+                            self._vision_busy = False
+                            result = f"Vision capture failed: {_cap_err}"
+                        finally:
+                            if callable(_ind):
+                                _ind(_mode_lbl, False)
 
             elif name == "close_camera":
                 self.ui.stop_camera_stream()
@@ -3352,6 +3449,22 @@ class AuraLive:
 
         _log_result = "[redacted]" if name == "screen_agent" else str(result)[:80]
         print(f"[AURA] 📤 {name} → {_log_result}")
+
+        # [AURA-FEATURE: adaptive-learning]
+        try:
+            from core.learning import get_learning_engine
+            _is_succ = not (isinstance(result, str) and (result.startswith("Tool '") and " failed:" in result))
+            get_learning_engine().record_experience(
+                task=f"Tool call: {name}",
+                outcome=str(result)[:500],
+                task_type=name,
+                approach=str(args)[:300],
+                tools_used=[name],
+                success=_is_succ,
+                error_text=str(result)[:300] if not _is_succ else None,
+            )
+        except Exception:
+            pass
 
         # A tool that declared itself NON_BLOCKING also says when its answer may
         # re-enter the conversation. Without this the model finishes whatever it
@@ -3817,6 +3930,12 @@ class AuraLive:
                                 cm = get_feature_registry().chat_memory_manager
                                 if cm:
                                     cm.log_turn("user", full_in)
+                                # [AURA-FEATURE: adaptive-learning]
+                                try:
+                                    from core.learning import get_learning_engine
+                                    get_learning_engine().process_feedback(full_in)
+                                except Exception:
+                                    pass
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
@@ -4100,9 +4219,19 @@ class AuraLive:
         name = _val("name")
         time_str = datetime.now().strftime("%H:%M")
 
-        # Start fetching news immediately — runs in parallel while phase 1 plays
+        # Start fetching news and cached calendar summary immediately — runs in parallel while phase 1 plays
         loop = asyncio.get_running_loop()
         news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
+
+        def _fetch_calendar_briefing_sync() -> str:
+            try:
+                from core.calendar.service import get_calendar_service
+
+                return get_calendar_service().briefing_section()
+            except Exception:
+                return ""
+
+        cal_future = loop.run_in_executor(None, _fetch_calendar_briefing_sync)
 
         await asyncio.sleep(0.3)
         if not self.session:
@@ -4178,20 +4307,32 @@ class AuraLive:
                     self.ui.write_log(f"SYS: News fetch timed out/failed: {e!r}")
                     news_text = ""
 
+                cal_text = ""
+                try:
+                    cal_text = await asyncio.wait_for(asyncio.wrap_future(cal_future), timeout=1.5)
+                except Exception:
+                    cal_text = ""
+
                 if not self.session:
                     return
+
+                cal_clause = f"\n\nSchedule: {cal_text}" if cal_text else ""
+                cal_speak = (
+                    f" Also briefly mention their schedule: {cal_text}."
+                    if cal_text else ""
+                )
 
                 failed = (not news_text) or news_text.startswith(
                     ("No news found", "Search failed", "Please provide")
                 )
                 if not failed:
                     # Show on UI content panel immediately
-                    self.ui.show_content("NEWS — top world news today", news_text)
+                    self.ui.show_content("NEWS — top world news today", news_text + cal_clause)
 
                     p2 = (
                         f"[BRIEFING] Here are today's top news headlines:\n{news_text}\n\n"
                         "Pick ONE headline, summarise it in one sentence, then say the full list "
-                        f"is displayed on screen. Do not call any tools.{lang_str}"
+                        f"is displayed on screen.{cal_speak} Do not call any tools.{lang_str}"
                     )
                 else:
                     self.ui.write_log(
@@ -4199,7 +4340,7 @@ class AuraLive:
                     )
                     p2 = (
                         "News headlines could not be fetched right now. "
-                        f"Let the user know briefly.{lang_str}"
+                        f"Let the user know briefly.{cal_speak}{lang_str}"
                     )
 
                 await self.session.send_client_content(
@@ -4345,6 +4486,75 @@ class AuraLive:
                 print("[AURA] Proactive check-in.")
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
+
+    async def _run_calendar_loop(self) -> None:
+        """Background calendar tick: due reminders (including tray mode), feed refresh, and proactive heads-up."""
+        last_refresh = 0.0
+        announced_events: set[str] = set()
+        announced_conflicts: set[str] = set()
+        while True:
+            await asyncio.sleep(60)
+            try:
+                from core.calendar.service import get_calendar_service
+                from core.calendar.summarizer import format_time_natural, summarize_conflicts
+                from core.notifications.bus import notify
+
+                svc = get_calendar_service()
+                await asyncio.to_thread(svc.tick_reminders)
+
+                settings = await asyncio.to_thread(svc.store.get_settings)
+                refresh_secs = max(5, int(settings.get("feed_refresh_minutes", 30))) * 60
+                now_mono = time.monotonic()
+                if now_mono - last_refresh >= refresh_secs:
+                    last_refresh = now_mono
+                    results = await asyncio.to_thread(svc.refresh_all)
+                    if results:
+                        now_dt = datetime.now().astimezone()
+                        conflicts = await asyncio.to_thread(
+                            svc.find_conflicts, now_dt, now_dt + timedelta(days=7)
+                        )
+                        for c in conflicts:
+                            ckey = f"{c.event_a.id}|{c.event_b.id}|{c.overlap_start.isoformat()}"
+                            if ckey not in announced_conflicts:
+                                announced_conflicts.add(ckey)
+                                notify(
+                                    "AURA Calendar",
+                                    "Schedule overlap noticed",
+                                    summarize_conflicts([c]),
+                                    priority=30,
+                                )
+
+                # Proactive heads-up for next event (respects proactive setting & silence/away)
+                if settings.get("proactive_enabled", True) and self.session:
+                    with self._speaking_lock:
+                        speaking = self._is_speaking
+                    pm = get_feature_registry().presence_manager
+                    away = bool(pm and pm.is_away)
+                    if not speaking and not away and self._proactive.should_trigger(self._last_user_speech):
+                        lead = int(settings.get("proactive_lead_minutes", 15))
+                        nxt = await asyncio.to_thread(svc.next_event)
+                        if nxt is not None:
+                            now_dt = datetime.now(nxt.start.tzinfo)
+                            mins_until = (nxt.start - now_dt).total_seconds() / 60.0
+                            ekey = f"{nxt.id}|{nxt.start.isoformat()}"
+                            if 0 < mins_until <= lead and ekey not in announced_events:
+                                announced_events.add(ekey)
+                                self._proactive.mark_triggered()
+                                t_str = format_time_natural(nxt.start, nxt.start.tzinfo)
+                                await self.session.send_client_content(
+                                    turns={
+                                        "role": "user",
+                                        "parts": [{
+                                            "text": (
+                                                f"[PROACTIVE_CHECK] Briefly remind the user in 1 short sentence "
+                                                f"that '{nxt.title}' starts at {t_str}."
+                                            )
+                                        }],
+                                    },
+                                    turn_complete=True,
+                                )
+            except Exception as exc:
+                print(f"[Calendar] Background tick error: {exc}")
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
@@ -4547,6 +4757,7 @@ class AuraLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    tg.create_task(self._run_calendar_loop())
                     if wake_greeting:
                         tg.create_task(self._deliver_wake_greeting())
                     if self._face_welcome_pending:

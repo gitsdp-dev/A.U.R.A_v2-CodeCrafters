@@ -14,6 +14,8 @@ _ACTION_INTENT = re.compile(
     r"search|look up|find|check the weather|weather|"
     r"send|remind me|set a reminder|set a timer|"
     r"turn on|turn off|volume|brightness|"
+    r"schedule|calendar|agenda|event|events|meeting|meetings|appointment|"
+    r"free time|free slots|clash|clashes|conflict|conflicts|reschedule|cancel|"
     r"what time|tell me the time|today's date|system information|system status"
     r")\b",
     re.IGNORECASE,
@@ -154,7 +156,26 @@ class LocalBrain:
                     elif not _validate_arguments(args, self._schemas[name]):
                         result = f"Rejected invalid arguments for local tool: {name}"
                     elif name == "screen_process":
-                        result = "Vision is unavailable in local mode unless a vision-capable model is configured."
+                        from core.vision.models import VisionSource, VisionTaskType
+                        from core.vision.service import get_vision_service
+
+                        angle = str(args.get("angle", "screen")).strip().lower()
+                        prompt = str(args.get("text", "What do you see?")).strip()
+                        source = (
+                            VisionSource.CAMERA if angle == "camera" else VisionSource.SCREEN
+                        )
+                        task = (
+                            VisionTaskType.CAMERA_OBJECT
+                            if angle == "camera"
+                            else VisionTaskType.SCREENSHOT
+                        )
+                        res = await asyncio.to_thread(
+                            get_vision_service().run_task,
+                            source=source,
+                            task=task,
+                            prompt=prompt,
+                        )
+                        result = res.summary if res.ok else (res.error or "Vision unavailable.")
                     else:
                         result = await self._execute_tool(str(name), args)
                     normalized_calls.append({

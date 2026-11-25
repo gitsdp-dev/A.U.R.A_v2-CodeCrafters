@@ -41,6 +41,7 @@ def _get_gemini(
                 tier=tier,
                 timeout_ms=60000,
                 task_type=task_type,
+                critical=True,
                 raise_errors=True,
             )
             if resp is None:

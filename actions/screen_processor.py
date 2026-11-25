@@ -86,6 +86,12 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
 
 
 def _capture_screen() -> tuple[bytes, str]:
+    try:
+        from core.vision.capture import capture_screen
+        img = capture_screen()
+        return img.data, img.mime_type
+    except Exception:
+        pass
 
     if not _MSS:
         raise RuntimeError("mss is not installed. Run: pip install mss")
@@ -139,23 +145,30 @@ def _get_camera_index() -> int:
 
 
 def _capture_camera() -> tuple[bytes, str]:
+    try:
+        from core.vision.capture import capture_camera
+        img = capture_camera()
+        return img.data, img.mime_type
+    except Exception:
+        pass
+
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 
     index   = _get_camera_index()
     cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Camera index {index} could not be opened.")
+
+        for _ in range(10):
+            cap.read()
+
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            raise RuntimeError("Camera returned no frame.")
+    finally:
         cap.release()
-        raise RuntimeError(f"Camera index {index} could not be opened.")
-
-    for _ in range(10):
-        cap.read()
-
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret or frame is None:
-        raise RuntimeError("Camera returned no frame.")
 
     if _PIL:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

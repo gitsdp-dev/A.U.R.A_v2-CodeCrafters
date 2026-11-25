@@ -35,6 +35,7 @@ TIERS: dict[str, tuple[str, ...]] = {
         "gemini-3.1-flash-lite",
     ),
     "deep": (
+        "gemini-4-hydrogen",
         "gemini-3.8-flash",
         "gemini-3.6-flash",
         "gemini-3-flash-preview",
@@ -46,6 +47,7 @@ TIERS: dict[str, tuple[str, ...]] = {
 # These standard inference models have a published Free Tier. Deep requests
 # never fall through to a model outside this reviewed set.
 _FREE_DEEP_MODELS = frozenset({
+    "gemini-4-hydrogen",
     "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
@@ -54,6 +56,8 @@ _FREE_DEEP_MODELS = frozenset({
 DEEP_TASK_TYPES = frozenset({
     "cad_design",
     "vibe_coding",
+    "coding",
+    "code",
     "multi_file_refactor",
     "long_agent_plan",
     "long_document_generation",
@@ -71,6 +75,21 @@ _CHEAP_TASK_TYPES = frozenset({
     "tool_output_parsing",
     "formatting",
 })
+_MODEL_RPM = {
+    "gemini-4-hydrogen": 5.0,
+    "gemini-3.8-flash": 10.0,
+    "gemini-3.6-flash": 15.0,
+    "gemini-3.5-flash-lite": 15.0,
+    "gemini-3.1-flash-lite": 15.0,
+    "gemini-2.5-flash-lite": 15.0,
+    "gemini-2.5-flash": 15.0,
+}
+_MODEL_DAILY_FREE_LIMITS = {
+    "gemini-4-hydrogen": 50,
+    "gemini-3.8-flash": 50,
+    "gemini-3.6-flash": 50,
+    "gemini-3.5-flash-lite": 1500,
+}
 _MODEL_LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 _MODEL_REFRESH_SECONDS = 6 * 60 * 60
 _COOLDOWN_DEFAULT = 60.0
@@ -268,7 +287,7 @@ def classify_task(
         return "deep"
     if normalized in _CHEAP_TASK_TYPES:
         return "fast"
-    if normalized in {"code", "debugging", "file_task", "ide_task", "long_reasoning"}:
+    if normalized in {"debugging", "file_task", "ide_task", "long_reasoning"}:
         return "smart"
 
     sample = " ".join(
@@ -277,14 +296,15 @@ def classify_task(
     if not sample:
         return "smart"
     if any(word in sample for word in (
-        "cad design", "design a cad", "vibe coding", "build a full app",
-        "build an app", "create a website", "build a website",
+        "cad design", "design a cad", "cad designing", "cad model", "3d cad",
+        "vibe coding", "coding task", "coding", "write code", "generate code",
+        "build a full app", "build an app", "create a website", "build a website",
         "multi-file refactor", "long agent plan", "write a long document",
         "generate a long document", "draft a long document",
     )):
         return "deep"
     if any(word in sample for word in (
-        "debug", "write code", "generate code", "refactor", "ide task",
+        "debug", "refactor", "ide task",
         "multiple steps", "step-by-step", "long reasoning", "large context",
         "analyze this file", "write a report",
     )):
@@ -630,9 +650,14 @@ class ModelRouter:
         order = _fallback_tiers(tier)
         candidates: list[tuple[str, str]] = []
         seen_models: set[str] = set()
+        task_label = str(task_type or (session.task_type if session is not None else "")).strip().casefold()
+        is_critical = critical or (task_label in {"cad_design", "vibe_coding", "coding", "code"})
         budget_excluded = {
             model for model in chains.get("deep", ())
-            if tier == "deep" and not critical and self._budget_near_limit(model)
+            if tier == "deep" and (
+                self._budget_exhausted(model)
+                or (not is_critical and self._budget_near_limit(model))
+            )
         }
         with self._lock:
             disabled = self._disabled.setdefault(key_id, set())
@@ -670,7 +695,7 @@ class ModelRouter:
             if self._is_cooling(key_id, model):
                 failure_reason = failure_reason or "rate_limit"
                 continue
-            if not self._acquire_token(key_id):
+            if not self._acquire_token(key_id, model):
                 session.pending = True
                 with self._lock:
                     self._pending_sessions[session.task_id] = session
@@ -824,7 +849,9 @@ class ModelRouter:
                 if self._is_cooling(key_id, active_model):
                     failure_reason = "rate_limit"
                     continue
-                if not self._acquire_token(key_id):
+                if self._budget_exhausted(active_model):
+                    continue
+                if not self._acquire_token(key_id, active_model):
                     break
                 client = self._client_factory(key, timeout_ms)
             try:
@@ -835,7 +862,7 @@ class ModelRouter:
                     **({"config": config} if config is not None else {}),
                 )
                 for chunk in stream:
-                    text = chunk if isinstance(chunk, str) else getattr(chunk, "text", "")
+                    text = _extract_chunk_text(chunk)
                     if not text:
                         continue
                     text = _remove_duplicate_prefix(
@@ -898,6 +925,7 @@ class ModelRouter:
         switched = prior is not None and prior != model
         session.current_model = model
         session.pending = False
+        session.partial_output = ""
         session.latest_result = response
         response_text = getattr(response, "text", None)
         if isinstance(response_text, str) and response_text:
@@ -945,12 +973,21 @@ class ModelRouter:
             self._last_notice = self._notice_clock()
         self.signals.model_switched.emit(message)
 
-    def _acquire_token(self, key_id: str) -> bool:
+    def _rpm_for_model(self, model: str | None) -> float:
+        if self.requests_per_minute != 5.0:
+            return self.requests_per_minute
+        if model and model in _MODEL_RPM:
+            return float(_MODEL_RPM[model])
+        return self.requests_per_minute
+
+    def _acquire_token(self, key_id: str, model: str | None = None) -> bool:
+        bucket_key = f"{key_id}:{model}" if model else key_id
+        rpm = self._rpm_for_model(model)
         with self._lock:
-            bucket = self._buckets.get(key_id)
+            bucket = self._buckets.get(bucket_key)
             if bucket is None:
-                bucket = TokenBucket(self.requests_per_minute)
-                self._buckets[key_id] = bucket
+                bucket = TokenBucket(rpm)
+                self._buckets[bucket_key] = bucket
         if _is_qt_main_thread():
             return bucket.acquire(timeout=0.0)
         return bucket.acquire(timeout=15.0)
@@ -1055,17 +1092,29 @@ class ModelRouter:
         except (OSError, ValueError):
             LOGGER.warning("Could not load local deep-tier budget data")
 
-    def _budget_near_limit(self, model: str) -> bool:
+    def _daily_limit_for_model(self, model: str) -> int:
         try:
             budget = int(self._settings_provider().get("deep_daily_budget", 50))
-            today_counts = self._daily_counts.get(date.today().isoformat(), {})
-            count = int(today_counts.get(model, 0))
         except (AttributeError, TypeError, ValueError):
-            LOGGER.warning("Invalid deep-tier daily budget configuration")
+            budget = 50
+        model_cap = _MODEL_DAILY_FREE_LIMITS.get(model, 50)
+        return min(budget, model_cap) if budget > 0 else model_cap
+
+    def _budget_exhausted(self, model: str) -> bool:
+        limit = self._daily_limit_for_model(model)
+        if limit <= 0:
             return False
-        if budget <= 0:
+        today_counts = self._daily_counts.get(date.today().isoformat(), {})
+        count = int(today_counts.get(model, 0))
+        return count >= limit
+
+    def _budget_near_limit(self, model: str) -> bool:
+        limit = self._daily_limit_for_model(model)
+        if limit <= 0:
             return False
-        return count >= max(1, math.ceil(budget * 0.8))
+        today_counts = self._daily_counts.get(date.today().isoformat(), {})
+        count = int(today_counts.get(model, 0))
+        return count >= max(1, math.ceil(limit * 0.8))
 
     def _increment_budget(self, model: str) -> None:
         today = date.today().isoformat()
@@ -1313,6 +1362,36 @@ def _notice_text(reason: str, tier: str) -> str:
     if reason in {"rate_limit", "unavailable"}:
         return "Switched models to keep things running smoothly."
     return "Continuing your task on another model."
+
+
+def _extract_chunk_text(chunk: Any) -> str:
+    if isinstance(chunk, str):
+        return chunk
+    try:
+        text = getattr(chunk, "text", None)
+        if text:
+            return str(text)
+    except Exception:
+        pass
+    candidates = getattr(chunk, "candidates", None)
+    if candidates and isinstance(candidates, list):
+        collected: list[str] = []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            if not content:
+                continue
+            parts = getattr(content, "parts", None)
+            if not parts or not isinstance(parts, list):
+                continue
+            for part in parts:
+                if getattr(part, "thought", False):
+                    continue
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text:
+                    collected.append(part_text)
+        if collected:
+            return "".join(collected)
+    return ""
 
 
 def _remove_duplicate_prefix(existing: str, chunk: str) -> str:

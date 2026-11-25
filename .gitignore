@@ -68,6 +68,20 @@ bugs_backup.txt
 *.pma
 *.session
 
+# ── Adaptive Intelligence & Self-Learning System ──────────────────────────────
+memory/learning.db*
+memory/learning*.json
+memory/learning*.sqlite*
+**/learning.db*
+**/learning*.sqlite*
+**/learning*.json
+**/learning*.corrupt-*
+**/learning_export*.json
+**/learning_audit*.log
+config/learning_settings.json
+unused-budget.json
+**/unused-budget.json
+
 # ── Downloaded models, user media, and generated output ──────────────────────
 models/
 voice_models/
